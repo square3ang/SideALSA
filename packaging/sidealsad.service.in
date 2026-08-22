@@ -1,0 +1,19 @@
+# Managed by SideALSA installer.
+[Unit]
+Description=SideALSA physical audio daemon
+After=sound.target
+Wants=sound.target
+Before=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=@PREFIX@/bin/sidealsad --profile @PROFILE@ --socket @SOCKET@
+Restart=on-failure
+RestartSec=2
+@GROUP_DIRECTIVE@
+UMask=@SOCKET_UMASK@
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

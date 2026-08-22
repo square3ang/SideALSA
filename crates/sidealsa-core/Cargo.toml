@@ -1,0 +1,12 @@
+[package]
+name = "sidealsa-core"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+alsa = "0.11"
+libc = "0.2"
+sidealsa-config = { path = "../sidealsa-config" }
+signal-hook = "0.3"
+thiserror = "2"

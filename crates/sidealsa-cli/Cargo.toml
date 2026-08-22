@@ -1,0 +1,22 @@
+[package]
+name = "sidealsa-cli"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+autobins = false
+
+[[bin]]
+name = "sidealsa-shared-test"
+path = "src/bin/sidealsa-shared-test.rs"
+
+[[bin]]
+name = "sidealsa-pro-client-test"
+path = "src/bin/sidealsa-pro-client-test.rs"
+
+[[bin]]
+name = "sidealsa-stats"
+path = "src/bin/sidealsa-stats.rs"
+
+[dependencies]
+sidealsa-client = { path = "../sidealsa-client" }
+sidealsa-protocol = { path = "../sidealsa-protocol" }

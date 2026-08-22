@@ -1,0 +1,19 @@
+[package]
+name = "sidealsa-daemon"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+autobins = false
+
+[[bin]]
+name = "sidealsad"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+sidealsa-client = { path = "../sidealsa-client" }
+sidealsa-config = { path = "../sidealsa-config" }
+sidealsa-core = { path = "../sidealsa-core" }
+sidealsa-protocol = { path = "../sidealsa-protocol" }
+signal-hook = "0.3"
+thiserror = "2"

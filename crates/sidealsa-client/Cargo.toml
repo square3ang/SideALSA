@@ -1,0 +1,10 @@
+[package]
+name = "sidealsa-client"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+libc = "0.2"
+sidealsa-protocol = { path = "../sidealsa-protocol" }
+thiserror = "2"

@@ -1,0 +1,18 @@
+[package]
+name = "sidealsa-alsa"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+build = "build.rs"
+
+[lib]
+name = "asound_module_pcm_sidealsa"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+libc = "0.2"
+sidealsa-client = { path = "../sidealsa-client" }
+sidealsa-protocol = { path = "../sidealsa-protocol" }
+
+[build-dependencies]
+cc = "1"

@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/sidealsa-config",
+    "crates/sidealsa-core",
+    "crates/sidealsa-protocol",
+    "crates/sidealsa-client",
+    "crates/sidealsa-alsa",
+    "crates/sidealsa-asio",
+    "crates/sidealsa-cli",
+    "crates/sidealsa-daemon",
+]
+
+[workspace.package]
+license = "GPL-3.0-or-later"

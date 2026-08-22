@@ -1,0 +1,14 @@
+[package]
+name = "sidealsa-asio"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib", "staticlib"]
+
+[dependencies]
+libc = "0.2"
+sidealsa-client = { path = "../sidealsa-client" }
+sidealsa-protocol = { path = "../sidealsa-protocol" }
+thiserror = "2"

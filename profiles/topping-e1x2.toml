@@ -1,0 +1,69 @@
+[device]
+name = "Topping E1x2 OTG"
+rate = 48000
+period_size = 64
+buffer_size = 192
+pro_latency_periods = 1
+shared_latency_periods = 3
+realtime = true
+realtime_priority = 50
+
+[device.playback]
+device = "hw:OTG,0"
+channels = 8
+format = "S32_LE"
+
+[device.capture]
+device = "hw:OTG,0"
+channels = 10
+format = "S32_LE"
+
+[[ports.playback]]
+id = "line1"
+name = "Line 1"
+channels = [0, 1]
+
+[[ports.playback]]
+id = "line2"
+name = "Line 2"
+channels = [2, 3]
+
+[[ports.playback]]
+id = "line3"
+name = "Line 3"
+channels = [4, 5]
+
+[[ports.playback]]
+id = "line4"
+name = "Line 4"
+channels = [6, 7]
+
+[[ports.capture]]
+id = "mic1"
+name = "Mic 1"
+channels = [0]
+
+[[ports.capture]]
+id = "mic2"
+name = "Mic 2"
+channels = [1]
+
+[[ports.capture]]
+id = "input34"
+name = "Input 3/4"
+channels = [2, 3]
+
+[[ports.capture]]
+id = "input56"
+name = "Input 5/6"
+channels = [4, 5]
+
+[[ports.capture]]
+id = "input78"
+name = "Input 7/8"
+channels = [6, 7]
+
+[[ports.capture]]
+id = "input910"
+name = "Input 9/10"
+channels = [8, 9]
