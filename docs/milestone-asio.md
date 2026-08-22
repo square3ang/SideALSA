@@ -13,10 +13,11 @@ ASIO input and output latency each report one operational Q64 period. The
 192-frame ALSA value is ring capacity, not queued ASIO software latency.
 
 PRO duplex clients use cycle notifications for a prepared-buffer pipeline. The
-playback worker is the sole sequence clock. During hardware playback period
-`N`, it publishes the newest capture block under future playback sequence
-`N + lead`. The client may publish playback for that target any time before the
-hardware writer consumes it. The hardware writer never waits for the client.
+playback worker is the sole sequence clock. Before waiting for hardware playback
+period `N`, it publishes writable sequence `N + lead`; the capture worker binds
+its next completed block to that target. The client may publish playback for
+that target any time before the hardware writer consumes it. The hardware
+writer never waits for the client.
 Missing playback gets one zero-filled fallback period, while stale playback is
 discarded and cannot affect later sequences.
 
@@ -60,8 +61,9 @@ that callback stack addresses belong to the Wine-created worker thread.
 It returns `77` when daemon connection is unavailable.
 
 ASIO begins with the first playback-clock target and publishes playback under
-that sequence. The configured one-period lead supplies deterministic startup
-margin without timed waits in the daemon or hardware writer.
+that sequence. The E1x2 profile uses zero additional lookahead; the hardware
+transfer interval supplies the callback window without timed client waits in
+the daemon or hardware writer.
 
 Poll live counters from another control connection while ASIO owns PRO:
 

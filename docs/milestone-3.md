@@ -1,10 +1,10 @@
 # Milestone 3: Local Fake PRO Client
 
 `DuplexEngine::run_pro` adds an in-process PRO path without changing physical
-ALSA ownership. The playback worker is the sole PRO sequence clock. Capture
-crosses from the capture worker through a fixed SPSC ring, and the playback
-worker publishes the newest capture block with a future playback sequence. The
-hardware workers never wait for a client callback.
+ALSA ownership. The playback worker is the sole PRO sequence clock. It publishes
+the writable playback target before waiting for the hardware transfer point.
+The capture worker attaches its completed block to that target and wakes the
+client. The hardware workers never wait for a client callback.
 
 Each audio block carries a sequence number. Playback consumes only its exact
 sequence. Missing blocks produce one zero-filled fallback period and stale
@@ -12,10 +12,10 @@ blocks are discarded. Client-owned PRO playback misses count
 `pro_deadline_misses`. They do not call ALSA recovery or reset the hardware
 timeline.
 
-`device.pro_latency_periods` configures fixed PRO output lookahead. The direct
-pipeline enforces at least one period because playback cannot depend on an
-unfinished same-cycle callback. Maximum value is `7`, limited by the fixed
-shared-memory ring. Reference profile uses `1` period.
+`device.pro_latency_periods` configures additional PRO output lookahead. `0`
+uses the current writable hardware period for minimum latency. Higher values
+trade whole periods of latency for client scheduling margin. Maximum value is
+`7`, limited by the fixed shared-memory ring. Reference profile uses `0`.
 
 `device.realtime = true` is default. Engine worker parent enters `SCHED_FIFO`
 with `device.realtime_priority` before spawning capture and playback workers.

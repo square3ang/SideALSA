@@ -3,7 +3,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -14,7 +14,7 @@ use alsa::{
 };
 use thiserror::Error;
 
-use crate::pro::{CaptureRing, ProCaptureSink, ProPlaybackSource};
+use crate::pro::{ProCaptureSink, ProPlaybackSource};
 use crate::{
     HardwareConfig, HardwareStats, HardwareTimeline, MAX_PRO_LATENCY_PERIODS, Profile,
     RoutingError, RoutingTable, SampleFormat,
@@ -291,6 +291,54 @@ impl DuplexEngine {
         Ok(())
     }
 
+    fn start_playback_first(&mut self) -> Result<(), EngineError> {
+        if self.started {
+            return Ok(());
+        }
+
+        let playback_pcm = self
+            .playback_pcm
+            .as_ref()
+            .ok_or_else(|| EngineError::InvalidConfig("playback worker is active".into()))?;
+        let capture_pcm = self
+            .capture_pcm
+            .as_ref()
+            .ok_or_else(|| EngineError::InvalidConfig("capture worker is active".into()))?;
+        let written = write_playback_samples(
+            playback_pcm,
+            &self.playback_silence,
+            self.playback_channels,
+            self.playback_start_samples,
+        )?;
+        if written != self.playback_start_frames {
+            return Err(EngineError::ShortCommit {
+                direction: StreamDirection::Playback,
+                actual: written,
+                required: self.playback_start_frames,
+            });
+        }
+
+        if playback_pcm.state() != State::Running {
+            alsa_call(
+                playback_pcm.start(),
+                "start playback stream",
+                StreamDirection::Playback,
+            )?;
+        }
+        if capture_pcm.state() != State::Running
+            && let Err(error) = alsa_call(
+                capture_pcm.start(),
+                "start capture stream",
+                StreamDirection::Capture,
+            )
+        {
+            let _ = playback_pcm.drop();
+            return Err(error);
+        }
+        self.started = true;
+        Ok(())
+    }
+
     pub fn run(&mut self, stop: &AtomicBool, max_periods: Option<u64>) -> Result<(), EngineError> {
         let _realtime = self.enter_realtime()?;
         self.start()?;
@@ -349,6 +397,7 @@ impl DuplexEngine {
                     capture_config,
                     capture_control,
                     None,
+                    None,
                 )
             });
             let playback_handle = scope.spawn(move || {
@@ -356,8 +405,6 @@ impl DuplexEngine {
                     playback_pcm,
                     playback_config,
                     playback_control,
-                    None,
-                    None,
                     None,
                     None,
                     None,
@@ -389,11 +436,13 @@ impl DuplexEngine {
         mut playback_source: P,
     ) -> Result<(), EngineError> {
         let _realtime = self.enter_realtime()?;
-        self.start()?;
+        if self.config.pro_latency_periods == 0 {
+            self.start_playback_first()?;
+        } else {
+            self.start()?;
+        }
 
         let done = AtomicBool::new(false);
-        let capture_ring = CaptureRing::new(8, self.capture_period_samples);
-        let mut playback_capture_scratch = vec![0; self.capture_period_samples];
         let mut playback_scratch = vec![0; self.playback_period_samples];
         let playback_pcm = self
             .playback_pcm
@@ -411,7 +460,8 @@ impl DuplexEngine {
         let playback_silence = &self.playback_silence;
         let capture_scratch = &mut self.capture_scratch;
         let timeline = &self.timeline;
-        let sequence_lead = u64::from(self.config.pro_latency_periods.max(1));
+        let sequence_lead = u64::from(self.config.pro_latency_periods);
+        let pro_clock = AtomicU64::new(sequence_lead);
         let capture_config = CaptureWorkerConfig {
             channels: self.capture_channels,
             period_samples: self.capture_period_samples,
@@ -436,15 +486,16 @@ impl DuplexEngine {
         };
         let playback_control = capture_control;
         std::thread::scope(|scope| -> Result<_, EngineError> {
-            let capture_ring_producer = &capture_ring;
-            let capture_ring_consumer = &capture_ring;
+            let capture_clock = &pro_clock;
+            let playback_clock = &pro_clock;
             let capture_handle = scope.spawn(move || {
                 capture_worker(
                     capture_pcm,
                     capture_scratch,
                     capture_config,
                     capture_control,
-                    Some(capture_ring_producer),
+                    Some(capture_clock),
+                    Some(&mut capture_sink),
                 )
             });
             let playback_handle = scope.spawn(move || {
@@ -452,9 +503,7 @@ impl DuplexEngine {
                     playback_pcm,
                     playback_config,
                     playback_control,
-                    Some(capture_ring_consumer),
-                    Some(&mut playback_capture_scratch),
-                    Some(&mut capture_sink),
+                    Some(playback_clock),
                     Some(&mut playback_scratch),
                     Some(&mut playback_source),
                     max_periods,
@@ -555,14 +604,11 @@ struct CaptureWorkerConfig {
     period: alsa::pcm::Frames,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn playback_worker(
     pcm: PCM,
     config: PlaybackWorkerConfig<'_>,
     control: WorkerControl<'_>,
-    capture_ring: Option<&CaptureRing>,
-    capture_scratch: Option<&mut [i32]>,
-    capture_sink: Option<&mut dyn ProCaptureSink>,
+    pro_clock: Option<&AtomicU64>,
     output_scratch: Option<&mut [i32]>,
     playback_source: Option<&mut dyn ProPlaybackSource>,
     max_periods: Option<u64>,
@@ -571,9 +617,7 @@ fn playback_worker(
         &pcm,
         config,
         control,
-        capture_ring,
-        capture_scratch,
-        capture_sink,
+        pro_clock,
         output_scratch,
         playback_source,
         max_periods,
@@ -581,22 +625,17 @@ fn playback_worker(
     (pcm, result)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn playback_worker_loop(
     pcm: &PCM,
     config: PlaybackWorkerConfig<'_>,
     control: WorkerControl<'_>,
-    capture_ring: Option<&CaptureRing>,
-    capture_scratch: Option<&mut [i32]>,
-    mut capture_sink: Option<&mut dyn ProCaptureSink>,
+    pro_clock: Option<&AtomicU64>,
     output_scratch: Option<&mut [i32]>,
     mut playback_source: Option<&mut dyn ProPlaybackSource>,
     max_periods: Option<u64>,
 ) -> Result<(), EngineError> {
     let mut position = 0_u64;
     let mut sequence = 0_u64;
-    let mut capture_index = 0_usize;
-    let mut capture_scratch = capture_scratch;
     let mut output_scratch = output_scratch;
 
     loop {
@@ -647,29 +686,6 @@ fn playback_worker_loop(
             );
         }
 
-        if let (Some(ring), Some(scratch), Some(sink)) = (
-            capture_ring,
-            capture_scratch.as_deref_mut(),
-            capture_sink.as_deref_mut(),
-        ) {
-            let mut captured = false;
-            while ring.try_pop(&mut capture_index, scratch) {
-                captured = true;
-            }
-            if !captured {
-                scratch.fill(0);
-            }
-            let target_sequence = pro_target_sequence(sequence, config.sequence_lead);
-            if catch_unwind(AssertUnwindSafe(|| {
-                sink.process_capture(target_sequence, scratch);
-            }))
-            .is_err()
-            {
-                control.done.store(true, Ordering::Release);
-                return Err(EngineError::WorkerPanic);
-            }
-        }
-
         let samples = match (
             playback_source.as_deref_mut(),
             output_scratch.as_deref_mut(),
@@ -693,6 +709,12 @@ fn playback_worker_loop(
             Ok(written) if written == config.period => {
                 position = position.wrapping_add(config.period as u64);
                 sequence = sequence.wrapping_add(1);
+                if let Some(clock) = pro_clock {
+                    clock.store(
+                        pro_target_sequence(sequence, config.sequence_lead),
+                        Ordering::Release,
+                    );
+                }
                 control.timeline.update_playback_position(position);
                 control.timeline.processed_frames(config.period as u64, 1);
             }
@@ -735,9 +757,10 @@ fn capture_worker(
     scratch: &mut [i32],
     config: CaptureWorkerConfig,
     control: WorkerControl<'_>,
-    capture_ring: Option<&CaptureRing>,
+    pro_clock: Option<&AtomicU64>,
+    capture_sink: Option<&mut dyn ProCaptureSink>,
 ) -> (PCM, Result<(), EngineError>) {
-    let result = capture_worker_loop(&pcm, scratch, config, control, capture_ring);
+    let result = capture_worker_loop(&pcm, scratch, config, control, pro_clock, capture_sink);
     (pcm, result)
 }
 
@@ -746,10 +769,11 @@ fn capture_worker_loop(
     scratch: &mut [i32],
     config: CaptureWorkerConfig,
     control: WorkerControl<'_>,
-    capture_ring: Option<&CaptureRing>,
+    pro_clock: Option<&AtomicU64>,
+    mut capture_sink: Option<&mut dyn ProCaptureSink>,
 ) -> Result<(), EngineError> {
     let mut position = 0_u64;
-    let mut capture_index = 0_usize;
+    let mut last_pro_sequence = None;
 
     loop {
         if control.stop.load(Ordering::Relaxed) || control.done.load(Ordering::Acquire) {
@@ -766,8 +790,17 @@ fn capture_worker_loop(
                         config.period as u64,
                     );
                 }
-                if let Some(ring) = capture_ring {
-                    let _ = ring.try_push(&mut capture_index, scratch);
+                if let (Some(clock), Some(sink)) = (pro_clock, capture_sink.as_deref_mut()) {
+                    let sequence = clock.load(Ordering::Acquire);
+                    if let Some(sequence) = take_new_pro_sequence(&mut last_pro_sequence, sequence)
+                        && catch_unwind(AssertUnwindSafe(|| {
+                            sink.process_capture(sequence, scratch);
+                        }))
+                        .is_err()
+                    {
+                        control.done.store(true, Ordering::Release);
+                        return Err(EngineError::WorkerPanic);
+                    }
                 }
                 position = position.wrapping_add(config.period as u64);
                 control.timeline.update_capture_position(position);
@@ -803,6 +836,15 @@ fn capture_worker_loop(
 
 fn pro_target_sequence(playback_sequence: u64, lead: u64) -> u64 {
     playback_sequence.wrapping_add(lead)
+}
+
+fn take_new_pro_sequence(last: &mut Option<u64>, current: u64) -> Option<u64> {
+    if *last == Some(current) {
+        None
+    } else {
+        *last = Some(current);
+        Some(current)
+    }
 }
 
 fn read_capture_samples(
@@ -1176,10 +1218,11 @@ impl EngineError {
 
 #[cfg(test)]
 mod tests {
-    use super::pro_target_sequence;
+    use super::{pro_target_sequence, take_new_pro_sequence};
 
     #[test]
     fn pro_target_tracks_canonical_playback_sequence() {
+        assert_eq!(pro_target_sequence(4, 0), 4);
         assert_eq!(pro_target_sequence(4, 1), 5);
         assert_eq!(pro_target_sequence(9, 1), 10);
         assert_eq!(pro_target_sequence(10, 1), 11);
@@ -1188,5 +1231,14 @@ mod tests {
     #[test]
     fn pro_target_wraps_with_playback_sequence() {
         assert_eq!(pro_target_sequence(u64::MAX, 1), 0);
+    }
+
+    #[test]
+    fn capture_publishes_each_playback_target_once() {
+        let mut last = None;
+
+        assert_eq!(take_new_pro_sequence(&mut last, 4), Some(4));
+        assert_eq!(take_new_pro_sequence(&mut last, 4), None);
+        assert_eq!(take_new_pro_sequence(&mut last, 7), Some(7));
     }
 }
