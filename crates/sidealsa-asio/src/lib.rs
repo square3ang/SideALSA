@@ -10,7 +10,7 @@ use std::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    thread::{self, JoinHandle, ThreadId},
+    thread,
     time::Duration,
 };
 
@@ -81,6 +81,29 @@ pub struct AsioCallbacks {
     pub sample_rate_changed: Option<SampleRateChanged>,
     pub asio_message: Option<AsioMessage>,
     pub buffer_switch_time_info: Option<BufferSwitchTimeInfo>,
+}
+
+pub type ThreadCreate = unsafe extern "C" fn(
+    context: *mut c_void,
+    handle: *mut *mut c_void,
+    thread_id: *mut u32,
+) -> c_int;
+pub type ThreadJoin = unsafe extern "C" fn(handle: *mut c_void) -> c_int;
+pub type CurrentThreadId = unsafe extern "C" fn() -> u32;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AsioThreadOps {
+    pub create: Option<ThreadCreate>,
+    pub join: Option<ThreadJoin>,
+    pub current_thread_id: Option<CurrentThreadId>,
+}
+
+#[derive(Clone, Copy)]
+struct ThreadOps {
+    create: ThreadCreate,
+    join: ThreadJoin,
+    current_thread_id: CurrentThreadId,
 }
 
 #[repr(C)]
@@ -154,7 +177,7 @@ struct DriverInner {
     callbacks: Option<AsioCallbacks>,
     time_info: bool,
     worker: Option<WorkerHandle>,
-    worker_thread: Option<ThreadId>,
+    worker_thread: Option<u32>,
     sample_position: Arc<AtomicU64>,
     time_stamp: Arc<AtomicU64>,
     last_error: Option<String>,
@@ -163,10 +186,15 @@ struct DriverInner {
 pub struct AsioDriver {
     inner: Mutex<DriverInner>,
     worker_done: Condvar,
+    thread_ops: Option<ThreadOps>,
 }
 
 impl AsioDriver {
     pub fn new() -> Self {
+        Self::new_with_thread_ops(None)
+    }
+
+    fn new_with_thread_ops(thread_ops: Option<ThreadOps>) -> Self {
         Self {
             inner: Mutex::new(DriverInner {
                 state: DriverState::Loaded,
@@ -184,6 +212,7 @@ impl AsioDriver {
                 last_error: None,
             }),
             worker_done: Condvar::new(),
+            thread_ops,
         }
     }
 
@@ -251,13 +280,8 @@ impl AsioDriver {
     pub fn get_latencies(&self) -> Result<(c_int, c_int), AsioError> {
         let inner = self.lock()?;
         ensure_initialized(inner.state)?;
-        let period = checked_c_int(
-            inner
-                .device
-                .as_ref()
-                .ok_or(AsioError::InvalidState)?
-                .period_size,
-        )?;
+        let device = inner.device.as_ref().ok_or(AsioError::InvalidState)?;
+        let period = checked_c_int(device.period_size)?;
         Ok((period, period))
     }
 
@@ -299,7 +323,7 @@ impl AsioDriver {
         buffer_size: c_int,
         callbacks: AsioCallbacks,
     ) -> Result<(), AsioError> {
-        let mut inner = self.lock()?;
+        let inner = self.lock()?;
         if inner.state != DriverState::Initialized {
             return Err(AsioError::InvalidState);
         }
@@ -355,6 +379,7 @@ impl AsioDriver {
             info.buffers = buffer.pointers();
         }
 
+        drop(inner);
         let time_info = callbacks.asio_message.is_some_and(|message| unsafe {
             message(
                 ASIO_MESSAGE_SUPPORTS_TIME_INFO,
@@ -363,6 +388,10 @@ impl AsioDriver {
                 ptr::null_mut(),
             ) != 0
         });
+        let mut inner = self.lock()?;
+        if inner.state != DriverState::Initialized {
+            return Err(AsioError::InvalidState);
+        }
         inner.buffers = Some(buffers);
         inner.active = Some(Arc::new(ActiveChannels {
             input: input_active,
@@ -380,17 +409,14 @@ impl AsioDriver {
         if inner.state != DriverState::Prepared {
             return Err(AsioError::InvalidState);
         }
-        let stream = inner.stream.take().ok_or(AsioError::NoIo)?;
+        let thread_ops = self.thread_ops.ok_or(AsioError::Worker)?;
         let rate = inner.device.as_ref().ok_or(AsioError::InvalidState)?.rate;
         let shared = inner.shared.ok_or(AsioError::InvalidState)?;
         let buffers = inner.buffers.clone().ok_or(AsioError::InvalidState)?;
         let active = inner.active.clone().ok_or(AsioError::InvalidState)?;
         let callbacks = inner.callbacks.ok_or(AsioError::InvalidState)?;
         let time_info = inner.time_info;
-        let ready = Arc::new(AtomicBool::new(false));
-        let worker_ready = Arc::clone(&ready);
         let stop = Arc::new(StopSignal::new()?);
-        let control = Arc::clone(&stop);
         let sample_position = Arc::clone(&inner.sample_position);
         let time_stamp = Arc::clone(&inner.time_stamp);
         let period_frames =
@@ -403,44 +429,52 @@ impl AsioDriver {
                 usize::try_from(shared.playback_channels).map_err(|_| AsioError::NoMemory)?,
             )
             .ok_or(AsioError::NoMemory)?;
-        let worker = thread::Builder::new()
-            .name("sidealsa-asio".into())
-            .spawn(move || {
-                while !worker_ready.load(Ordering::Acquire) {
-                    thread::yield_now();
-                }
-                run_worker(
-                    stream,
-                    control,
-                    buffers,
-                    active,
-                    callbacks,
-                    time_info,
-                    rate,
-                    period_frames,
-                    capture_samples,
-                    playback_samples,
-                    sample_position,
-                    time_stamp,
-                )
-            })
-            .map_err(|_| AsioError::Worker)?;
-        let thread_id = worker.thread().id();
+        let stream = inner.stream.take().ok_or(AsioError::NoIo)?;
+        let context = Box::new(WorkerContext {
+            ready: AtomicBool::new(false),
+            stream: Mutex::new(Some(stream)),
+            input: WorkerInput {
+                stop: Arc::clone(&stop),
+                buffers,
+                active,
+                callbacks,
+                time_info,
+                rate,
+                period_frames,
+                capture_samples,
+                playback_samples,
+                sample_position,
+                time_stamp,
+            },
+            error: Mutex::new(None),
+        });
+        let context = Box::into_raw(context);
+        let mut thread_handle = ptr::null_mut();
+        let mut thread_id = 0;
+        let create_result =
+            unsafe { (thread_ops.create)(context.cast(), &mut thread_handle, &mut thread_id) };
+        if create_result != 0 || thread_handle.is_null() || thread_id == 0 {
+            let context = unsafe { Box::from_raw(context) };
+            inner.stream = context.take_stream();
+            return Err(AsioError::Worker);
+        }
         inner.worker = Some(WorkerHandle {
             stop,
             thread_id,
-            join: Some(worker),
+            handle: thread_handle,
+            context,
+            thread_ops,
         });
         inner.worker_thread = Some(thread_id);
         inner.sample_position.store(0, Ordering::Release);
         inner.time_stamp.store(0, Ordering::Release);
         inner.state = DriverState::Running;
-        ready.store(true, Ordering::Release);
+        unsafe { &*context }.ready.store(true, Ordering::Release);
         Ok(())
     }
 
     pub fn stop(&self) -> Result<(), AsioError> {
-        let current = thread::current().id();
+        let current = self.current_thread_id();
         let handle = {
             let mut inner = self.lock()?;
             loop {
@@ -488,7 +522,7 @@ impl AsioDriver {
     }
 
     pub fn close(&self) -> Result<(), AsioError> {
-        let current = thread::current().id();
+        let current = self.current_thread_id();
         {
             let inner = self.lock()?;
             if inner.worker_thread == Some(current) {
@@ -542,7 +576,7 @@ impl AsioDriver {
     }
 
     fn reap_worker(&self) -> Result<(), AsioError> {
-        let current = thread::current().id();
+        let current = self.current_thread_id();
         let handle = {
             let mut inner = self.lock()?;
             if inner.worker_thread == Some(current) {
@@ -559,29 +593,31 @@ impl AsioDriver {
         self.finish_worker(handle)
     }
 
-    fn finish_worker(&self, mut handle: WorkerHandle) -> Result<(), AsioError> {
+    fn finish_worker(&self, handle: WorkerHandle) -> Result<(), AsioError> {
         handle.stop.request();
-        let join = handle.join.take().ok_or(AsioError::Worker)?;
-        let result = match join.join() {
-            Ok(result) => result,
-            Err(_) => {
-                let mut inner = self.lock()?;
-                inner.worker_thread = None;
-                inner.state = DriverState::Prepared;
-                self.worker_done.notify_all();
-                return Err(AsioError::Worker);
-            }
-        };
+        if unsafe { (handle.thread_ops.join)(handle.handle) } != 0 {
+            let mut inner = self.lock()?;
+            inner.worker = Some(handle);
+            self.worker_done.notify_all();
+            return Err(AsioError::Worker);
+        }
+        let context = unsafe { Box::from_raw(handle.context) };
+        let (stream, error) = context.into_exit();
         let mut inner = self.lock()?;
-        inner.stream = Some(result.stream);
+        inner.stream = stream;
         inner.worker_thread = None;
         inner.state = DriverState::Prepared;
         self.worker_done.notify_all();
-        if let Some(error) = result.error {
+        if let Some(error) = error {
             inner.last_error = Some(error.to_string());
             return Err(error);
         }
         Ok(())
+    }
+
+    fn current_thread_id(&self) -> u32 {
+        self.thread_ops
+            .map_or(0, |ops| unsafe { (ops.current_thread_id)() })
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, DriverInner>, AsioError> {
@@ -597,20 +633,21 @@ impl Default for AsioDriver {
 
 impl Drop for AsioDriver {
     fn drop(&mut self) {
-        let current = thread::current().id();
+        let current = self.current_thread_id();
         let handle = self
             .inner
             .get_mut()
             .ok()
             .and_then(|inner| inner.worker.take());
-        if let Some(mut handle) = handle {
+        if let Some(handle) = handle {
             handle.stop.request();
             if handle.thread_id != current
-                && let Some(join) = handle.join.take()
-                && let Ok(exit) = join.join()
+                && unsafe { (handle.thread_ops.join)(handle.handle) } == 0
             {
-                let mut stream = exit.stream;
-                let _ = stream.close();
+                let context = unsafe { Box::from_raw(handle.context) };
+                if let Some(mut stream) = context.take_stream() {
+                    let _ = stream.close();
+                }
             }
         }
         if let Ok(inner) = self.inner.get_mut()
@@ -623,13 +660,54 @@ impl Drop for AsioDriver {
 
 struct WorkerHandle {
     stop: Arc<StopSignal>,
-    thread_id: ThreadId,
-    join: Option<JoinHandle<WorkerExit>>,
+    thread_id: u32,
+    handle: *mut c_void,
+    context: *mut WorkerContext,
+    thread_ops: ThreadOps,
 }
 
-struct WorkerExit {
-    stream: AudioStream,
-    error: Option<AsioError>,
+unsafe impl Send for WorkerHandle {}
+
+struct WorkerInput {
+    stop: Arc<StopSignal>,
+    buffers: Arc<HostBuffers>,
+    active: Arc<ActiveChannels>,
+    callbacks: AsioCallbacks,
+    time_info: bool,
+    rate: u32,
+    period_frames: usize,
+    capture_samples: usize,
+    playback_samples: usize,
+    sample_position: Arc<AtomicU64>,
+    time_stamp: Arc<AtomicU64>,
+}
+
+struct WorkerContext {
+    ready: AtomicBool,
+    stream: Mutex<Option<AudioStream>>,
+    input: WorkerInput,
+    error: Mutex<Option<AsioError>>,
+}
+
+impl WorkerContext {
+    fn take_stream(&self) -> Option<AudioStream> {
+        self.stream
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    fn into_exit(self) -> (Option<AudioStream>, Option<AsioError>) {
+        let stream = self
+            .stream
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let error = self
+            .error
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (stream, error)
+    }
 }
 
 struct ActiveChannels {
@@ -748,67 +826,26 @@ impl Drop for StopSignal {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_worker(
-    mut stream: AudioStream,
-    stop: Arc<StopSignal>,
-    buffers: Arc<HostBuffers>,
-    active: Arc<ActiveChannels>,
-    callbacks: AsioCallbacks,
-    time_info: bool,
-    rate: u32,
-    period_frames: usize,
-    capture_samples: usize,
-    playback_samples: usize,
-    sample_position: Arc<AtomicU64>,
-    time_stamp: Arc<AtomicU64>,
-) -> WorkerExit {
-    let mut capture = vec![0_i32; capture_samples].into_boxed_slice();
-    let mut playback = vec![0_i32; playback_samples].into_boxed_slice();
-    let audio_fd = match stream.notification_fd() {
-        Ok(fd) => fd,
-        Err(error) => {
-            return WorkerExit {
-                stream,
-                error: Some(error.into()),
-            };
-        }
-    };
+fn run_worker(stream: &mut AudioStream, input: &WorkerInput) -> Result<(), AsioError> {
+    let mut capture = vec![0_i32; input.capture_samples].into_boxed_slice();
+    let mut playback = vec![0_i32; input.playback_samples].into_boxed_slice();
+    let audio_fd = stream.notification_fd()?;
     let result = match stream.start() {
-        Ok(()) => {
-            let prime_result = if playback_samples > 0 {
-                playback.fill(0);
-                let sequence = stream.cycle_sequence().wrapping_add(1);
-                stream
-                    .submit_playback(sequence, &playback)
-                    .and_then(require_playback_publish)
-                    .and_then(|_| {
-                        stream
-                            .submit_playback(sequence.wrapping_add(1), &playback)
-                            .and_then(require_playback_publish)
-                    })
-            } else {
-                Ok(())
-            };
-            match prime_result {
-                Ok(()) => worker_loop(
-                    &mut stream,
-                    audio_fd,
-                    &stop,
-                    &buffers,
-                    &active,
-                    callbacks,
-                    time_info,
-                    rate,
-                    period_frames,
-                    &mut capture,
-                    &mut playback,
-                    &sample_position,
-                    &time_stamp,
-                ),
-                Err(error) => Err(error.into()),
-            }
-        }
+        Ok(()) => worker_loop(
+            stream,
+            audio_fd,
+            &input.stop,
+            &input.buffers,
+            &input.active,
+            input.callbacks,
+            input.time_info,
+            input.rate,
+            input.period_frames,
+            &mut capture,
+            &mut playback,
+            &input.sample_position,
+            &input.time_stamp,
+        ),
         Err(error) => Err(error.into()),
     };
     let stop_result = stream.stop();
@@ -818,11 +855,7 @@ fn run_worker(
     let error = result
         .err()
         .or_else(|| stop_result.err().map(AsioError::from));
-    WorkerExit { stream, error }
-}
-
-fn require_playback_publish(published: bool) -> Result<(), ClientError> {
-    published.then_some(()).ok_or(ClientError::BufferNotReady)
+    error.map_or(Ok(()), Err)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -842,6 +875,7 @@ fn worker_loop(
     time_stamp: &AtomicU64,
 ) -> Result<(), AsioError> {
     let mut buffer_index = 0_usize;
+    let mut previous_sequence = None;
     while !stop.is_requested() {
         let sequence = wait_cycle(stream, audio_fd, stop)?;
         let Some(sequence) = sequence else {
@@ -863,9 +897,17 @@ fn worker_loop(
         let samples = sample_position.load(Ordering::Relaxed);
         invoke_callback(callbacks, time_info, buffer_index, samples, stamp, rate)?;
         copy_host_to_playback(buffers, active, buffer_index, playback, period_frames);
-        let _ = stream.submit_playback(block_sequence.wrapping_add(1), playback)?;
+        let _ = stream.submit_playback(block_sequence, playback)?;
+        let elapsed_periods = previous_sequence
+            .map(|previous| block_sequence.wrapping_sub(previous).max(1))
+            .unwrap_or(1);
+        previous_sequence = Some(block_sequence);
         sample_position.store(
-            samples.saturating_add(u64::try_from(period_frames).unwrap_or(0)),
+            samples.saturating_add(
+                u64::try_from(period_frames)
+                    .unwrap_or(0)
+                    .saturating_mul(elapsed_periods),
+            ),
             Ordering::Release,
         );
         buffer_index ^= 1;
@@ -1068,12 +1110,57 @@ where
 #[unsafe(no_mangle)]
 /// # Safety
 ///
-/// `out` must be a valid writable pointer.
-pub unsafe extern "C" fn sidealsa_asio_new(out: *mut *mut AsioDriver) -> c_int {
-    if out.is_null() {
+/// `context` must point to a live `WorkerContext` until its thread is joined.
+pub unsafe extern "C" fn sidealsa_asio_worker_entry(context: *mut c_void) {
+    let Some(context) = (unsafe { (context.cast::<WorkerContext>()).as_ref() }) else {
+        return;
+    };
+    while !context.ready.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let mut stream = context
+            .stream
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stream = stream.as_mut().ok_or(AsioError::Worker)?;
+        run_worker(stream, &context.input)
+    }));
+    let error = match result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error),
+        Err(_) => Some(AsioError::Worker),
+    };
+    *context
+        .error
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = error;
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `thread_ops` must point to a valid function table and `out` must be writable.
+pub unsafe extern "C" fn sidealsa_asio_new(
+    thread_ops: *const AsioThreadOps,
+    out: *mut *mut AsioDriver,
+) -> c_int {
+    if thread_ops.is_null() || out.is_null() {
         return ASIO_INVALID_PARAMETER;
     }
-    let driver = Box::new(AsioDriver::new());
+    let thread_ops = unsafe { *thread_ops };
+    let (Some(create), Some(join), Some(current_thread_id)) = (
+        thread_ops.create,
+        thread_ops.join,
+        thread_ops.current_thread_id,
+    ) else {
+        return ASIO_INVALID_PARAMETER;
+    };
+    let driver = Box::new(AsioDriver::new_with_thread_ops(Some(ThreadOps {
+        create,
+        join,
+        current_thread_id,
+    })));
     unsafe {
         *out = Box::into_raw(driver);
     }
@@ -1177,7 +1264,11 @@ pub unsafe extern "C" fn sidealsa_asio_create_buffers(
         return ASIO_INVALID_PARAMETER;
     }
     catch_unwind(AssertUnwindSafe(|| unsafe {
-        let infos = slice::from_raw_parts_mut(infos, count as usize);
+        let infos = if count == 0 {
+            &mut []
+        } else {
+            slice::from_raw_parts_mut(infos, count as usize)
+        };
         match (&*driver).create_buffers(infos, buffer_size, *callbacks) {
             Ok(()) => ASIO_SUCCESS,
             Err(error) => error.code(),
@@ -1350,7 +1441,8 @@ mod tests {
             name: "Test".into(),
             rate: 48000,
             period_size: 64,
-            buffer_size: 64,
+            buffer_size: 192,
+            shared_latency_periods: 3,
             playback_channels: 8,
             capture_channels: 10,
             playback_ports: Vec::new(),
@@ -1361,6 +1453,10 @@ mod tests {
         assert_eq!(
             driver.get_buffer_size().expect("size should work"),
             (64, 64, 64, 0)
+        );
+        assert_eq!(
+            driver.get_latencies().expect("latencies should work"),
+            (64, 64)
         );
     }
 

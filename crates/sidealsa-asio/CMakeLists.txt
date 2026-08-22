@@ -33,6 +33,10 @@ set(WINE_WINDOWS_OUTPUT
     "${CMAKE_CURRENT_BINARY_DIR}/x86_64-windows/sidealsa-asio64.dll")
 set(WINE_UNIX_OUTPUT
     "${CMAKE_CURRENT_BINARY_DIR}/x86_64-unix/sidealsa-asio64.dll.so")
+set(WINE_WINDOWS_ALIAS
+    "${CMAKE_CURRENT_BINARY_DIR}/x86_64-windows/sidealsa-asio.dll")
+set(WINE_UNIX_ALIAS
+    "${CMAKE_CURRENT_BINARY_DIR}/x86_64-unix/sidealsa-asio.dll.so")
 
 add_library(sidealsa-asio-shim OBJECT src/wine_shim.c)
 set_target_properties(sidealsa-asio-shim PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -96,6 +100,7 @@ add_custom_target(sidealsa-asio ALL DEPENDS "${DLL_OUTPUT}.stamp")
 
 add_custom_command(
     OUTPUT "${WINE_WINDOWS_OUTPUT}" "${WINE_UNIX_OUTPUT}"
+           "${WINE_WINDOWS_ALIAS}" "${WINE_UNIX_ALIAS}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory
             "${CMAKE_CURRENT_BINARY_DIR}/x86_64-windows"
             "${CMAKE_CURRENT_BINARY_DIR}/x86_64-unix"
@@ -103,6 +108,10 @@ add_custom_command(
             "../sidealsa-asio64.dll" "${WINE_WINDOWS_OUTPUT}"
     COMMAND "${CMAKE_COMMAND}" -E create_symlink
             "../sidealsa-asio64.dll.so" "${WINE_UNIX_OUTPUT}"
+    COMMAND "${CMAKE_COMMAND}" -E create_symlink
+            "../sidealsa-asio64.dll" "${WINE_WINDOWS_ALIAS}"
+    COMMAND "${CMAKE_COMMAND}" -E create_symlink
+            "../sidealsa-asio64.dll.so" "${WINE_UNIX_ALIAS}"
     DEPENDS "${DLL_OUTPUT}" "${UNIX_OUTPUT}"
     VERBATIM
 )

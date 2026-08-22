@@ -1,23 +1,25 @@
 # Milestone 3: Local Fake PRO Client
 
 `DuplexEngine::run_pro` adds an in-process PRO path without changing physical
-ALSA ownership. Capture and playback workers communicate with a separate PRO
-callback thread through fixed-capacity SPSC rings.
+ALSA ownership. The playback worker is the sole PRO sequence clock. Capture
+crosses from the capture worker through a fixed SPSC ring, and the playback
+worker publishes the newest capture block with a future playback sequence. The
+hardware workers never wait for a client callback.
 
 Each audio block carries a sequence number. Playback consumes only its exact
-sequence. Missing or stale blocks produce zero-filled fallback audio and count
-`pro_core_deadline_misses`. Client-owned PRO playback misses count
-`pro_deadline_misses`. Neither condition calls ALSA recovery or resets the
-hardware timeline.
+sequence. Missing blocks produce one zero-filled fallback period and stale
+blocks are discarded. Client-owned PRO playback misses count
+`pro_deadline_misses`. They do not call ALSA recovery or reset the hardware
+timeline.
 
-`device.pro_latency_periods` configures fixed PRO output lookahead. `0` keeps
-zero-period internal latency. Each additional period gives callback one more
-period to publish output before playback consumes it. Maximum value is `7`,
-limited by fixed eight-slot PRO ring. Reference profile uses `1` period.
+`device.pro_latency_periods` configures fixed PRO output lookahead. The direct
+pipeline enforces at least one period because playback cannot depend on an
+unfinished same-cycle callback. Maximum value is `7`, limited by the fixed
+shared-memory ring. Reference profile uses `1` period.
 
 `device.realtime = true` is default. Engine worker parent enters `SCHED_FIFO`
-with `device.realtime_priority` before spawning capture, callback, and playback
-workers. Setting realtime scheduling requires appropriate process privileges.
+with `device.realtime_priority` before spawning capture and playback workers.
+Setting realtime scheduling requires appropriate process privileges.
 
 ## Build
 
@@ -53,15 +55,16 @@ pro_latency_periods = 2
 
 ## Late PRO Test
 
-Delay callback every 16 periods by 2 ms:
+Use the daemon client to delay playback production every 16 periods by 2 ms:
 
 ```text
-target/release/sidealsa-pro-test --profile profiles/topping-e1x2.toml --periods 15000 --delay-ms 2 --delay-every 16
+target/release/sidealsa-pro-client-test --periods 15000 --delay-ms 2 --delay-every 16
 ```
 
 Expected:
 
-- `pro_core_deadline_misses > 0`
+- `pro_deadline_misses > 0`
+- `pro_core_deadline_misses=0`
 - `hw_playback_xruns=0`
 - `hw_capture_xruns=0`
 - `generation=0`
@@ -73,5 +76,5 @@ Expected:
 - PRO client is in-process only.
 - No Unix socket, shared memory, client ownership, or crash recovery protocol.
 - No SHARED path or mixer.
-- Fake PRO copies capture samples into playback samples.
+- Fake PRO capture and playback endpoints are independent.
 - Missing PRO output uses silence.

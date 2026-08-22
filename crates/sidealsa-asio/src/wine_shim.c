@@ -12,6 +12,7 @@
 #define SIDEALSA_ASIO_CLSID_STRING "{8C4D6A10-5A7D-4CC2-AE13-7D9E3E2A1B40}"
 #define SIDEALSA_ASIO_PROGID "SideALSA"
 #define SIDEALSA_ASIO_NAME "SideALSA ASIO"
+#define SIDEALSA_ASIO_NO_IO -1000
 
 static const CLSID CLSID_SideAlsaAsio
         = { 0x8c4d6a10, 0x5a7d, 0x4cc2, { 0xae, 0x13, 0x7d, 0x9e, 0x3e, 0x2a, 0x1b, 0x40 } };
@@ -57,6 +58,69 @@ struct SideAlsaAsioVtbl
 
 static LONG driver_objects;
 static LONG server_locks;
+
+static DWORD WINAPI
+sidealsa_worker_trampoline(void *context)
+{
+    sidealsa_asio_worker_entry(context);
+    return 0;
+}
+
+static int32_t
+sidealsa_worker_create(void *context, void **handle, uint32_t *thread_id)
+{
+    HANDLE thread;
+
+    if (!context || !handle || !thread_id)
+        return ERROR_INVALID_PARAMETER;
+    thread = CreateThread(NULL, 8 * 1024 * 1024, sidealsa_worker_trampoline, context,
+                          STACK_SIZE_PARAM_IS_A_RESERVATION | CREATE_SUSPENDED,
+                          (DWORD *)thread_id);
+    if (!thread)
+        return (int32_t)GetLastError();
+    if (!SetThreadPriority(thread, THREAD_PRIORITY_TIME_CRITICAL)
+        && !SetThreadPriority(thread, THREAD_PRIORITY_HIGHEST)) {
+        DWORD error = GetLastError();
+        TerminateThread(thread, error);
+        CloseHandle(thread);
+        return (int32_t)error;
+    }
+    if (ResumeThread(thread) == (DWORD)-1) {
+        DWORD error = GetLastError();
+        TerminateThread(thread, error);
+        CloseHandle(thread);
+        return (int32_t)error;
+    }
+    *handle = thread;
+    return 0;
+}
+
+static int32_t
+sidealsa_worker_join(void *handle)
+{
+    DWORD result;
+
+    if (!handle)
+        return ERROR_INVALID_HANDLE;
+    result = WaitForSingleObject(handle, INFINITE);
+    if (result != WAIT_OBJECT_0)
+        return (int32_t)GetLastError();
+    if (!CloseHandle(handle))
+        return (int32_t)GetLastError();
+    return 0;
+}
+
+static uint32_t
+sidealsa_current_thread_id(void)
+{
+    return GetCurrentThreadId();
+}
+
+static const SideAlsaAsioThreadOps sidealsa_thread_ops = {
+    sidealsa_worker_create,
+    sidealsa_worker_join,
+    sidealsa_current_thread_id,
+};
 
 static HRESULT WINAPI asio_query_interface(SideAlsaAsio *, REFIID, void **);
 static ULONG WINAPI asio_add_ref(SideAlsaAsio *);
@@ -131,6 +195,21 @@ asio_add_ref(SideAlsaAsio *self)
     return (ULONG)InterlockedIncrement(&self->ref);
 }
 
+static DWORD WINAPI
+asio_deferred_release(void *context)
+{
+    SideAlsaAsio *self = context;
+
+    if (sidealsa_asio_close(self->driver) != 0
+        && sidealsa_asio_close(self->driver) != 0)
+        return 0;
+    self->driver = NULL;
+    InterlockedExchange(&self->ref, 0);
+    InterlockedDecrement(&driver_objects);
+    HeapFree(GetProcessHeap(), 0, self);
+    return 0;
+}
+
 static ULONG WINAPI
 asio_release(SideAlsaAsio *self)
 {
@@ -139,7 +218,23 @@ asio_release(SideAlsaAsio *self)
     {
         if (self->driver)
         {
-            if (sidealsa_asio_close(self->driver) != 0)
+            LONG result = sidealsa_asio_close(self->driver);
+            if (result != 0 && result != SIDEALSA_ASIO_NO_IO)
+                result = sidealsa_asio_close(self->driver);
+            if (result == SIDEALSA_ASIO_NO_IO)
+            {
+                HANDLE cleanup;
+
+                InterlockedExchange(&self->ref, 1);
+                cleanup = CreateThread(NULL, 0, asio_deferred_release, self, 0, NULL);
+                if (cleanup)
+                {
+                    CloseHandle(cleanup);
+                    return 0;
+                }
+                return 1;
+            }
+            if (result != 0)
             {
                 InterlockedExchange(&self->ref, 1);
                 return 1;
@@ -169,7 +264,7 @@ asio_init(SideAlsaAsio *self, void *sys_ref)
     (void)sys_ref;
     if (!self->driver)
     {
-        if (sidealsa_asio_new(&self->driver) != 0)
+        if (sidealsa_asio_new(&sidealsa_thread_ops, &self->driver) != 0)
             return -9991;
         result = sidealsa_asio_init(self->driver, asio_socket_path());
         return result == 0 ? 1 : result;
@@ -311,11 +406,16 @@ asio_get_channel_info(SideAlsaAsio *self, SideAlsaAsioChannelInfo *info)
 
 static LONG WINAPI
 asio_create_buffers(SideAlsaAsio *self, SideAlsaAsioBufferInfo *infos, LONG count, LONG size,
-                    SideAlsaAsioCallbacks *callbacks)
+                     SideAlsaAsioCallbacks *callbacks)
 {
-    return self->driver
-                   ? sidealsa_asio_create_buffers(self->driver, infos, count, size, callbacks)
-                   : -1000;
+    LONG result;
+
+    if (!self->driver)
+        return -1000;
+    asio_add_ref(self);
+    result = sidealsa_asio_create_buffers(self->driver, infos, count, size, callbacks);
+    asio_release(self);
+    return result;
 }
 
 static LONG WINAPI

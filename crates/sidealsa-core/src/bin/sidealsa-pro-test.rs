@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use sidealsa_core::{DuplexEngine, ProCallback, Profile};
+use sidealsa_core::{DuplexEngine, ProCaptureSink, ProPlaybackSource, Profile};
 use signal_hook::{
     consts::signal::{SIGINT, SIGTERM},
     flag,
@@ -19,20 +19,24 @@ struct Args {
     delay_every: u64,
 }
 
-struct FakePro {
+struct FakeCapture {
     delay: Duration,
     delay_every: u64,
 }
 
-impl ProCallback for FakePro {
-    fn process(&mut self, sequence: u64, capture: &[i32], playback: &mut [i32]) {
+impl ProCaptureSink for FakeCapture {
+    fn process_capture(&mut self, sequence: u64, _capture: &[i32]) {
         if !self.delay.is_zero() && sequence.is_multiple_of(self.delay_every) {
             thread::sleep(self.delay);
         }
+    }
+}
 
-        for (index, sample) in playback.iter_mut().enumerate() {
-            *sample = capture.get(index).copied().unwrap_or(0);
-        }
+struct FakePlayback;
+
+impl ProPlaybackSource for FakePlayback {
+    fn process_playback(&mut self, _sequence: u64, playback: &mut [i32]) {
+        playback.fill(0);
     }
 }
 
@@ -75,11 +79,11 @@ fn main() {
         std::process::exit(1);
     }
 
-    let callback = FakePro {
+    let capture = FakeCapture {
         delay: Duration::from_millis(args.delay_ms),
         delay_every: args.delay_every,
     };
-    let run_result = engine.run_pro(&stop, args.periods, callback);
+    let run_result = engine.run_pro(&stop, args.periods, capture, FakePlayback);
     let stop_result = engine.stop();
     let stats = engine.stats();
 

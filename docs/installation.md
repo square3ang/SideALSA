@@ -14,13 +14,16 @@ re-enters as original user before building.
 Installer defaults:
 
 - binaries: `/usr/local/bin`
-- profile: `/etc/sidealsa/profiles/topping-e1x2.toml`
+- user-owned profile: `/etc/sidealsa/profiles/topping-e1x2.toml`
 - ALSA definitions: `/etc/alsa/conf.d/99-sidealsa.conf`
 - PipeWire objects: `/etc/pipewire/pipewire.conf.d/99-sidealsa.conf`
 - daemon service: `sidealsad.service`
 - socket: `/tmp/sidealsad.sock`
 - socket access: `audio` group when available
 - realtime scheduling: profile-controlled, enabled by default
+
+The profile is seeded only on first install. Reinstalling or upgrading never
+overwrites it, including when `--force` is used. Uninstall also preserves it.
 
 PipeWire adapter settings match the plugin and hardware at a `64`-frame period
 and three periods (`192` ALSA frames). SideALSA SHARED playback consumes data

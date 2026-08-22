@@ -91,7 +91,7 @@ Build and install SideALSA system files.
 
 Options:
   --prefix PATH             Binary and data prefix (default: /usr/local)
-  --profile PATH            Profile to install (default: profiles/topping-e1x2.toml)
+  --profile PATH            Profile seed for first install; existing config is preserved
   --socket PATH             Daemon socket (default: /tmp/sidealsad.sock)
   --alsa-plugin-dir PATH    ALSA external-plugin directory
   --no-build                Use existing target/release artifacts
@@ -279,7 +279,6 @@ MANAGED_PATHS+=(
     "$ALSA_PLUGIN_DIR/libasound_module_pcm_sidealsa.so"
     "$ALSA_CONFIG_PATH"
     "$SERVICE_PATH"
-    "$PROFILE_PATH"
     "$LICENSE_PATH"
 )
 if ((INSTALL_PIPEWIRE == 1)); then
@@ -292,6 +291,8 @@ if ((WITH_ASIO == 1)); then
     MANAGED_PATHS+=(
         "$PREFIX/lib/wine/x86_64-windows/sidealsa-asio64.dll"
         "$PREFIX/lib/wine/x86_64-unix/sidealsa-asio64.dll.so"
+        "$PREFIX/lib/wine/x86_64-windows/sidealsa-asio.dll"
+        "$PREFIX/lib/wine/x86_64-unix/sidealsa-asio.dll.so"
     )
     [[ -f "$ROOT/build-asio/sidealsa-asio64.dll" ]] || die "missing ASIO PE binary"
     [[ -f "$ROOT/build-asio/sidealsa-asio64.dll.so" ]] || die "missing ASIO Unix binary"
@@ -337,7 +338,13 @@ for binary in sidealsa-hw-test sidealsa-pro-test sidealsa-stats sidealsa-pro-cli
     run_privileged install -D -m 0755 "$ROOT/target/release/$binary" "$(destination "$PREFIX/bin/$binary")"
 done
 run_privileged install -D -m 0755 "$PLUGIN_SOURCE" "$(destination "$ALSA_PLUGIN_DIR/libasound_module_pcm_sidealsa.so")"
-install_managed_copy "$PROFILE_SOURCE" "$PROFILE_PATH" 0644
+PROFILE_ACTUAL="$(destination "$PROFILE_PATH")"
+if [[ -e "$PROFILE_ACTUAL" ]]; then
+    info "preserving existing profile: $PROFILE_ACTUAL"
+else
+    run_privileged install -D -m 0644 "$PROFILE_SOURCE" "$PROFILE_ACTUAL"
+    info "created initial profile: $PROFILE_ACTUAL"
+fi
 run_privileged install -D -m 0644 "$ROOT/LICENSE" "$(destination "$LICENSE_PATH")"
 
 for doc in "$ROOT"/docs/*.md; do
@@ -383,6 +390,10 @@ if ((WITH_ASIO == 1)); then
         "$(destination "$PREFIX/lib/wine/x86_64-windows/sidealsa-asio64.dll")"
     run_privileged install -D -m 0755 "$ROOT/build-asio/sidealsa-asio64.dll.so" \
         "$(destination "$PREFIX/lib/wine/x86_64-unix/sidealsa-asio64.dll.so")"
+    run_privileged ln -sfn sidealsa-asio64.dll \
+        "$(destination "$PREFIX/lib/wine/x86_64-windows/sidealsa-asio.dll")"
+    run_privileged ln -sfn sidealsa-asio64.dll.so \
+        "$(destination "$PREFIX/lib/wine/x86_64-unix/sidealsa-asio.dll.so")"
 fi
 
 manifest_temp="$TMP_DIR/install-manifest"

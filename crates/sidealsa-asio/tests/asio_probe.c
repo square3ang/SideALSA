@@ -89,11 +89,26 @@ static const CLSID CLSID_SideAlsaAsio
         = { 0x8c4d6a10, 0x5a7d, 0x4cc2, { 0xae, 0x13, 0x7d, 0x9e, 0x3e, 0x2a, 0x1b, 0x40 } };
 static LONG cycles;
 static LONG first_index = -1;
+static LONG callback_thread;
+static LONG callback_thread_mismatch;
+static LONG invalid_callback_stack;
+static LONG start_thread;
 
 static void CALLBACK
 buffer_switch(LONG index, LONG direct_process)
 {
+    NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+    LONG thread = (LONG)GetCurrentThreadId();
+    LONG previous;
+    char marker;
+
     (void)direct_process;
+    if ((uintptr_t)&marker < (uintptr_t)tib->StackLimit
+        || (uintptr_t)&marker >= (uintptr_t)tib->StackBase)
+        InterlockedExchange(&invalid_callback_stack, 1);
+    previous = InterlockedCompareExchange(&callback_thread, thread, 0);
+    if ((previous != 0 && previous != thread) || thread == start_thread)
+        InterlockedExchange(&callback_thread_mismatch, 1);
     InterlockedCompareExchange(&first_index, index, -1);
     InterlockedIncrement(&cycles);
 }
@@ -152,6 +167,8 @@ main(void)
     int exit_code = 1;
     DWORD run_ms = 1000;
     char run_text[16];
+
+    start_thread = (LONG)GetCurrentThreadId();
 
     if (GetEnvironmentVariableA("SIDEALSA_ASIO_PROBE_MS", run_text, sizeof(run_text)) > 0)
         run_ms = (DWORD)strtoul(run_text, NULL, 10);
@@ -272,6 +289,11 @@ main(void)
         }
     }
 
+    InterlockedExchange(&cycles, 0);
+    InterlockedExchange(&first_index, -1);
+    InterlockedExchange(&callback_thread, 0);
+    InterlockedExchange(&callback_thread_mismatch, 0);
+    InterlockedExchange(&invalid_callback_stack, 0);
     result = asio->lpVtbl->Start(asio);
     if (result != 0)
     {
@@ -279,14 +301,41 @@ main(void)
         goto dispose;
     }
     started = 1;
-    InterlockedExchange(&cycles, 0);
-    InterlockedExchange(&first_index, -1);
     Sleep(run_ms);
     result = asio->lpVtbl->Stop(asio);
     started = 0;
-    if (result != 0 || cycles == 0 || first_index != 0)
+    if (result != 0 || cycles == 0 || first_index != 0 || callback_thread == 0
+        || callback_thread_mismatch != 0 || invalid_callback_stack != 0)
     {
         exit_code = fail("Stop/callbacks", result);
+        goto dispose;
+    }
+    LONG stopped_cycles = cycles;
+    Sleep(20);
+    if (cycles != stopped_cycles)
+    {
+        exit_code = fail("callback after Stop", -1);
+        goto dispose;
+    }
+
+    InterlockedExchange(&cycles, 0);
+    InterlockedExchange(&first_index, -1);
+    InterlockedExchange(&callback_thread, 0);
+    InterlockedExchange(&callback_thread_mismatch, 0);
+    result = asio->lpVtbl->Start(asio);
+    if (result != 0)
+    {
+        exit_code = fail("restart", result);
+        goto dispose;
+    }
+    started = 1;
+    Sleep(run_ms);
+    result = asio->lpVtbl->Stop(asio);
+    started = 0;
+    if (result != 0 || cycles == 0 || first_index != 0 || callback_thread == 0
+        || callback_thread_mismatch != 0 || invalid_callback_stack != 0)
+    {
+        exit_code = fail("restart Stop/callbacks", result);
         goto dispose;
     }
     exit_code = 0;

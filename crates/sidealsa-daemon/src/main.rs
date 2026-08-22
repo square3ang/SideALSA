@@ -71,10 +71,10 @@ fn main() {
     });
 
     let hardware_stop = Arc::clone(&stop);
-    let bridge = state.bridge();
+    let (capture_bridge, playback_bridge) = state.bridges();
     let hardware_handle = thread::spawn(move || {
         let mut engine = engine;
-        let run_result = engine.run_pro(&hardware_stop, None, bridge);
+        let run_result = engine.run_pro(&hardware_stop, None, capture_bridge, playback_bridge);
         let stop_result = engine.stop();
         (run_result, stop_result)
     });
@@ -119,6 +119,11 @@ fn main() {
     println!(
         "pro_core_deadline_misses={}",
         stats.pro_core_deadline_misses
+    );
+    println!("pro_playback_blocks={}", stats.pro_playback_blocks);
+    println!(
+        "pro_playback_nonzero_blocks={}",
+        stats.pro_playback_nonzero_blocks
     );
     println!("shared_underruns={}", stats.shared_underruns);
     println!("shared_overruns={}", stats.shared_overruns);

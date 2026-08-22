@@ -6,9 +6,9 @@
 domain socket. PRO audio uses a memfd-backed shared-memory region. Audio never
 travels through the control socket.
 
-The daemon starts the existing `DuplexEngine::run_pro` loop. Its callback
-publishes capture periods into the shared region and consumes playback periods
-by sequence number. Missing playback becomes silence and increments
+The daemon starts the existing `DuplexEngine::run_pro` loop. The playback-clock
+cycle publishes capture into the shared region and consumes playback by exact
+sequence number. Missing playback becomes silence and increments
 `pro_deadline_misses`; ALSA is not restarted for that condition.
 
 ## Control

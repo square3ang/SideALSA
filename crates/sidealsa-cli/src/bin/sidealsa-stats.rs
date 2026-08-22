@@ -39,6 +39,14 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
             "shared_underruns={} shared_overruns={} timeline_resets={} generation={}",
             stats.shared_underruns, stats.shared_overruns, stats.timeline_resets, stats.generation,
         );
+        println!(
+            "playback_delay={} capture_delay={} playback_low_watermarks={}",
+            stats.playback_delay_frames, stats.capture_delay_frames, stats.playback_low_watermarks,
+        );
+        println!(
+            "pro_playback_blocks={} pro_playback_nonzero_blocks={}",
+            stats.pro_playback_blocks, stats.pro_playback_nonzero_blocks,
+        );
         thread::sleep(Duration::from_millis(args.interval_ms));
     }
     Ok(())

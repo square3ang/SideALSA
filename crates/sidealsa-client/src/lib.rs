@@ -33,8 +33,8 @@ pub enum ClientError {
     #[error("daemon rejected request: {code:?}: {message}")]
     Daemon { code: ErrorCode, message: String },
     #[error("unexpected daemon response: {0:?}")]
-    UnexpectedResponse(Response),
-    #[error("expected 3 shared descriptors, received {0}")]
+    UnexpectedResponse(Box<Response>),
+    #[error("expected 4 shared descriptors, received {0}")]
     InvalidDescriptorCount(usize),
     #[error("stream is closed")]
     Closed,
@@ -149,6 +149,7 @@ pub struct AudioStream {
     region: SharedRegion,
     capture_event: EventFd,
     playback_event: EventFd,
+    playback_ready_event: EventFd,
     capture_index: usize,
     playback_index: usize,
     last_sequence: Option<u64>,
@@ -165,7 +166,7 @@ impl AudioStream {
         info: SharedRegionInfo,
         fds: Vec<RawFd>,
     ) -> Result<Self, ClientError> {
-        if fds.len() != 3 {
+        if fds.len() != 4 {
             let count = fds.len();
             close_fds(fds);
             return Err(ClientError::InvalidDescriptorCount(count));
@@ -175,6 +176,7 @@ impl AudioStream {
             Err(error) => {
                 close_fd(fds[1]);
                 close_fd(fds[2]);
+                close_fd(fds[3]);
                 return Err(error.into());
             }
         };
@@ -187,6 +189,7 @@ impl AudioStream {
             region,
             capture_event: EventFd::from_raw(fds[1]),
             playback_event: EventFd::from_raw(fds[2]),
+            playback_ready_event: EventFd::from_raw(fds[3]),
             capture_index: 0,
             playback_index: 0,
             last_sequence: None,
@@ -220,6 +223,7 @@ impl AudioStream {
         self.lifecycle_generation = self.region.lifecycle_generation();
         self.capture_event.drain();
         self.playback_event.drain();
+        self.playback_ready_event.drain();
         match request(
             &mut self.control,
             Request::Start {
@@ -260,6 +264,7 @@ impl AudioStream {
                 self.last_sequence = None;
                 self.capture_event.drain();
                 self.playback_event.drain();
+                self.playback_ready_event.drain();
                 Ok(())
             }
             response => Err(response_error(response)),
@@ -277,6 +282,7 @@ impl AudioStream {
         self.last_sequence = None;
         self.capture_event.drain();
         self.playback_event.drain();
+        self.playback_ready_event.drain();
         Ok(())
     }
 
@@ -295,6 +301,7 @@ impl AudioStream {
                 self.region.reset_slots();
                 self.capture_event.drain();
                 self.playback_event.drain();
+                self.playback_ready_event.drain();
                 Ok(())
             }
             response => Err(response_error(response)),
@@ -310,10 +317,10 @@ impl AudioStream {
     }
 
     pub fn notification_fd(&self) -> Result<RawFd, ClientError> {
-        let fd = if self.info.playback_channels > 0 {
-            self.playback_event.fd
-        } else if self.info.capture_channels > 0 {
+        let fd = if self.info.capture_channels > 0 {
             self.capture_event.fd
+        } else if self.info.playback_channels > 0 {
+            self.playback_event.fd
         } else {
             return Err(ClientError::MissingDirection("audio"));
         };
@@ -327,17 +334,22 @@ impl AudioStream {
 
     pub fn wait_period(&mut self, timeout: Duration) -> Result<u64, ClientError> {
         self.ensure_started()?;
-        if self.info.playback_channels > 0 {
-            self.playback_event.wait(timeout)?;
-        } else if self.info.capture_channels > 0 {
-            self.capture_event.wait(timeout)?;
-        } else {
-            return Err(ClientError::MissingDirection("audio"));
+        loop {
+            if self.info.capture_channels > 0 {
+                self.capture_event.wait(timeout)?;
+            } else if self.info.playback_channels > 0 {
+                self.playback_event.wait(timeout)?;
+            } else {
+                return Err(ClientError::MissingDirection("audio"));
+            }
+            self.refresh_generation();
+            let sequence = self.region.cycle_sequence();
+            if self.last_sequence == Some(sequence) {
+                continue;
+            }
+            self.last_sequence = Some(sequence);
+            return Ok(sequence);
         }
-        self.refresh_generation();
-        let sequence = self.region.cycle_sequence();
-        self.last_sequence = Some(sequence);
-        Ok(sequence)
     }
 
     pub fn capture_buffer(&mut self, samples: &mut [i32]) -> Result<Option<u64>, ClientError> {
@@ -378,10 +390,11 @@ impl AudioStream {
 
     pub fn playback_buffer(&mut self, samples: &[i32]) -> Result<bool, ClientError> {
         self.ensure_started()?;
-        let sequence = self
-            .last_sequence
-            .ok_or(ClientError::BufferNotReady)?
-            .wrapping_add(1);
+        let sequence = self.last_sequence.ok_or(ClientError::BufferNotReady)?;
+        let sequence = match self.mode {
+            StreamMode::Pro => sequence,
+            StreamMode::Shared(_) => sequence.wrapping_add(1),
+        };
         self.submit_playback(sequence, samples)
     }
 
@@ -390,9 +403,13 @@ impl AudioStream {
         if self.info.playback_channels == 0 {
             return Err(ClientError::MissingDirection("playback"));
         }
-        Ok(self
-            .region
-            .try_client_publish_playback(&mut self.playback_index, sequence, samples))
+        let published =
+            self.region
+                .try_client_publish_playback(&mut self.playback_index, sequence, samples);
+        if published && matches!(self.mode, StreamMode::Pro) {
+            self.playback_ready_event.notify()?;
+        }
+        Ok(published)
     }
 
     fn ensure_open(&self) -> Result<(), ClientError> {
@@ -493,6 +510,22 @@ impl EventFd {
         }
     }
 
+    fn notify(&self) -> Result<(), ClientError> {
+        let value = 1_u64;
+        loop {
+            let bytes =
+                unsafe { libc::write(self.fd, (&value as *const u64).cast(), size_of::<u64>()) };
+            if bytes == size_of::<u64>() as isize {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+    }
+
     fn drain(&self) {
         loop {
             let mut value = 0_u64;
@@ -525,14 +558,14 @@ fn response_error(response: Response) -> ClientError {
         Response::Busy => ClientError::Busy,
         Response::Unsupported => ClientError::Unsupported,
         Response::Error { code, message } => ClientError::Daemon { code, message },
-        response => ClientError::UnexpectedResponse(response),
+        response => ClientError::UnexpectedResponse(Box::new(response)),
     }
 }
 
 fn receive_with_fds(stream: &UnixStream) -> Result<(Response, Vec<RawFd>), ClientError> {
     let mut bytes = vec![0_u8; 4096];
     let mut control =
-        vec![0_u8; unsafe { libc::CMSG_SPACE((3 * size_of::<RawFd>()) as u32) } as usize];
+        vec![0_u8; unsafe { libc::CMSG_SPACE((4 * size_of::<RawFd>()) as u32) } as usize];
     let mut iov = libc::iovec {
         iov_base: bytes.as_mut_ptr().cast(),
         iov_len: bytes.len(),
@@ -616,6 +649,7 @@ mod tests {
             rate: 48000,
             period_size: 32,
             buffer_size: 64,
+            shared_latency_periods: 3,
             playback_channels: 2,
             capture_channels: 2,
             playback_ports: Vec::new(),
@@ -660,6 +694,7 @@ mod tests {
         assert!(client_fd >= 0);
         let capture_fd = event_fd();
         let playback_fd = event_fd();
+        let playback_ready_fd = event_fd();
         let info = server_region.info();
         let (mut peer, control) = UnixStream::pair().expect("socket pair should create");
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -678,9 +713,9 @@ mod tests {
         let mut stream = AudioStream::from_parts(
             control,
             9,
-            StreamMode::Shared(PortDirection::Playback),
+            StreamMode::Pro,
             info,
-            vec![client_fd, capture_fd, playback_fd],
+            vec![client_fd, capture_fd, playback_fd, playback_ready_fd],
         )
         .expect("stream should create");
         stream.start().expect("stream should start");
@@ -701,10 +736,64 @@ mod tests {
                 .expect("playback should submit")
         );
         let mut submitted = [0; 8];
-        assert!(server_region.try_consume_playback(9, &mut submitted));
+        assert!(server_region.try_consume_playback(8, &mut submitted));
         assert_eq!(submitted, [1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut ready = 0_u64;
+        assert_eq!(
+            unsafe {
+                libc::read(
+                    playback_ready_fd,
+                    (&mut ready as *mut u64).cast(),
+                    size_of::<u64>(),
+                )
+            },
+            size_of::<u64>() as isize
+        );
+        assert_eq!(ready, 1);
+        signal_event(playback_fd);
+        assert!(matches!(
+            stream.wait_period(Duration::ZERO),
+            Err(ClientError::Timeout)
+        ));
+        server_region.set_cycle_sequence(9);
+        signal_event(playback_fd);
+        assert_eq!(
+            stream
+                .wait_period(Duration::from_millis(100))
+                .expect("next period should arrive"),
+            9
+        );
         stream.close().expect("stream should close");
         server.join().expect("server should not panic");
+    }
+
+    #[test]
+    fn pro_accepts_playback_until_hardware_consumes_sequence() {
+        let server_region = SharedRegion::create(4, 2, 0).expect("region should create");
+        let client_fd = unsafe { libc::dup(server_region.fd()) };
+        assert!(client_fd >= 0);
+        let (peer, control) = UnixStream::pair().expect("socket pair should create");
+        drop(peer);
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Pro,
+            server_region.info(),
+            vec![client_fd, event_fd(), event_fd(), event_fd()],
+        )
+        .expect("stream should create");
+        stream.started = true;
+        server_region.set_cycle_sequence(9);
+
+        assert!(
+            stream
+                .submit_playback(8, &[1, 2, 3, 4, 5, 6, 7, 8])
+                .expect("playback should remain publishable")
+        );
+        let mut submitted = [0; 8];
+        assert!(server_region.try_consume_playback(8, &mut submitted));
+        assert_eq!(submitted, [1, 2, 3, 4, 5, 6, 7, 8]);
+        stream.closed = true;
     }
 
     fn event_fd() -> RawFd {

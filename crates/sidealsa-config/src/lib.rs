@@ -22,6 +22,10 @@ pub struct HardwareConfig {
     pub rate: u32,
     pub period_size: u32,
     pub buffer_size: u32,
+    #[serde(default)]
+    pub playback_queue_periods: Option<u32>,
+    #[serde(default)]
+    pub playback_timer_scheduling: bool,
     #[serde(default = "default_pro_latency_periods")]
     pub pro_latency_periods: u32,
     #[serde(default = "default_shared_latency_periods")]
@@ -125,6 +129,21 @@ impl HardwareConfig {
             return Err(ProfileError::Invalid(
                 "buffer_size must not be smaller than period_size".into(),
             ));
+        }
+        if let Some(periods) = self.playback_queue_periods {
+            if periods == 0 {
+                return Err(ProfileError::Invalid(
+                    "playback_queue_periods must be non-zero".into(),
+                ));
+            }
+            let queue_frames = self.period_size.checked_mul(periods).ok_or_else(|| {
+                ProfileError::Invalid("playback_queue_periods is too large".into())
+            })?;
+            if queue_frames > self.buffer_size {
+                return Err(ProfileError::Invalid(
+                    "playback_queue_periods must fit within buffer_size".into(),
+                ));
+            }
         }
         if self.pro_latency_periods > MAX_PRO_LATENCY_PERIODS {
             return Err(ProfileError::Invalid(format!(
@@ -257,6 +276,8 @@ mod tests {
         rate = 48000
         period_size = 32
         buffer_size = 64
+        playback_queue_periods = 1
+        playback_timer_scheduling = true
         pro_latency_periods = 1
         shared_latency_periods = 4
         realtime = true
@@ -294,6 +315,8 @@ mod tests {
 
         assert_eq!(profile.device.name, "Test interface");
         assert_eq!(profile.device.pro_latency_periods, 1);
+        assert_eq!(profile.device.playback_queue_periods, Some(1));
+        assert!(profile.device.playback_timer_scheduling);
         assert_eq!(profile.device.shared_latency_periods, 4);
         assert!(profile.device.realtime);
         assert_eq!(profile.device.realtime_priority, 50);
@@ -313,15 +336,32 @@ mod tests {
     fn defaults_pro_latency_when_omitted() {
         let text = PROFILE
             .replace("pro_latency_periods = 1\n", "")
+            .replace("playback_queue_periods = 1\n", "")
+            .replace("playback_timer_scheduling = true\n", "")
             .replace("shared_latency_periods = 4\n", "")
             .replace("realtime = true\n", "")
             .replace("realtime_priority = 50\n", "");
         let profile = Profile::from_toml(&text).expect("profile should parse");
 
         assert_eq!(profile.device.pro_latency_periods, 1);
+        assert_eq!(profile.device.playback_queue_periods, None);
+        assert!(!profile.device.playback_timer_scheduling);
         assert_eq!(profile.device.shared_latency_periods, 4);
         assert!(profile.device.realtime);
         assert_eq!(profile.device.realtime_priority, 50);
+    }
+
+    #[test]
+    fn rejects_playback_queue_larger_than_hardware_buffer() {
+        let text = PROFILE.replace("playback_queue_periods = 1", "playback_queue_periods = 3");
+
+        let error = Profile::from_toml(&text).expect_err("profile should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("playback_queue_periods must fit within buffer_size")
+        );
     }
 
     #[test]

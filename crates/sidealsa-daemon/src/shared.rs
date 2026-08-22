@@ -5,6 +5,7 @@ pub use sidealsa_client::{SharedError, SharedRegion};
 pub struct SharedEvents {
     capture: RawFd,
     playback: RawFd,
+    playback_ready: RawFd,
 }
 
 impl SharedEvents {
@@ -19,7 +20,19 @@ impl SharedEvents {
             unsafe { libc::close(capture) };
             return Err(io::Error::last_os_error().into());
         }
-        Ok(Self { capture, playback })
+        let playback_ready = unsafe { libc::eventfd(0, flags) };
+        if playback_ready < 0 {
+            unsafe {
+                libc::close(capture);
+                libc::close(playback);
+            }
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(Self {
+            capture,
+            playback,
+            playback_ready,
+        })
     }
 
     pub fn capture_fd(&self) -> RawFd {
@@ -28,6 +41,10 @@ impl SharedEvents {
 
     pub fn playback_fd(&self) -> RawFd {
         self.playback
+    }
+
+    pub fn playback_ready_fd(&self) -> RawFd {
+        self.playback_ready
     }
 
     pub fn notify_capture(&self) {
@@ -41,6 +58,7 @@ impl SharedEvents {
     pub fn drain(&self) {
         drain(self.capture);
         drain(self.playback);
+        drain(self.playback_ready);
     }
 }
 
@@ -49,6 +67,7 @@ impl Drop for SharedEvents {
         unsafe {
             libc::close(self.capture);
             libc::close(self.playback);
+            libc::close(self.playback_ready);
         }
     }
 }

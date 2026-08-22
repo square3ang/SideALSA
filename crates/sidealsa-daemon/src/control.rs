@@ -325,7 +325,7 @@ mod tests {
         write_request(stream, &request).expect("request should write");
         let mut bytes = vec![0_u8; 4096];
         let mut control =
-            vec![0_u8; unsafe { libc::CMSG_SPACE((3 * size_of::<RawFd>()) as u32) } as usize];
+            vec![0_u8; unsafe { libc::CMSG_SPACE((4 * size_of::<RawFd>()) as u32) } as usize];
         let mut iov = libc::iovec {
             iov_base: bytes.as_mut_ptr().cast(),
             iov_len: bytes.len(),
@@ -386,7 +386,7 @@ mod tests {
             matches!(hello, Response::Hello { features, .. } if features & FEATURE_SHARED != 0)
         );
         let (response, fds) = request_with_fds(&mut first, Request::OpenPro);
-        assert_eq!(fds.len(), 3);
+        assert_eq!(fds.len(), 4);
         for fd in fds {
             unsafe { libc::close(fd) };
         }
@@ -435,7 +435,7 @@ mod tests {
             } => session_id,
             response => panic!("unexpected response: {response:?}"),
         };
-        assert_eq!(fds.len(), 3);
+        assert_eq!(fds.len(), 4);
         for fd in fds {
             unsafe { libc::close(fd) };
         }
@@ -485,7 +485,7 @@ mod tests {
         ));
         let (response, fds) = request_with_fds(&mut third, Request::OpenPro);
         assert!(matches!(response, Response::OpenPro { .. }));
-        assert_eq!(fds.len(), 3);
+        assert_eq!(fds.len(), 4);
         for fd in fds {
             unsafe { libc::close(fd) };
         }

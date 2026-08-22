@@ -4,4 +4,6 @@ mod state;
 
 pub use control::{ControlError, run_control_listener};
 pub use shared::{SharedError, SharedEvents, SharedRegion};
-pub use state::{DaemonAudioBridge, DaemonState, OpenSharedError, SharedOpen};
+pub use state::{
+    DaemonCaptureBridge, DaemonPlaybackBridge, DaemonState, OpenSharedError, SharedOpen,
+};

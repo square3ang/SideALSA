@@ -6,7 +6,7 @@ use std::{
 
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"SALS";
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 pub const FEATURE_PRO: u32 = 1 << 0;
@@ -66,6 +66,7 @@ pub struct DeviceInfo {
     pub rate: u32,
     pub period_size: u32,
     pub buffer_size: u32,
+    pub shared_latency_periods: u32,
     pub playback_channels: u32,
     pub capture_channels: u32,
     pub playback_ports: Vec<PortInfo>,
@@ -106,9 +107,14 @@ pub struct Stats {
     pub capture_position: u64,
     pub hw_playback_xruns: u64,
     pub hw_capture_xruns: u64,
+    pub playback_delay_frames: u64,
+    pub capture_delay_frames: u64,
+    pub playback_low_watermarks: u64,
     pub pro_deadline_misses: u64,
     pub pro_client_deadline_misses: u64,
     pub pro_core_deadline_misses: u64,
+    pub pro_playback_blocks: u64,
+    pub pro_playback_nonzero_blocks: u64,
     pub shared_underruns: u64,
     pub shared_overruns: u64,
     pub timeline_resets: u64,
@@ -470,6 +476,7 @@ fn encode_info(payload: &mut Vec<u8>, info: &DeviceInfo) -> Result<(), ProtocolE
     put_u32(payload, info.rate);
     put_u32(payload, info.period_size);
     put_u32(payload, info.buffer_size);
+    put_u32(payload, info.shared_latency_periods);
     put_u32(payload, info.playback_channels);
     put_u32(payload, info.capture_channels);
     encode_ports(payload, &info.playback_ports)?;
@@ -482,6 +489,7 @@ fn decode_info(decoder: &mut Decoder<'_>) -> Result<DeviceInfo, ProtocolError> {
         rate: decoder.u32()?,
         period_size: decoder.u32()?,
         buffer_size: decoder.u32()?,
+        shared_latency_periods: decoder.u32()?,
         playback_channels: decoder.u32()?,
         capture_channels: decoder.u32()?,
         playback_ports: decode_ports(decoder)?,
@@ -553,9 +561,14 @@ fn encode_stats(payload: &mut Vec<u8>, stats: &Stats) {
         stats.capture_position,
         stats.hw_playback_xruns,
         stats.hw_capture_xruns,
+        stats.playback_delay_frames,
+        stats.capture_delay_frames,
+        stats.playback_low_watermarks,
         stats.pro_deadline_misses,
         stats.pro_client_deadline_misses,
         stats.pro_core_deadline_misses,
+        stats.pro_playback_blocks,
+        stats.pro_playback_nonzero_blocks,
         stats.shared_underruns,
         stats.shared_overruns,
         stats.timeline_resets,
@@ -573,9 +586,14 @@ fn decode_stats(decoder: &mut Decoder<'_>) -> Result<Stats, ProtocolError> {
         capture_position: decoder.u64()?,
         hw_playback_xruns: decoder.u64()?,
         hw_capture_xruns: decoder.u64()?,
+        playback_delay_frames: decoder.u64()?,
+        capture_delay_frames: decoder.u64()?,
+        playback_low_watermarks: decoder.u64()?,
         pro_deadline_misses: decoder.u64()?,
         pro_client_deadline_misses: decoder.u64()?,
         pro_core_deadline_misses: decoder.u64()?,
+        pro_playback_blocks: decoder.u64()?,
+        pro_playback_nonzero_blocks: decoder.u64()?,
         shared_underruns: decoder.u64()?,
         shared_overruns: decoder.u64()?,
         timeline_resets: decoder.u64()?,
@@ -880,13 +898,18 @@ mod tests {
             capture_position: 96,
             hw_playback_xruns: 1,
             hw_capture_xruns: 2,
+            playback_delay_frames: 128,
+            capture_delay_frames: 32,
+            playback_low_watermarks: 1,
             pro_deadline_misses: 3,
             pro_client_deadline_misses: 4,
             pro_core_deadline_misses: 5,
-            shared_underruns: 6,
-            shared_overruns: 7,
-            timeline_resets: 8,
-            periods_processed: 9,
+            pro_playback_blocks: 6,
+            pro_playback_nonzero_blocks: 7,
+            shared_underruns: 8,
+            shared_overruns: 9,
+            timeline_resets: 10,
+            periods_processed: 11,
         });
         let bytes = encode_response(&response).expect("response should encode");
         let decoded = decode_response(&bytes).expect("response should decode");

@@ -3,6 +3,7 @@ name = "Topping E1x2 OTG"
 rate = 48000
 period_size = 64
 buffer_size = 192
+playback_timer_scheduling = true
 pro_latency_periods = 1
 shared_latency_periods = 3
 realtime = true
