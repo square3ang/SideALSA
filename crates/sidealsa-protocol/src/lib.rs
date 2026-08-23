@@ -6,14 +6,14 @@ use std::{
 
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 7;
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"SALS";
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 pub const FEATURE_PRO: u32 = 1 << 0;
 pub const FEATURE_SHARED: u32 = 1 << 1;
 
 pub const SHARED_MAGIC: u32 = u32::from_le_bytes(*b"SASH");
-pub const SHARED_VERSION: u16 = 3;
+pub const SHARED_VERSION: u16 = 4;
 pub const SHARED_SLOT_COUNT: u32 = 8;
 pub const SHARED_SLOT_FREE: u32 = 0;
 pub const SHARED_SLOT_READY: u32 = 1;
@@ -66,6 +66,8 @@ pub struct DeviceInfo {
     pub rate: u32,
     pub period_size: u32,
     pub buffer_size: u32,
+    pub pro_latency_periods: u32,
+    pub pro_realtime_priority: u32,
     pub shared_latency_periods: u32,
     pub playback_channels: u32,
     pub capture_channels: u32,
@@ -113,6 +115,12 @@ pub struct Stats {
     pub pro_deadline_misses: u64,
     pub pro_client_deadline_misses: u64,
     pub pro_core_deadline_misses: u64,
+    pub pro_capture_overruns: u64,
+    pub pro_expired_capture_blocks: u64,
+    pub pro_playback_submit_failures: u64,
+    pub pro_realtime_failures: u64,
+    pub pro_callback_overruns: u64,
+    pub pro_callback_max_nanos: u64,
     pub pro_playback_blocks: u64,
     pub pro_playback_nonzero_blocks: u64,
     pub shared_underruns: u64,
@@ -476,6 +484,8 @@ fn encode_info(payload: &mut Vec<u8>, info: &DeviceInfo) -> Result<(), ProtocolE
     put_u32(payload, info.rate);
     put_u32(payload, info.period_size);
     put_u32(payload, info.buffer_size);
+    put_u32(payload, info.pro_latency_periods);
+    put_u32(payload, info.pro_realtime_priority);
     put_u32(payload, info.shared_latency_periods);
     put_u32(payload, info.playback_channels);
     put_u32(payload, info.capture_channels);
@@ -489,6 +499,8 @@ fn decode_info(decoder: &mut Decoder<'_>) -> Result<DeviceInfo, ProtocolError> {
         rate: decoder.u32()?,
         period_size: decoder.u32()?,
         buffer_size: decoder.u32()?,
+        pro_latency_periods: decoder.u32()?,
+        pro_realtime_priority: decoder.u32()?,
         shared_latency_periods: decoder.u32()?,
         playback_channels: decoder.u32()?,
         capture_channels: decoder.u32()?,
@@ -567,6 +579,12 @@ fn encode_stats(payload: &mut Vec<u8>, stats: &Stats) {
         stats.pro_deadline_misses,
         stats.pro_client_deadline_misses,
         stats.pro_core_deadline_misses,
+        stats.pro_capture_overruns,
+        stats.pro_expired_capture_blocks,
+        stats.pro_playback_submit_failures,
+        stats.pro_realtime_failures,
+        stats.pro_callback_overruns,
+        stats.pro_callback_max_nanos,
         stats.pro_playback_blocks,
         stats.pro_playback_nonzero_blocks,
         stats.shared_underruns,
@@ -592,6 +610,12 @@ fn decode_stats(decoder: &mut Decoder<'_>) -> Result<Stats, ProtocolError> {
         pro_deadline_misses: decoder.u64()?,
         pro_client_deadline_misses: decoder.u64()?,
         pro_core_deadline_misses: decoder.u64()?,
+        pro_capture_overruns: decoder.u64()?,
+        pro_expired_capture_blocks: decoder.u64()?,
+        pro_playback_submit_failures: decoder.u64()?,
+        pro_realtime_failures: decoder.u64()?,
+        pro_callback_overruns: decoder.u64()?,
+        pro_callback_max_nanos: decoder.u64()?,
         pro_playback_blocks: decoder.u64()?,
         pro_playback_nonzero_blocks: decoder.u64()?,
         shared_underruns: decoder.u64()?,
@@ -705,8 +729,14 @@ pub struct SharedRegionHeader {
     pub capture_offset: u64,
     pub playback_offset: u64,
     pub cycle_sequence: AtomicU64,
+    pub playback_sequence: AtomicU64,
     pub lifecycle_generation: AtomicU64,
     pub client_state: AtomicU32,
+    pub client_expired_capture_blocks: AtomicU64,
+    pub client_playback_submit_failures: AtomicU64,
+    pub client_realtime_failures: AtomicU64,
+    pub client_callback_overruns: AtomicU64,
+    pub client_callback_max_nanos: AtomicU64,
 }
 
 impl SharedRegionHeader {
@@ -725,8 +755,14 @@ impl SharedRegionHeader {
             capture_offset: info.capture_offset,
             playback_offset: info.playback_offset,
             cycle_sequence: AtomicU64::new(0),
+            playback_sequence: AtomicU64::new(0),
             lifecycle_generation: AtomicU64::new(0),
             client_state: AtomicU32::new(SHARED_CLIENT_IDLE),
+            client_expired_capture_blocks: AtomicU64::new(0),
+            client_playback_submit_failures: AtomicU64::new(0),
+            client_realtime_failures: AtomicU64::new(0),
+            client_callback_overruns: AtomicU64::new(0),
+            client_callback_max_nanos: AtomicU64::new(0),
         }
     }
 }
@@ -904,12 +940,18 @@ mod tests {
             pro_deadline_misses: 3,
             pro_client_deadline_misses: 4,
             pro_core_deadline_misses: 5,
-            pro_playback_blocks: 6,
-            pro_playback_nonzero_blocks: 7,
-            shared_underruns: 8,
-            shared_overruns: 9,
-            timeline_resets: 10,
-            periods_processed: 11,
+            pro_capture_overruns: 6,
+            pro_expired_capture_blocks: 7,
+            pro_playback_submit_failures: 8,
+            pro_realtime_failures: 9,
+            pro_callback_overruns: 10,
+            pro_callback_max_nanos: 11,
+            pro_playback_blocks: 12,
+            pro_playback_nonzero_blocks: 13,
+            shared_underruns: 14,
+            shared_overruns: 15,
+            timeline_resets: 16,
+            periods_processed: 17,
         });
         let bytes = encode_response(&response).expect("response should encode");
         let decoded = decode_response(&bytes).expect("response should decode");

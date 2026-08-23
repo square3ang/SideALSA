@@ -17,6 +17,7 @@ Installer defaults:
 - user-owned profile: `/etc/sidealsa/profiles/topping-e1x2.toml`
 - ALSA definitions: `/etc/alsa/conf.d/99-sidealsa.conf`
 - PipeWire objects: `/etc/pipewire/pipewire.conf.d/99-sidealsa.conf`
+- PipeWire Pulse scheduling: `/etc/pipewire/pipewire-pulse.conf.d/99-sidealsa.conf`
 - daemon service: `sidealsad.service`
 - socket: `/tmp/sidealsad.sock`
 - socket access: `audio` group when available
@@ -29,7 +30,12 @@ PipeWire adapter settings match the plugin and hardware at a `64`-frame period
 and three periods (`192` ALSA frames). SideALSA SHARED playback consumes data
 after three hardware periods (`192` frames), so client scheduling has buffering
 without changing the hardware timeline. PipeWire's global clock quantum stays
-distribution-managed.
+distribution-managed. The installed PipeWire and PipeWire Pulse fragments cap
+their realtime priority at `10`. The reference priority order is playback `88`,
+capture `87`, ASIO callback `86`, WirePlumber `83`, and PipeWire/Pulse `10`.
+The callback keeps normal scheduling and reports `pro_realtime_failures` when
+the Wine process lacks realtime scheduling rights. Existing profiles that omit
+`pro_realtime_priority` derive it as two below `realtime_priority`.
 
 Restart user PipeWire and WirePlumber after installation:
 

@@ -16,6 +16,7 @@ pub struct HardwareTimeline {
     pro_deadline_misses: AtomicU64,
     pro_client_deadline_misses: AtomicU64,
     pro_core_deadline_misses: AtomicU64,
+    pro_capture_overruns: AtomicU64,
     pro_playback_blocks: AtomicU64,
     pro_playback_nonzero_blocks: AtomicU64,
     shared_underruns: AtomicU64,
@@ -38,6 +39,7 @@ pub struct HardwareStats {
     pub pro_deadline_misses: u64,
     pub pro_client_deadline_misses: u64,
     pub pro_core_deadline_misses: u64,
+    pub pro_capture_overruns: u64,
     pub pro_playback_blocks: u64,
     pub pro_playback_nonzero_blocks: u64,
     pub shared_underruns: u64,
@@ -47,6 +49,10 @@ pub struct HardwareStats {
 }
 
 impl HardwareTimeline {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
     pub fn snapshot(&self) -> HardwareStats {
         HardwareStats {
             generation: self.generation.load(Ordering::Relaxed),
@@ -61,6 +67,7 @@ impl HardwareTimeline {
             pro_deadline_misses: self.pro_deadline_misses.load(Ordering::Relaxed),
             pro_client_deadline_misses: self.pro_client_deadline_misses.load(Ordering::Relaxed),
             pro_core_deadline_misses: self.pro_core_deadline_misses.load(Ordering::Relaxed),
+            pro_capture_overruns: self.pro_capture_overruns.load(Ordering::Relaxed),
             pro_playback_blocks: self.pro_playback_blocks.load(Ordering::Relaxed),
             pro_playback_nonzero_blocks: self.pro_playback_nonzero_blocks.load(Ordering::Relaxed),
             shared_underruns: self.shared_underruns.load(Ordering::Relaxed),
@@ -112,6 +119,16 @@ impl HardwareTimeline {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_pro_core_deadline_miss(&self) {
+        self.pro_deadline_misses.fetch_add(1, Ordering::Relaxed);
+        self.pro_core_deadline_misses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_pro_capture_overrun(&self) {
+        self.pro_capture_overruns.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_pro_playback_block(&self, nonzero: bool) {
         self.pro_playback_blocks.fetch_add(1, Ordering::Relaxed);
         if nonzero {
@@ -128,7 +145,7 @@ impl HardwareTimeline {
         self.shared_overruns.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn hardware_xrun(&self, direction: StreamDirection) {
+    pub(crate) fn record_hardware_xrun(&self, direction: StreamDirection) {
         match direction {
             StreamDirection::Playback => {
                 self.playback_xruns.fetch_add(1, Ordering::Relaxed);
@@ -137,7 +154,10 @@ impl HardwareTimeline {
                 self.capture_xruns.fetch_add(1, Ordering::Relaxed);
             }
         }
-        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn reset_after_hardware_xrun(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.timeline_resets.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -153,7 +173,8 @@ mod tests {
         timeline.update_playback_position(64);
         timeline.update_capture_position(64);
         timeline.processed_frames(64, 1);
-        timeline.hardware_xrun(StreamDirection::Capture);
+        timeline.record_hardware_xrun(StreamDirection::Capture);
+        timeline.reset_after_hardware_xrun();
         timeline.update_playback_position(0);
         timeline.update_capture_position(0);
         timeline.processed_frames(64, 1);
@@ -163,6 +184,18 @@ mod tests {
         assert_eq!(stats.generation, 1);
         assert_eq!(stats.timeline_resets, 1);
         assert_eq!(stats.hw_capture_xruns, 1);
+    }
+
+    #[test]
+    fn failed_xrun_recovery_is_counted_without_publishing_reset() {
+        let timeline = HardwareTimeline::default();
+
+        timeline.record_hardware_xrun(StreamDirection::Playback);
+
+        let stats = timeline.snapshot();
+        assert_eq!(stats.hw_playback_xruns, 1);
+        assert_eq!(stats.generation, 0);
+        assert_eq!(stats.timeline_resets, 0);
     }
 
     #[test]

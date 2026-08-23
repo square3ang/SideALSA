@@ -120,6 +120,18 @@ fn main() {
         "pro_core_deadline_misses={}",
         stats.pro_core_deadline_misses
     );
+    println!("pro_capture_overruns={}", stats.pro_capture_overruns);
+    println!(
+        "pro_expired_capture_blocks={}",
+        stats.pro_expired_capture_blocks
+    );
+    println!(
+        "pro_playback_submit_failures={}",
+        stats.pro_playback_submit_failures
+    );
+    println!("pro_realtime_failures={}", stats.pro_realtime_failures);
+    println!("pro_callback_overruns={}", stats.pro_callback_overruns);
+    println!("pro_callback_max_nanos={}", stats.pro_callback_max_nanos);
     println!("pro_playback_blocks={}", stats.pro_playback_blocks);
     println!(
         "pro_playback_nonzero_blocks={}",

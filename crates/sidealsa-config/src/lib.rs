@@ -26,8 +26,12 @@ pub struct HardwareConfig {
     pub playback_queue_periods: Option<u32>,
     #[serde(default)]
     pub playback_timer_scheduling: bool,
+    #[serde(default)]
+    pub duplex_link: Option<bool>,
     #[serde(default = "default_pro_latency_periods")]
     pub pro_latency_periods: u32,
+    #[serde(default)]
+    pub pro_realtime_priority: Option<u32>,
     #[serde(default = "default_shared_latency_periods")]
     pub shared_latency_periods: u32,
     #[serde(default = "default_realtime")]
@@ -150,6 +154,18 @@ impl HardwareConfig {
                 "pro_latency_periods must be <= {MAX_PRO_LATENCY_PERIODS}"
             )));
         }
+        if self.pro_latency_periods == 0 {
+            if !self.playback_timer_scheduling {
+                return Err(ProfileError::Invalid(
+                    "pro_latency_periods = 0 requires playback_timer_scheduling = true".into(),
+                ));
+            }
+            if self.buffer_size < self.period_size.saturating_mul(2) {
+                return Err(ProfileError::Invalid(
+                    "pro_latency_periods = 0 requires at least two hardware periods".into(),
+                ));
+            }
+        }
         if self.shared_latency_periods > MAX_SHARED_LATENCY_PERIODS {
             return Err(ProfileError::Invalid(format!(
                 "shared_latency_periods must be <= {MAX_SHARED_LATENCY_PERIODS}"
@@ -160,9 +176,35 @@ impl HardwareConfig {
                 "realtime_priority must be between 1 and {MAX_REALTIME_PRIORITY}"
             )));
         }
+        if let Some(priority) = self.pro_realtime_priority {
+            if priority == 0 || priority > MAX_REALTIME_PRIORITY {
+                return Err(ProfileError::Invalid(format!(
+                    "pro_realtime_priority must be between 1 and {MAX_REALTIME_PRIORITY}"
+                )));
+            }
+            if self.realtime && priority > self.realtime_priority.saturating_sub(2) {
+                return Err(ProfileError::Invalid(
+                    "pro_realtime_priority must be at least two below realtime_priority".into(),
+                ));
+            }
+        }
         self.playback.validate("playback")?;
         self.capture.validate("capture")?;
         Ok(())
+    }
+
+    pub fn effective_pro_realtime_priority(&self) -> u32 {
+        if !self.realtime || self.realtime_priority <= 2 {
+            0
+        } else {
+            self.pro_realtime_priority
+                .unwrap_or(self.realtime_priority - 2)
+        }
+    }
+
+    pub fn effective_duplex_link(&self) -> bool {
+        self.duplex_link
+            .unwrap_or_else(|| self.playback.device == self.capture.device)
     }
 }
 
@@ -278,7 +320,9 @@ mod tests {
         buffer_size = 64
         playback_queue_periods = 1
         playback_timer_scheduling = true
+        duplex_link = true
         pro_latency_periods = 1
+        pro_realtime_priority = 15
         shared_latency_periods = 4
         realtime = true
         realtime_priority = 50
@@ -315,8 +359,12 @@ mod tests {
 
         assert_eq!(profile.device.name, "Test interface");
         assert_eq!(profile.device.pro_latency_periods, 1);
+        assert_eq!(profile.device.pro_realtime_priority, Some(15));
+        assert_eq!(profile.device.effective_pro_realtime_priority(), 15);
         assert_eq!(profile.device.playback_queue_periods, Some(1));
         assert!(profile.device.playback_timer_scheduling);
+        assert_eq!(profile.device.duplex_link, Some(true));
+        assert!(profile.device.effective_duplex_link());
         assert_eq!(profile.device.shared_latency_periods, 4);
         assert!(profile.device.realtime);
         assert_eq!(profile.device.realtime_priority, 50);
@@ -333,22 +381,110 @@ mod tests {
     }
 
     #[test]
+    fn accepts_zero_pro_latency() {
+        let text = PROFILE.replace("pro_latency_periods = 1", "pro_latency_periods = 0");
+        let profile = Profile::from_toml(&text).expect("zero lead should parse");
+
+        assert_eq!(profile.device.pro_latency_periods, 0);
+    }
+
+    #[test]
+    fn rejects_zero_pro_latency_without_timer_scheduling() {
+        let text = PROFILE
+            .replace("pro_latency_periods = 1", "pro_latency_periods = 0")
+            .replace(
+                "playback_timer_scheduling = true",
+                "playback_timer_scheduling = false",
+            );
+
+        let error = Profile::from_toml(&text).expect_err("profile should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("requires playback_timer_scheduling = true")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_pro_latency_with_one_hardware_period() {
+        let text = PROFILE
+            .replace("buffer_size = 64", "buffer_size = 32")
+            .replace("pro_latency_periods = 1", "pro_latency_periods = 0");
+
+        let error = Profile::from_toml(&text).expect_err("profile should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("requires at least two hardware periods")
+        );
+    }
+
+    #[test]
+    fn parses_configurable_pro_realtime_priority() {
+        let text = PROFILE
+            .replace("pro_realtime_priority = 15", "pro_realtime_priority = 86")
+            .replace("realtime_priority = 50", "realtime_priority = 88");
+        let profile = Profile::from_toml(&text).expect("profile should parse");
+
+        assert_eq!(profile.device.pro_realtime_priority, Some(86));
+        assert_eq!(profile.device.effective_pro_realtime_priority(), 86);
+    }
+
+    #[test]
+    fn rejects_pro_priority_too_close_to_hardware() {
+        let text = PROFILE.replace("pro_realtime_priority = 15", "pro_realtime_priority = 49");
+
+        let error = Profile::from_toml(&text).expect_err("profile should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("must be at least two below realtime_priority")
+        );
+    }
+
+    #[test]
+    fn disables_pro_realtime_when_hardware_realtime_is_disabled() {
+        let text = PROFILE.replace("realtime = true", "realtime = false");
+        let profile = Profile::from_toml(&text).expect("profile should parse");
+
+        assert_eq!(profile.device.effective_pro_realtime_priority(), 0);
+    }
+
+    #[test]
     fn defaults_pro_latency_when_omitted() {
         let text = PROFILE
             .replace("pro_latency_periods = 1\n", "")
+            .replace("pro_realtime_priority = 15\n", "")
             .replace("playback_queue_periods = 1\n", "")
             .replace("playback_timer_scheduling = true\n", "")
+            .replace("duplex_link = true\n", "")
             .replace("shared_latency_periods = 4\n", "")
             .replace("realtime = true\n", "")
             .replace("realtime_priority = 50\n", "");
         let profile = Profile::from_toml(&text).expect("profile should parse");
 
         assert_eq!(profile.device.pro_latency_periods, 1);
+        assert_eq!(profile.device.pro_realtime_priority, None);
+        assert_eq!(profile.device.effective_pro_realtime_priority(), 48);
         assert_eq!(profile.device.playback_queue_periods, None);
         assert!(!profile.device.playback_timer_scheduling);
+        assert_eq!(profile.device.duplex_link, None);
+        assert!(profile.device.effective_duplex_link());
         assert_eq!(profile.device.shared_latency_periods, 4);
         assert!(profile.device.realtime);
         assert_eq!(profile.device.realtime_priority, 50);
+    }
+
+    #[test]
+    fn defaults_duplex_link_off_for_separate_devices() {
+        let text = PROFILE.replace("duplex_link = true\n", "").replace(
+            "[device.capture]\n        device = \"hw:Test,0\"",
+            "[device.capture]\n        device = \"hw:Other,0\"",
+        );
+        let profile = Profile::from_toml(&text).expect("profile should parse");
+
+        assert_eq!(profile.device.duplex_link, None);
+        assert!(!profile.device.effective_duplex_link());
     }
 
     #[test]
@@ -374,6 +510,19 @@ mod tests {
             error
                 .to_string()
                 .contains("pro_latency_periods must be <= 7")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_pro_realtime_priority() {
+        let text = PROFILE.replace("pro_realtime_priority = 15", "pro_realtime_priority = 100");
+
+        let error = Profile::from_toml(&text).expect_err("profile should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("pro_realtime_priority must be between 1 and 99")
         );
     }
 

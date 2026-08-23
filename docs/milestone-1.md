@@ -4,7 +4,7 @@ Current scope is direct duplex access from `sidealsa-core`.
 
 The engine opens profile-selected playback and capture PCM streams, configures
 `S32_LE` interleaved ALSA access at `48 kHz`, `64` frames per period, and a
-`128`-frame hardware buffer. It discards capture data and writes zero-filled
+`192`-frame hardware buffer. It discards capture data and writes zero-filled
 playback data.
 
 The RT cycle uses preallocated sample buffers and fixed sample counts. It does
@@ -12,16 +12,22 @@ not parse configuration, allocate buffers, use locks, or log.
 
 Realtime scheduling is enabled by default. `device.realtime` controls whether
 the engine enters `SCHED_FIFO`; `device.realtime_priority` selects priority
-`1..=99`, default `50`. Audio workers inherit scheduling from engine worker
-parent. Disable it only for environments without realtime scheduling rights.
+`1..=99`, default `50`. The playback worker uses that priority and capture uses
+one level lower. Disable it only for environments without realtime scheduling
+rights.
 
 Playback and capture run in independent workers with one owned ALSA PCM per
-direction. They are not ALSA-linked, and recovery of one stream does not stop
-or rebase the other. The timeline exposes atomic diagnostics for sample
+direction. Streams using the same PCM device are linked for a synchronized
+hardware start unless `device.duplex_link = false`; separate devices remain
+unlinked unless explicitly enabled. Both workers establish their scheduling
+policy before hardware starts. For unlinked devices capture starts first; for
+linked devices the playback worker starts the group. Linked streams are then
+unlinked so recovery remains direction-local. The timeline
+exposes atomic diagnostics for sample
 position, transferred playback and capture frames, processed periods, hardware
-XRUNs, stream generation, and timeline resets. Hardware recovery increments
-generation and XRUN counters. Client failure statistics and routing are not
-part of this milestone.
+XRUNs, stream generation, and timeline resets. A detected hardware XRUN is
+counted immediately; generation advances only after recovery succeeds. Client
+failure statistics and routing are not part of this milestone.
 
 ## Build
 

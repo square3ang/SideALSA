@@ -39,8 +39,9 @@ cargo run --release -p sidealsa-core --bin sidealsa-hw-test -- --profile profile
 
 Expected hardware result remains zero playback and capture XRUNs.
 
-The reference profile enables `SCHED_FIFO` priority `50` for the engine worker
-tree. External `chrt -f 50` is not required; buffer size remains unchanged.
+The reference profile enables `SCHED_FIFO` priority `88` for the engine worker
+tree and priority `86` for the ASIO callback. External `chrt -f 88` is not
+required; buffer size remains unchanged.
 
 ## Validation
 

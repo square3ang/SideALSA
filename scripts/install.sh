@@ -265,11 +265,15 @@ PLUGIN_SOURCE="$ROOT/target/release/libasound_module_pcm_sidealsa.so"
 
 ALSA_CONFIG_PATH=/etc/alsa/conf.d/99-sidealsa.conf
 PIPEWIRE_CONFIG_PATH=/etc/pipewire/pipewire.conf.d/99-sidealsa.conf
+PIPEWIRE_PULSE_CONFIG_PATH=/etc/pipewire/pipewire-pulse.conf.d/99-sidealsa.conf
 SERVICE_PATH=/etc/systemd/system/sidealsad.service
 PROFILE_PATH=/etc/sidealsa/profiles/$PROFILE_NAME
 LICENSE_PATH="$PREFIX/share/sidealsa/LICENSE"
 DOC_PREFIX="$PREFIX/share/doc/sidealsa"
 MANIFEST_PATH="$PREFIX/share/sidealsa/install-manifest"
+RETIRED_MANAGED_PATHS=(
+    /etc/wireplumber/wireplumber.conf.d/99-sidealsa.conf
+)
 
 MANAGED_PATHS=()
 for binary in "${BINARIES[@]}"; do
@@ -282,7 +286,10 @@ MANAGED_PATHS+=(
     "$LICENSE_PATH"
 )
 if ((INSTALL_PIPEWIRE == 1)); then
-    MANAGED_PATHS+=("$PIPEWIRE_CONFIG_PATH")
+    MANAGED_PATHS+=(
+        "$PIPEWIRE_CONFIG_PATH"
+        "$PIPEWIRE_PULSE_CONFIG_PATH"
+    )
 fi
 for doc in "$ROOT"/docs/*.md; do
     MANAGED_PATHS+=("$DOC_PREFIX/$(basename -- "$doc")")
@@ -315,6 +322,13 @@ for path in "${MANAGED_PATHS[@]}"; do
     if [[ -e "$actual" && -n "${OLD_HASHES[$path]+owned}" && $FORCE -eq 0 ]]; then
         [[ "$(file_hash "$actual")" == "${OLD_HASHES[$path]}" ]] || \
             die "managed file changed since install: $actual (use --force)"
+    fi
+done
+for path in "${RETIRED_MANAGED_PATHS[@]}"; do
+    actual="$(destination "$path")"
+    [[ -e "$actual" && -n "${OLD_HASHES[$path]+owned}" ]] || continue
+    if ((FORCE == 1)) || [[ "$(file_hash "$actual")" == "${OLD_HASHES[$path]}" ]]; then
+        run_privileged rm -f -- "$actual"
     fi
 done
 
@@ -382,6 +396,10 @@ if ((INSTALL_PIPEWIRE == 1)); then
     install_managed_copy \
         "$ROOT/configs/pipewire/pipewire.conf.d/sidealsa.conf" \
         "$PIPEWIRE_CONFIG_PATH" \
+        0644
+    install_managed_copy \
+        "$ROOT/configs/pipewire/pipewire-pulse.conf.d/sidealsa.conf" \
+        "$PIPEWIRE_PULSE_CONFIG_PATH" \
         0644
 fi
 

@@ -35,19 +35,40 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
     let mut captured = 0_u64;
     let mut published = 0_u64;
     let mut publish_failures = 0_u64;
+    let mut wait_offsets = [0_u64; 9];
+    let mut capture_offsets = [0_u64; 9];
+    let mut submit_offsets = [0_u64; 9];
 
+    let initial_stats = stream.get_stats()?;
     stream.start()?;
     for _ in 0..args.periods {
         let sequence = stream.wait_period(Duration::from_secs(1))?;
+        record_sequence_offset(&mut wait_offsets, sequence, stream.playback_sequence());
         maybe_delay(&args, sequence);
-        if stream.capture_buffer(&mut capture)?.is_some() {
-            captured += 1;
-        }
+        let capture_sequence =
+            if let Some(capture_sequence) = stream.capture_buffer(&mut capture)? {
+                captured += 1;
+                record_sequence_offset(
+                    &mut capture_offsets,
+                    capture_sequence,
+                    stream.playback_sequence(),
+                );
+                Some(capture_sequence)
+            } else {
+                None
+            };
         playback.fill(0);
         if stream.playback_buffer(&playback)? {
             published += 1;
         } else {
             publish_failures += 1;
+        }
+        if let Some(capture_sequence) = capture_sequence {
+            record_sequence_offset(
+                &mut submit_offsets,
+                capture_sequence,
+                stream.playback_sequence(),
+            );
         }
     }
     stream.stop()?;
@@ -58,12 +79,33 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
     println!("capture_blocks_read={captured}");
     println!("playback_blocks_published={published}");
     println!("playback_publish_failures={publish_failures}");
+    println!("wait_offsets_minus4_to_plus4={wait_offsets:?}");
+    println!("capture_offsets_minus4_to_plus4={capture_offsets:?}");
+    println!("submit_offsets_minus4_to_plus4={submit_offsets:?}");
     println!("periods_processed={}", stats.periods_processed);
+    println!(
+        "periods_processed_delta={}",
+        stats
+            .periods_processed
+            .saturating_sub(initial_stats.periods_processed)
+    );
     println!("generation={}", stats.generation);
     println!("timeline_resets={}", stats.timeline_resets);
     println!("hw_playback_xruns={}", stats.hw_playback_xruns);
     println!("hw_capture_xruns={}", stats.hw_capture_xruns);
     println!("pro_deadline_misses={}", stats.pro_deadline_misses);
+    println!(
+        "pro_deadline_misses_delta={}",
+        stats
+            .pro_deadline_misses
+            .saturating_sub(initial_stats.pro_deadline_misses)
+    );
+    println!(
+        "pro_playback_blocks_delta={}",
+        stats
+            .pro_playback_blocks
+            .saturating_sub(initial_stats.pro_playback_blocks)
+    );
     println!(
         "pro_client_deadline_misses={}",
         stats.pro_client_deadline_misses
@@ -75,6 +117,13 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
     println!("shared_underruns={}", stats.shared_underruns);
     println!("shared_overruns={}", stats.shared_overruns);
     Ok(())
+}
+
+fn record_sequence_offset(buckets: &mut [u64; 9], sequence: u64, playback_sequence: u64) {
+    let offset = sequence.wrapping_sub(playback_sequence) as i64;
+    if (-4..=4).contains(&offset) {
+        buckets[(offset + 4) as usize] += 1;
+    }
 }
 
 fn sample_count(frames: u32, channels: u32) -> Result<usize, Box<dyn Error>> {

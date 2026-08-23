@@ -8,9 +8,10 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
-use crate::shared::{SharedError, SharedEvents, SharedRegion};
+use crate::shared::{PlaybackWaitResult, SharedError, SharedEvents, SharedRegion};
 
 struct SessionState {
     region: Arc<SharedRegion>,
@@ -66,11 +67,18 @@ impl SessionState {
         self.events.drain();
         let generation = self.lifecycle_generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.region.set_lifecycle_generation(generation);
+        self.region
+            .set_client_state(if self.region.info().playback_channels > 0 {
+                SHARED_CLIENT_STARTING
+            } else {
+                SHARED_CLIENT_RUNNING
+            });
         if self
             .active
             .compare_exchange(0, session_id, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
+            self.region.set_client_state(SHARED_CLIENT_IDLE);
             return false;
         }
         self.armed.store(0, Ordering::Release);
@@ -244,7 +252,7 @@ impl DaemonState {
     }
 
     pub fn stats(&self) -> Stats {
-        stats_from_core(self.timeline.snapshot())
+        stats_from_core(self.timeline.snapshot(), &self.pro.region)
     }
 
     pub fn open_pro(&self) -> Option<(u64, SharedRegionInfo, [std::os::fd::RawFd; 4])> {
@@ -398,7 +406,8 @@ struct TestBridge {
 impl TestBridge {
     fn process(&mut self, sequence: u64, capture: &[i32], playback: &mut [i32]) {
         self.capture.process_capture(sequence, capture);
-        self.playback.process_playback(sequence, playback);
+        self.playback
+            .process_playback(sequence, playback, Duration::ZERO);
     }
 }
 
@@ -459,11 +468,10 @@ impl SharedAudioPortBridge {
         if self.region.client_state() != SHARED_CLIENT_RUNNING {
             return;
         }
-        let expected_sequence = sequence.checked_sub(self.latency_periods);
-        let consumed = expected_sequence.is_some_and(|expected| {
-            self.region
-                .try_consume_playback(expected, &mut self.scratch)
-        });
+        let expected_sequence = sequence.wrapping_sub(self.latency_periods);
+        let consumed = self
+            .region
+            .try_consume_playback(expected_sequence, &mut self.scratch);
         let session_is_current = self.active.load(Ordering::Acquire) == session_id;
         if consumed && session_is_current {
             if self.armed.load(Ordering::Acquire) != session_id {
@@ -482,7 +490,6 @@ impl SharedAudioPortBridge {
                 }
             }
         } else if !consumed
-            && expected_sequence.is_some()
             && session_is_current
             && self.armed.load(Ordering::Acquire) == session_id
         {
@@ -523,10 +530,14 @@ impl ProCaptureSink for DaemonCaptureBridge {
         self.pro_region.set_cycle_sequence(sequence);
         let session_id = self.pro_active.load(Ordering::Acquire);
         if session_id != 0 && self.pro_region.client_state() != SHARED_CLIENT_IDLE {
-            let _ =
-                self.pro_region
-                    .try_publish_capture(&mut self.pro_capture_index, sequence, capture);
-            self.pro_events.notify_capture();
+            if self
+                .pro_region
+                .try_publish_capture(&mut self.pro_capture_index, sequence, capture)
+            {
+                self.pro_events.notify_capture();
+            } else {
+                self.timeline.record_pro_capture_overrun();
+            }
         }
         for port in &mut self.shared {
             port.process_capture(sequence, capture, &self.timeline);
@@ -535,12 +546,48 @@ impl ProCaptureSink for DaemonCaptureBridge {
 }
 
 impl ProPlaybackSource for DaemonPlaybackBridge {
-    fn process_playback(&mut self, sequence: u64, playback: &mut [i32]) {
+    fn process_playback(&mut self, sequence: u64, playback: &mut [i32], wait_budget: Duration) {
+        self.pro_region.set_playback_sequence(sequence);
         playback.fill(0);
         let session_id = self.pro_active.load(Ordering::Acquire);
         if session_id != 0 && self.pro_region.client_state() != SHARED_CLIENT_IDLE {
-            let consumed = self.pro_region.client_state() == SHARED_CLIENT_RUNNING
-                && self.pro_region.try_consume_playback(sequence, playback);
+            let deadline = Instant::now()
+                .checked_add(wait_budget)
+                .unwrap_or_else(Instant::now);
+            let mut wait_failed = false;
+            let consumed = loop {
+                self.pro_events.drain_playback_ready();
+                if self.pro_active.load(Ordering::Acquire) != session_id {
+                    break false;
+                }
+                if self.pro_region.client_state() == SHARED_CLIENT_RUNNING
+                    && self.pro_region.try_consume_playback(sequence, playback)
+                {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    self.pro_events.drain_playback_ready();
+                    break self.pro_active.load(Ordering::Acquire) == session_id
+                        && self.pro_region.client_state() == SHARED_CLIENT_RUNNING
+                        && self.pro_region.try_consume_playback(sequence, playback);
+                }
+                match self.pro_events.wait_playback_ready_until(deadline) {
+                    PlaybackWaitResult::Ready => {}
+                    PlaybackWaitResult::TimedOut => {
+                        self.pro_events.drain_playback_ready();
+                        break self.pro_active.load(Ordering::Acquire) == session_id
+                            && self.pro_region.client_state() == SHARED_CLIENT_RUNNING
+                            && self.pro_region.try_consume_playback(sequence, playback);
+                    }
+                    PlaybackWaitResult::Failed => {
+                        wait_failed = true;
+                        self.pro_events.drain_playback_ready();
+                        break self.pro_active.load(Ordering::Acquire) == session_id
+                            && self.pro_region.client_state() == SHARED_CLIENT_RUNNING
+                            && self.pro_region.try_consume_playback(sequence, playback);
+                    }
+                }
+            };
             if consumed {
                 self.timeline
                     .record_pro_playback_block(playback.iter().any(|sample| *sample != 0));
@@ -558,7 +605,11 @@ impl ProPlaybackSource for DaemonPlaybackBridge {
             } else if self.pro_region.client_state() == SHARED_CLIENT_RUNNING
                 && self.pro_armed.load(Ordering::Acquire) == session_id
             {
-                self.timeline.record_pro_deadline_miss();
+                if wait_failed {
+                    self.timeline.record_pro_core_deadline_miss();
+                } else {
+                    self.timeline.record_pro_deadline_miss();
+                }
             } else if self.pro_region.client_state() == SHARED_CLIENT_STARTING {
                 self.pro_warmup_blocks.store(0, Ordering::Release);
             }
@@ -576,6 +627,8 @@ fn device_info(profile: &Profile) -> DeviceInfo {
         rate: profile.device.rate,
         period_size: profile.device.period_size,
         buffer_size: profile.device.buffer_size,
+        pro_latency_periods: profile.device.pro_latency_periods,
+        pro_realtime_priority: profile.device.effective_pro_realtime_priority(),
         shared_latency_periods: profile.device.shared_latency_periods,
         playback_channels: profile.device.playback.channels,
         capture_channels: profile.device.capture.channels,
@@ -592,7 +645,7 @@ fn port_info(port: &PortConfig) -> PortInfo {
     }
 }
 
-fn stats_from_core(stats: HardwareStats) -> Stats {
+fn stats_from_core(stats: HardwareStats, pro_region: &SharedRegion) -> Stats {
     Stats {
         generation: stats.generation,
         sample_position: stats.sample_position,
@@ -606,6 +659,12 @@ fn stats_from_core(stats: HardwareStats) -> Stats {
         pro_deadline_misses: stats.pro_deadline_misses,
         pro_client_deadline_misses: stats.pro_client_deadline_misses,
         pro_core_deadline_misses: stats.pro_core_deadline_misses,
+        pro_capture_overruns: stats.pro_capture_overruns,
+        pro_expired_capture_blocks: pro_region.client_expired_capture_blocks(),
+        pro_playback_submit_failures: pro_region.client_playback_submit_failures(),
+        pro_realtime_failures: pro_region.client_realtime_failures(),
+        pro_callback_overruns: pro_region.client_callback_overruns(),
+        pro_callback_max_nanos: pro_region.client_callback_max_nanos(),
         pro_playback_blocks: stats.pro_playback_blocks,
         pro_playback_nonzero_blocks: stats.pro_playback_nonzero_blocks,
         shared_underruns: stats.shared_underruns,
@@ -741,10 +800,10 @@ mod tests {
             .expect("port should exist")
             .expect("shared port should open");
         assert!(state.start(shared.session_id));
-        state.shared[0]
-            .session
-            .region
-            .set_client_state(SHARED_CLIENT_STARTING);
+        assert_eq!(
+            state.shared[0].session.region.client_state(),
+            SHARED_CLIENT_STARTING
+        );
 
         let mut bridge = state.bridge();
         let mut output = [0; 8];
@@ -782,10 +841,6 @@ mod tests {
             .expect("shared port should open");
         assert!(state.start(shared.session_id));
         let first_generation = state.shared[0].session.region.lifecycle_generation();
-        state.shared[0]
-            .session
-            .region
-            .set_client_state(SHARED_CLIENT_STARTING);
 
         let mut bridge = state.bridge();
         let mut output = [0; 8];
@@ -855,6 +910,70 @@ mod tests {
     }
 
     #[test]
+    fn shared_playback_lookahead_wraps_sequence() {
+        let profile_text =
+            PROFILE.replace("shared_latency_periods = 0", "shared_latency_periods = 2");
+        let profile = Profile::from_toml(&profile_text).expect("profile should parse");
+        let timeline = Arc::new(HardwareTimeline::default());
+        let state = DaemonState::new(&profile, timeline).expect("state should create");
+        let shared = state
+            .open_shared("line1")
+            .expect("port should exist")
+            .expect("shared port should open");
+        assert!(state.start(shared.session_id));
+
+        let mut producer_index = 0;
+        assert!(state.shared[0].session.region.try_client_publish_playback(
+            &mut producer_index,
+            u64::MAX,
+            &[7; 8],
+        ));
+
+        let mut bridge = state.bridge();
+        let mut output = [0; 8];
+        bridge.process(1, &[0; 8], &mut output);
+        assert_eq!(output, [7; 8]);
+    }
+
+    #[test]
+    fn shared_playback_recovers_after_one_missing_sequence() {
+        let profile_text =
+            PROFILE.replace("shared_latency_periods = 0", "shared_latency_periods = 3");
+        let profile = Profile::from_toml(&profile_text).expect("profile should parse");
+        let timeline = Arc::new(HardwareTimeline::default());
+        let state = DaemonState::new(&profile, Arc::clone(&timeline)).expect("state should create");
+        let shared = state
+            .open_shared("line1")
+            .expect("port should exist")
+            .expect("shared port should open");
+        assert!(state.start(shared.session_id));
+
+        let mut producer_index = 0;
+        assert!(state.shared[0].session.region.try_client_publish_playback(
+            &mut producer_index,
+            102,
+            &[102; 8],
+        ));
+        let mut bridge = state.bridge();
+        let mut output = [0; 8];
+        bridge.process(105, &[0; 8], &mut output);
+        assert_eq!(output, [102; 8]);
+
+        bridge.process(106, &[0; 8], &mut output);
+        assert_eq!(output, [0; 8]);
+        assert_eq!(timeline.snapshot().shared_underruns, 1);
+
+        assert!(state.shared[0].session.region.try_client_publish_playback(
+            &mut producer_index,
+            104,
+            &[104; 8],
+        ));
+        bridge.process(107, &[0; 8], &mut output);
+        assert_eq!(output, [104; 8]);
+        assert_eq!(timeline.snapshot().shared_underruns, 1);
+    }
+
+    #[test]
     fn shared_startup_gap_does_not_count_until_first_block_is_consumed() {
         let profile_text =
             PROFILE.replace("shared_latency_periods = 0", "shared_latency_periods = 2");
@@ -866,10 +985,6 @@ mod tests {
             .expect("port should exist")
             .expect("shared port should open");
         assert!(state.start(shared.session_id));
-        state.shared[0]
-            .session
-            .region
-            .set_client_state(SHARED_CLIENT_STARTING);
 
         let mut bridge = state.bridge();
         let mut output = [0; 8];
@@ -939,6 +1054,114 @@ mod tests {
     }
 
     #[test]
+    fn full_pro_capture_ring_is_not_a_core_deadline_miss() {
+        let profile = Profile::from_toml(PROFILE).expect("profile should parse");
+        let timeline = Arc::new(HardwareTimeline::default());
+        let state = DaemonState::new(&profile, Arc::clone(&timeline)).expect("state should create");
+        let pro_session = state.open_pro().expect("PRO should open").0;
+        assert!(state.start(pro_session));
+
+        let (mut capture, _) = state.bridges();
+        for sequence in 0..=u64::from(sidealsa_protocol::SHARED_SLOT_COUNT) {
+            capture.process_capture(sequence, &[sequence as i32; 8]);
+        }
+
+        let stats = timeline.snapshot();
+        assert_eq!(stats.pro_deadline_misses, 0);
+        assert_eq!(stats.pro_client_deadline_misses, 0);
+        assert_eq!(stats.pro_core_deadline_misses, 0);
+        assert_eq!(stats.pro_capture_overruns, 1);
+    }
+
+    #[test]
+    fn playback_barrier_consumes_block_published_before_deadline() {
+        let profile = Profile::from_toml(PROFILE).expect("profile should parse");
+        let timeline = Arc::new(HardwareTimeline::default());
+        let state = DaemonState::new(&profile, Arc::clone(&timeline)).expect("state should create");
+        let pro_session = state.open_pro().expect("PRO should open").0;
+        assert!(state.start(pro_session));
+
+        let (_, mut playback) = state.bridges();
+        let region = Arc::clone(&state.pro.region);
+        let events = Arc::clone(&state.pro.events);
+        let mut output = [0; 8];
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(1));
+                let mut producer_index = 0;
+                assert!(region.try_client_publish_playback(&mut producer_index, 10, &[10; 8],));
+                let value = 1_u64;
+                assert_eq!(
+                    unsafe {
+                        libc::write(
+                            events.playback_ready_fd(),
+                            (&value as *const u64).cast(),
+                            std::mem::size_of::<u64>(),
+                        )
+                    },
+                    std::mem::size_of::<u64>() as isize
+                );
+            });
+            playback.process_playback(10, &mut output, Duration::from_millis(10));
+        });
+
+        assert_eq!(output, [10; 8]);
+        assert_eq!(state.pro.region.playback_sequence(), 10);
+        assert_eq!(timeline.snapshot().pro_deadline_misses, 0);
+    }
+
+    #[test]
+    fn playback_barrier_ignores_future_wake_until_exact_sequence_arrives() {
+        let profile = Profile::from_toml(PROFILE).expect("profile should parse");
+        let timeline = Arc::new(HardwareTimeline::default());
+        let state = DaemonState::new(&profile, Arc::clone(&timeline)).expect("state should create");
+        let pro_session = state.open_pro().expect("PRO should open").0;
+        assert!(state.start(pro_session));
+
+        let (_, mut playback) = state.bridges();
+        let region = Arc::clone(&state.pro.region);
+        let events = Arc::clone(&state.pro.events);
+        let mut producer_index = 0;
+        assert!(region.try_client_publish_playback(&mut producer_index, 11, &[11; 8]));
+        let value = 1_u64;
+        assert_eq!(
+            unsafe {
+                libc::write(
+                    events.playback_ready_fd(),
+                    (&value as *const u64).cast(),
+                    std::mem::size_of::<u64>(),
+                )
+            },
+            std::mem::size_of::<u64>() as isize
+        );
+
+        let mut output = [0; 8];
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(1));
+                assert!(region.try_client_publish_playback(&mut producer_index, 10, &[10; 8],));
+                let value = 1_u64;
+                assert_eq!(
+                    unsafe {
+                        libc::write(
+                            events.playback_ready_fd(),
+                            (&value as *const u64).cast(),
+                            std::mem::size_of::<u64>(),
+                        )
+                    },
+                    std::mem::size_of::<u64>() as isize
+                );
+            });
+            playback.process_playback(10, &mut output, Duration::from_millis(10));
+        });
+
+        assert_eq!(output, [10; 8]);
+        playback.process_playback(11, &mut output, Duration::ZERO);
+        assert_eq!(output, [11; 8]);
+        assert_eq!(timeline.snapshot().pro_deadline_misses, 0);
+    }
+
+    #[test]
     fn late_pro_block_does_not_poison_next_sequence() {
         let profile = Profile::from_toml(PROFILE).expect("profile should parse");
         let timeline = Arc::new(HardwareTimeline::default());
@@ -955,10 +1178,10 @@ mod tests {
                 sequence,
                 &[sequence as i32; 8],
             ));
-            playback.process_playback(sequence, &mut output);
+            playback.process_playback(sequence, &mut output, Duration::ZERO);
         }
 
-        playback.process_playback(12, &mut output);
+        playback.process_playback(12, &mut output, Duration::ZERO);
         assert_eq!(output, [0; 8]);
         assert_eq!(timeline.snapshot().pro_deadline_misses, 1);
 
@@ -974,7 +1197,7 @@ mod tests {
                 .region
                 .try_client_publish_playback(&mut producer_index, 13, &[13; 8])
         );
-        playback.process_playback(13, &mut output);
+        playback.process_playback(13, &mut output, Duration::ZERO);
 
         assert_eq!(output, [13; 8]);
         assert_eq!(timeline.snapshot().pro_deadline_misses, 1);

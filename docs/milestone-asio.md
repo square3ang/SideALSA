@@ -9,21 +9,31 @@ The adapter expects the daemon profile to expose a `64`-frame period. The
 reference E1x2 profile uses `period_size = 64` and `buffer_size = 192` to give
 the shared client path three periods of scheduling margin.
 
-ASIO input and output latency each report one operational Q64 period. The
-192-frame ALSA value is ring capacity, not queued ASIO software latency.
+ASIO input latency reports one operational period. Output latency reports the
+configured PRO lookahead in periods. The 192-frame ALSA value is ring capacity,
+not queued ASIO software latency.
 
 PRO duplex clients use cycle notifications for a prepared-buffer pipeline. The
-playback worker is the sole sequence clock. Before waiting for hardware playback
-period `N`, it publishes writable sequence `N + lead`; the capture worker binds
-its next completed block to that target. The client may publish playback for
-that target any time before the hardware writer consumes it. The hardware
-writer never waits for the client.
-Missing playback gets one zero-filled fallback period, while stale playback is
-discarded and cannot affect later sequences.
+playback worker defines the initial sequence target. Synchronized duplex start
+fixes capture/playback hardware phase, and capture advances one sequence for
+each completed period. A real hardware-generation change rebases it to the
+playback target. The client may publish playback for
+that target any time before the hardware writer consumes it. The writer prepares
+output before its ALSA wait and may block on `playback_ready` only for the budget
+remaining before the hardware reserve. Missing playback then gets one
+zero-filled fallback period, while stale playback is discarded and cannot
+affect later sequences. The ALSA write deadline and queue guard never move for
+the client.
 
-Protocol v5 still carries the playback-ready eventfd for compatibility, but the
-daemon does not use it for RT scheduling. Shared-memory slot state and sequence
-ownership determine whether a playback block is ready.
+Protocol v7 carries the playback-ready eventfd and shared-memory v4 adds the
+daemon's authoritative playback watermark. Shared-memory slot state and
+sequence ownership remain authoritative for whether a playback block is ready.
+The client chooses the oldest capture target not older than that watermark, so
+a newly published future block cannot displace an exact block the daemon still
+needs. Sequence gaps advance sample position and double-buffer parity before
+callback dispatch.
+Playback keeps its original sequence; the daemon discards it if its exact
+deadline has already passed.
 
 The reference profile keeps ALSA hardware `buffer_size = 192`. E1x2 experiments
 with delayed period writes fail even with a 32-frame guard. PipeWire's 96-frame
@@ -61,9 +71,18 @@ that callback stack addresses belong to the Wine-created worker thread.
 It returns `77` when daemon connection is unavailable.
 
 ASIO begins with the first playback-clock target and publishes playback under
-that sequence. The E1x2 profile uses zero additional lookahead; the hardware
-transfer interval supplies the callback window without timed client waits in
-the daemon or hardware writer.
+that exact sequence. The E1x2 profile keeps one safe engine period. The bounded
+ready barrier lets the lower-priority callback run while ALSA drains queued
+audio. The daemon derives each wait budget from current ALSA availability and
+reserves one quarter-period for the hardware write.
+
+The ASIO frontend owns its callback thread and attempts to raise it to the
+profile's `device.pro_realtime_priority`. When omitted, it defaults to two below
+the hardware worker; the reference profile therefore uses `86` below capture
+`87` and playback `88`. It continues with normal scheduling and increments
+`pro_realtime_failures` when the Wine process lacks realtime rights. Native ALSA
+clients retain application-owned scheduling because the plugin cannot safely
+promote arbitrary host threads.
 
 Poll live counters from another control connection while ASIO owns PRO:
 
@@ -76,8 +95,12 @@ cargo run --release -p sidealsa-cli --bin sidealsa-stats -- --socket /tmp/sideal
 - E1x2 direct engine: `7500` periods at `48 kHz`, `64/192`, zero hardware XRUNs.
 - Live Wine probe: `3337` callbacks during a five-second run, zero hardware
   XRUNs, zero timeline resets.
-- Prepared playback misses are reported by `pro_deadline_misses`. Core timed
-  waits no longer exist, so `pro_core_deadline_misses` remains zero.
+- Prepared playback misses are reported by `pro_deadline_misses`. The bounded
+  daemon barrier preserves the hardware deadline, so `pro_core_deadline_misses`
+  remains zero.
+- Client diagnostics expose expired capture blocks, playback publication
+  failures, realtime promotion failures, callback overruns, and maximum callback
+  duration without logging from the audio thread.
 
 ## Limitations
 

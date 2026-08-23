@@ -175,6 +175,70 @@ impl SharedRegion {
         self.header().cycle_sequence.load(Ordering::Acquire)
     }
 
+    pub fn set_playback_sequence(&self, sequence: u64) {
+        self.header()
+            .playback_sequence
+            .store(sequence, Ordering::Release);
+    }
+
+    pub fn playback_sequence(&self) -> u64 {
+        self.header().playback_sequence.load(Ordering::Acquire)
+    }
+
+    pub fn client_expired_capture_blocks(&self) -> u64 {
+        self.header()
+            .client_expired_capture_blocks
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn record_client_expired_capture_block(&self) {
+        self.header()
+            .client_expired_capture_blocks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn client_playback_submit_failures(&self) -> u64 {
+        self.header()
+            .client_playback_submit_failures
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn record_client_realtime_failure(&self) {
+        self.header()
+            .client_realtime_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn client_realtime_failures(&self) -> u64 {
+        self.header()
+            .client_realtime_failures
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn record_client_callback_timing(&self, duration_nanos: u64, period_nanos: u64) {
+        let header = self.header();
+        header
+            .client_callback_max_nanos
+            .fetch_max(duration_nanos, Ordering::Relaxed);
+        if duration_nanos > period_nanos {
+            header
+                .client_callback_overruns
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn client_callback_overruns(&self) -> u64 {
+        self.header()
+            .client_callback_overruns
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn client_callback_max_nanos(&self) -> u64 {
+        self.header()
+            .client_callback_max_nanos
+            .load(Ordering::Relaxed)
+    }
+
     pub fn set_lifecycle_generation(&self, generation: u64) {
         self.header()
             .lifecycle_generation
@@ -240,6 +304,10 @@ impl SharedRegion {
         );
         if published {
             self.set_client_state(sidealsa_protocol::SHARED_CLIENT_RUNNING);
+        } else {
+            self.header()
+                .client_playback_submit_failures
+                .fetch_add(1, Ordering::Relaxed);
         }
         published
     }
@@ -299,29 +367,40 @@ impl SharedRegion {
         if samples.len() < sample_count {
             return false;
         }
+        let mut exact_index = None;
         for index in 0..self.layout.slot_count() {
             let slot = unsafe { self.slot(ring_offset, index) };
             if slot.state.load(Ordering::Acquire) != SHARED_SLOT_READY {
                 continue;
             }
             let sequence = slot.sequence.load(Ordering::Relaxed);
-            if sequence > expected_sequence {
+            if sequence_is_after(sequence, expected_sequence) {
                 continue;
             }
             if sequence == expected_sequence {
-                unsafe {
-                    samples[..sample_count].copy_from_slice(self.audio(
-                        ring_offset,
-                        index,
-                        sample_count,
-                    ));
+                if exact_index.is_none() {
+                    exact_index = Some(index);
+                } else {
+                    slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
                 }
-                slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
-                return true;
+                continue;
             }
             slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
         }
-        false
+        let Some(index) = exact_index else {
+            return false;
+        };
+        let slot = unsafe { self.slot(ring_offset, index) };
+        if slot.state.load(Ordering::Acquire) != SHARED_SLOT_READY
+            || slot.sequence.load(Ordering::Relaxed) != expected_sequence
+        {
+            return false;
+        }
+        unsafe {
+            samples[..sample_count].copy_from_slice(self.audio(ring_offset, index, sample_count));
+        }
+        slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
+        true
     }
 
     pub fn try_client_read_capture(
@@ -351,10 +430,45 @@ impl SharedRegion {
         Some(sequence)
     }
 
-    pub fn try_client_read_capture_at_least(
+    pub fn next_client_capture_sequence(&self, consumer_index: usize) -> Option<u64> {
+        if self.capture_samples == 0 {
+            return None;
+        }
+        let slot = unsafe { self.slot(self.layout.capture_offset(), consumer_index) };
+        (slot.state.load(Ordering::Acquire) == SHARED_SLOT_READY)
+            .then(|| slot.sequence.load(Ordering::Relaxed))
+    }
+
+    pub fn oldest_valid_client_capture_sequence(&self, minimum_sequence: u64) -> Option<u64> {
+        if self.capture_samples == 0 {
+            return None;
+        }
+        let mut selected = None;
+        for index in 0..self.layout.slot_count() {
+            let slot = unsafe { self.slot(self.layout.capture_offset(), index) };
+            if slot.state.load(Ordering::Acquire) != SHARED_SLOT_READY {
+                continue;
+            }
+            let sequence = slot.sequence.load(Ordering::Relaxed);
+            if sequence_is_before(sequence, minimum_sequence) {
+                slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
+                self.header()
+                    .client_expired_capture_blocks
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let distance = sequence.wrapping_sub(minimum_sequence);
+            if selected.is_none_or(|(_, current_distance)| distance < current_distance) {
+                selected = Some((sequence, distance));
+            }
+        }
+        selected.map(|(sequence, _)| sequence)
+    }
+
+    pub fn try_client_read_valid_capture(
         &self,
         consumer_index: &mut usize,
-        expected_sequence: u64,
+        minimum_sequence: u64,
         samples: &mut [i32],
     ) -> Option<u64> {
         if self.capture_samples == 0 || samples.len() < self.capture_samples {
@@ -370,16 +484,21 @@ impl SharedRegion {
                 continue;
             }
             let sequence = slot.sequence.load(Ordering::Relaxed);
-            if sequence < expected_sequence {
+            if sequence_is_before(sequence, minimum_sequence) {
                 slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
+                self.header()
+                    .client_expired_capture_blocks
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            if selected.is_none_or(|(_, selected_sequence)| sequence < selected_sequence) {
-                selected = Some((index, sequence));
+            let distance = sequence.wrapping_sub(minimum_sequence);
+            if selected.is_none_or(|(_, _, current_distance)| distance < current_distance) {
+                selected = Some((index, sequence, distance));
             }
         }
 
-        let (index, sequence) = selected?;
+        let (index, sequence, _) = selected?;
+        let slot = unsafe { self.slot(self.layout.capture_offset(), index) };
         unsafe {
             samples[..self.capture_samples].copy_from_slice(self.audio(
                 self.layout.capture_offset(),
@@ -387,7 +506,6 @@ impl SharedRegion {
                 self.capture_samples,
             ));
         }
-        let slot = unsafe { self.slot(self.layout.capture_offset(), index) };
         slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
         *consumer_index = next_index(index, slot_count);
         Some(sequence)
@@ -439,6 +557,15 @@ impl Drop for SharedRegion {
 
 fn next_index(index: usize, slot_count: usize) -> usize {
     (index + 1) % slot_count
+}
+
+fn sequence_is_after(candidate: u64, reference: u64) -> bool {
+    let distance = candidate.wrapping_sub(reference);
+    distance != 0 && distance < (1_u64 << 63)
+}
+
+fn sequence_is_before(candidate: u64, reference: u64) -> bool {
+    sequence_is_after(reference, candidate)
 }
 
 fn sample_count(frames: u32, channels: u32) -> Result<usize, SharedError> {
@@ -516,9 +643,122 @@ mod tests {
     }
 
     #[test]
+    fn exact_playback_consume_reclaims_later_stale_slots() {
+        let region = SharedRegion::create(1, 1, 0).expect("region should create");
+        let mut producer_index = 0;
+        assert!(region.try_client_publish_playback(&mut producer_index, 10, &[10]));
+        assert!(region.try_client_publish_playback(&mut producer_index, 9, &[9]));
+
+        let mut samples = [0];
+        assert!(region.try_consume_playback(10, &mut samples));
+        assert_eq!(samples, [10]);
+        for sequence in 20..20 + u64::from(sidealsa_protocol::SHARED_SLOT_COUNT) {
+            assert!(region.try_client_publish_playback(
+                &mut producer_index,
+                sequence,
+                &[sequence as i32]
+            ));
+        }
+    }
+
+    #[test]
+    fn exact_playback_consume_reclaims_stale_slots_across_wrap() {
+        let region = SharedRegion::create(1, 1, 0).expect("region should create");
+        let mut producer_index = 0;
+        assert!(region.try_client_publish_playback(&mut producer_index, 0, &[0]));
+        assert!(region.try_client_publish_playback(&mut producer_index, u64::MAX, &[-1]));
+        assert!(region.try_client_publish_playback(&mut producer_index, 1, &[1]));
+
+        let mut samples = [0];
+        assert!(region.try_consume_playback(0, &mut samples));
+        assert_eq!(samples, [0]);
+        assert!(region.try_consume_playback(1, &mut samples));
+        assert_eq!(samples, [1]);
+        for sequence in 20..20 + u64::from(sidealsa_protocol::SHARED_SLOT_COUNT) {
+            assert!(region.try_client_publish_playback(
+                &mut producer_index,
+                sequence,
+                &[sequence as i32]
+            ));
+        }
+    }
+
+    #[test]
+    fn capture_reader_observes_ready_sequences_in_order() {
+        let region = SharedRegion::create(1, 0, 1).expect("region should create");
+        let mut producer_index = 0;
+        assert!(region.try_publish_capture(&mut producer_index, 10, &[10]));
+        assert!(region.try_publish_capture(&mut producer_index, 11, &[11]));
+
+        let mut consumer_index = 0;
+        let mut samples = [0];
+        assert_eq!(
+            region.next_client_capture_sequence(consumer_index),
+            Some(10)
+        );
+        assert_eq!(
+            region.try_client_read_capture(&mut consumer_index, &mut samples),
+            Some(10)
+        );
+        assert_eq!(
+            region.next_client_capture_sequence(consumer_index),
+            Some(11)
+        );
+        assert_eq!(
+            region.try_client_read_capture(&mut consumer_index, &mut samples),
+            Some(11)
+        );
+        assert_eq!(region.next_client_capture_sequence(consumer_index), None);
+    }
+
+    #[test]
+    fn valid_capture_reader_keeps_oldest_unexpired_block() {
+        let region = SharedRegion::create(1, 0, 1).expect("region should create");
+        let mut producer_index = 0;
+        for sequence in 100..=105 {
+            assert!(region.try_publish_capture(&mut producer_index, sequence, &[sequence as i32]));
+        }
+
+        assert_eq!(region.oldest_valid_client_capture_sequence(103), Some(103));
+        let mut consumer_index = 0;
+        let mut samples = [0];
+        assert_eq!(
+            region.try_client_read_valid_capture(&mut consumer_index, 103, &mut samples),
+            Some(103)
+        );
+        assert_eq!(samples, [103]);
+        assert_eq!(region.client_expired_capture_blocks(), 3);
+        assert_eq!(region.oldest_valid_client_capture_sequence(103), Some(104));
+    }
+
+    #[test]
+    fn valid_capture_reader_handles_sequence_wrap() {
+        let region = SharedRegion::create(1, 0, 1).expect("region should create");
+        let mut producer_index = 0;
+        for sequence in [u64::MAX - 1, u64::MAX, 0, 1] {
+            assert!(region.try_publish_capture(&mut producer_index, sequence, &[sequence as i32]));
+        }
+
+        assert_eq!(
+            region.oldest_valid_client_capture_sequence(u64::MAX),
+            Some(u64::MAX)
+        );
+        let mut consumer_index = 0;
+        let mut samples = [0];
+        assert_eq!(
+            region.try_client_read_valid_capture(&mut consumer_index, u64::MAX, &mut samples),
+            Some(u64::MAX)
+        );
+        assert_eq!(samples, [-1]);
+        assert_eq!(region.client_expired_capture_blocks(), 1);
+        assert_eq!(region.oldest_valid_client_capture_sequence(0), Some(0));
+    }
+
+    #[test]
     fn reset_slots_keeps_timeline_sequence() {
         let region = SharedRegion::create(1, 1, 1).expect("region should create");
         region.set_cycle_sequence(42);
+        region.set_playback_sequence(41);
         region.set_client_state(sidealsa_protocol::SHARED_CLIENT_RUNNING);
         let mut playback_index = 0;
         assert!(region.try_client_publish_playback(&mut playback_index, 7, &[7]));
@@ -528,6 +768,31 @@ mod tests {
         let mut samples = [0];
         assert!(!region.try_consume_playback(7, &mut samples));
         assert_eq!(region.cycle_sequence(), 42);
+        assert_eq!(region.playback_sequence(), 41);
         assert_eq!(region.client_state(), sidealsa_protocol::SHARED_CLIENT_IDLE);
+    }
+
+    #[test]
+    fn client_diagnostics_accumulate_without_resetting() {
+        let region = SharedRegion::create(1, 1, 0).expect("region should create");
+        region.record_client_realtime_failure();
+        region.record_client_callback_timing(500, 1_000);
+        region.record_client_callback_timing(1_500, 1_000);
+
+        let mut producer_index = 0;
+        for sequence in 0..u64::from(sidealsa_protocol::SHARED_SLOT_COUNT) {
+            assert!(region.try_client_publish_playback(
+                &mut producer_index,
+                sequence,
+                &[sequence as i32]
+            ));
+        }
+        assert!(!region.try_client_publish_playback(&mut producer_index, 99, &[99]));
+        region.reset_slots();
+
+        assert_eq!(region.client_realtime_failures(), 1);
+        assert_eq!(region.client_callback_overruns(), 1);
+        assert_eq!(region.client_callback_max_nanos(), 1_500);
+        assert_eq!(region.client_playback_submit_failures(), 1);
     }
 }

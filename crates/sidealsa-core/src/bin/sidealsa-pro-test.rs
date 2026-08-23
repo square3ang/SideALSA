@@ -35,7 +35,7 @@ impl ProCaptureSink for FakeCapture {
 struct FakePlayback;
 
 impl ProPlaybackSource for FakePlayback {
-    fn process_playback(&mut self, _sequence: u64, playback: &mut [i32]) {
+    fn process_playback(&mut self, _sequence: u64, playback: &mut [i32], _wait_budget: Duration) {
         playback.fill(0);
     }
 }

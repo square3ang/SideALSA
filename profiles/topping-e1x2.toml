@@ -4,10 +4,12 @@ rate = 48000
 period_size = 64
 buffer_size = 192
 playback_timer_scheduling = true
-pro_latency_periods = 0
+duplex_link = true
+pro_latency_periods = 1
+pro_realtime_priority = 86
 shared_latency_periods = 3
 realtime = true
-realtime_priority = 50
+realtime_priority = 88
 
 [device.playback]
 device = "hw:OTG,0"

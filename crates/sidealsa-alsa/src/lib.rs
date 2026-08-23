@@ -416,19 +416,14 @@ impl SideAlsaStream {
                     Err(error) => return Err(error),
                 },
             };
-            let (sequence, expired) = plan_playback_sequence(
+            let queued_periods = self.playback_fifo_frames / self.period_frames;
+            let sequence = plan_playback_sequence_with_queue(
                 self.next_playback_sequence,
                 observed,
                 self.playback_latency_periods,
                 self.pro,
+                queued_periods,
             );
-            if expired > 0 {
-                self.discard_playback_periods(expired)?;
-                self.next_playback_sequence = Some(sequence);
-                if self.playback_fifo_frames < self.period_frames {
-                    return Ok(progressed);
-                }
-            }
             self.next_playback_sequence = Some(sequence);
             if sequence > observed.saturating_add(1) {
                 self.playback_cycle_sequence = None;
@@ -574,19 +569,18 @@ fn wait_timeout(nonblock: bool) -> Duration {
     }
 }
 
-fn plan_playback_sequence(
+fn plan_playback_sequence_with_queue(
     next: Option<u64>,
     observed: u64,
     latency: u64,
     same_cycle: bool,
-) -> (u64, usize) {
-    let next = next.unwrap_or_else(|| {
-        if same_cycle {
-            observed
-        } else {
-            observed.saturating_add(1)
-        }
-    });
+    queued_periods: usize,
+) -> u64 {
+    let newest = if same_cycle {
+        observed
+    } else {
+        observed.saturating_add(1)
+    };
     let earliest = if same_cycle {
         observed
     } else {
@@ -594,9 +588,9 @@ fn plan_playback_sequence(
             .checked_sub(latency)
             .map_or(0, |sequence| sequence.saturating_add(1))
     };
-    let sequence = next.max(earliest);
-    let expired = usize::try_from(sequence - next).unwrap_or(usize::MAX);
-    (sequence, expired)
+    let queued_behind = u64::try_from(queued_periods.saturating_sub(1)).unwrap_or(u64::MAX);
+    let aligned = newest.saturating_sub(queued_behind).max(earliest);
+    next.unwrap_or(aligned).max(aligned)
 }
 
 fn copy_into_fifo(
@@ -631,7 +625,8 @@ fn copy_into_fifo(
 }
 
 fn plugin_buffer_size(period_size: u32, buffer_size: u32) -> u32 {
-    buffer_size.max(period_size.saturating_mul(2))
+    let periods = buffer_size.div_ceil(period_size).max(2);
+    period_size.saturating_mul(periods)
 }
 
 unsafe fn copy_from_area(
@@ -747,6 +742,7 @@ mod tests {
     fn ioplug_buffer_has_at_least_two_periods() {
         assert_eq!(plugin_buffer_size(32, 64), 64);
         assert_eq!(plugin_buffer_size(64, 64), 128);
+        assert_eq!(plugin_buffer_size(64, 160), 192);
         assert_eq!(plugin_buffer_size(64, 256), 256);
     }
 
@@ -804,17 +800,42 @@ mod tests {
     }
 
     #[test]
-    fn coalesced_cycles_keep_viable_sequences_and_drop_only_expired_blocks() {
-        assert_eq!(plan_playback_sequence(None, 100, 3, false), (101, 0));
-        assert_eq!(plan_playback_sequence(Some(101), 102, 3, false), (101, 0));
-        assert_eq!(plan_playback_sequence(Some(101), 104, 3, false), (102, 1));
-        assert_eq!(plan_playback_sequence(Some(101), 106, 3, false), (104, 3));
+    fn late_shared_callback_leaves_one_gap_then_realigns() {
+        assert_eq!(
+            plan_playback_sequence_with_queue(Some(103), 103, 3, false, 1),
+            104
+        );
+        assert_eq!(
+            plan_playback_sequence_with_queue(Some(105), 104, 3, false, 1),
+            105
+        );
+    }
+
+    #[test]
+    fn coalesced_shared_callback_uses_available_catchup_blocks() {
+        assert_eq!(
+            plan_playback_sequence_with_queue(Some(103), 103, 3, false, 2),
+            103
+        );
+        assert_eq!(
+            plan_playback_sequence_with_queue(Some(104), 103, 3, false, 1),
+            104
+        );
     }
 
     #[test]
     fn pro_submits_the_observed_same_cycle_sequence() {
-        assert_eq!(plan_playback_sequence(None, 100, 0, true), (100, 0));
-        assert_eq!(plan_playback_sequence(Some(101), 101, 0, true), (101, 0));
-        assert_eq!(plan_playback_sequence(Some(101), 103, 0, true), (103, 2));
+        assert_eq!(
+            plan_playback_sequence_with_queue(None, 100, 0, true, 1),
+            100
+        );
+        assert_eq!(
+            plan_playback_sequence_with_queue(Some(101), 101, 0, true, 1),
+            101
+        );
+        assert_eq!(
+            plan_playback_sequence_with_queue(Some(101), 103, 0, true, 1),
+            103
+        );
     }
 }

@@ -19,6 +19,10 @@ installing the ALSA definitions in the normal ALSA configuration path. The
 plugin directory must likewise be installed or exposed through
 `ALSA_PLUGIN_DIR`.
 
+The PipeWire and PipeWire Pulse fragments set realtime priority `10`, below the
+ASIO callback at `15` and SideALSA hardware workers at `87/88`. Heavy desktop
+audio work can therefore lose SHARED data without preempting PRO or hardware.
+
 The objects disable mmap and resampling because the current ioplug supports
 RW interleaved S32_LE at the profile rate. The E1x2 hardware profile uses a
 `64`-frame period and a three-period `192`-frame buffer; the ioplug stages
@@ -26,6 +30,11 @@ arbitrary transfer sizes into this preallocated client buffer. The reference
 shared path consumes playback after three hardware periods (`192` frames),
 absorbing normal PipeWire scheduling jitter without changing hardware period
 timing.
+
+If a PipeWire callback is late, the ioplug uses all queued catch-up periods. If
+no catch-up block exists, it leaves one explicit sequence gap and immediately
+realigns later blocks to the three-period target. The daemon substitutes silence
+for that one gap; lateness does not permanently reduce SHARED lookahead.
 
 ## Local Test
 

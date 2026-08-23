@@ -145,6 +145,8 @@ pub enum AsioError {
     Client(#[from] ClientError),
     #[error("worker thread failed")]
     Worker,
+    #[error("realtime scheduling failed: {0}")]
+    RealtimeScheduling(#[source] std::io::Error),
     #[error("worker callback panicked")]
     CallbackPanic,
     #[error("driver method called from audio callback")]
@@ -161,7 +163,10 @@ impl AsioError {
             Self::BufferSizeNotSupported => ASIO_BUFFER_SIZE_NOT_SUPPORTED,
             Self::SampleRateNotSupported => ASIO_SAMPLE_RATE_NOT_SUPPORTED,
             Self::NoMemory => ASIO_NO_MEMORY,
-            Self::Client(_) | Self::Worker | Self::WorkerStopped(_) => ASIO_HW_MALFUNCTION,
+            Self::Client(_)
+            | Self::Worker
+            | Self::RealtimeScheduling(_)
+            | Self::WorkerStopped(_) => ASIO_HW_MALFUNCTION,
             Self::CallbackPanic | Self::Reentrant => ASIO_NO_IO,
         }
     }
@@ -282,7 +287,11 @@ impl AsioDriver {
         ensure_initialized(inner.state)?;
         let device = inner.device.as_ref().ok_or(AsioError::InvalidState)?;
         let period = checked_c_int(device.period_size)?;
-        Ok((period, period))
+        let output_periods = checked_c_int(device.pro_latency_periods.max(1))?;
+        let output = period
+            .checked_mul(output_periods)
+            .ok_or(AsioError::InvalidParameter)?;
+        Ok((period, output))
     }
 
     pub fn get_channel_info(
@@ -410,7 +419,10 @@ impl AsioDriver {
             return Err(AsioError::InvalidState);
         }
         let thread_ops = self.thread_ops.ok_or(AsioError::Worker)?;
-        let rate = inner.device.as_ref().ok_or(AsioError::InvalidState)?.rate;
+        let device = inner.device.as_ref().ok_or(AsioError::InvalidState)?;
+        let rate = device.rate;
+        let realtime_priority = c_int::try_from(device.pro_realtime_priority)
+            .map_err(|_| AsioError::InvalidParameter)?;
         let shared = inner.shared.ok_or(AsioError::InvalidState)?;
         let buffers = inner.buffers.clone().ok_or(AsioError::InvalidState)?;
         let active = inner.active.clone().ok_or(AsioError::InvalidState)?;
@@ -440,6 +452,7 @@ impl AsioDriver {
                 callbacks,
                 time_info,
                 rate,
+                realtime_priority,
                 period_frames,
                 capture_samples,
                 playback_samples,
@@ -675,11 +688,60 @@ struct WorkerInput {
     callbacks: AsioCallbacks,
     time_info: bool,
     rate: u32,
+    realtime_priority: c_int,
     period_frames: usize,
     capture_samples: usize,
     playback_samples: usize,
     sample_position: Arc<AtomicU64>,
     time_stamp: Arc<AtomicU64>,
+}
+
+struct RealtimeGuard {
+    policy: libc::c_int,
+    priority: libc::c_int,
+}
+
+impl RealtimeGuard {
+    fn enter(priority: libc::c_int) -> Result<Self, AsioError> {
+        let policy = unsafe { libc::sched_getscheduler(0) };
+        if policy < 0 {
+            return Err(AsioError::RealtimeScheduling(
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let mut parameters = libc::sched_param { sched_priority: 0 };
+        if unsafe { libc::sched_getparam(0, &mut parameters) } != 0 {
+            return Err(AsioError::RealtimeScheduling(
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let realtime = libc::sched_param {
+            sched_priority: priority,
+        };
+        if unsafe {
+            libc::sched_setscheduler(0, libc::SCHED_FIFO | libc::SCHED_RESET_ON_FORK, &realtime)
+        } != 0
+        {
+            return Err(AsioError::RealtimeScheduling(
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(Self {
+            policy,
+            priority: parameters.sched_priority,
+        })
+    }
+}
+
+impl Drop for RealtimeGuard {
+    fn drop(&mut self) {
+        let parameters = libc::sched_param {
+            sched_priority: self.priority,
+        };
+        unsafe {
+            let _ = libc::sched_setscheduler(0, self.policy, &parameters);
+        }
+    }
 }
 
 struct WorkerContext {
@@ -831,21 +893,36 @@ fn run_worker(stream: &mut AudioStream, input: &WorkerInput) -> Result<(), AsioE
     let mut playback = vec![0_i32; input.playback_samples].into_boxed_slice();
     let audio_fd = stream.notification_fd()?;
     let result = match stream.start() {
-        Ok(()) => worker_loop(
-            stream,
-            audio_fd,
-            &input.stop,
-            &input.buffers,
-            &input.active,
-            input.callbacks,
-            input.time_info,
-            input.rate,
-            input.period_frames,
-            &mut capture,
-            &mut playback,
-            &input.sample_position,
-            &input.time_stamp,
-        ),
+        Ok(()) => {
+            let realtime = if input.realtime_priority == 0 {
+                None
+            } else {
+                match RealtimeGuard::enter(input.realtime_priority) {
+                    Ok(realtime) => Some(realtime),
+                    Err(_) => {
+                        stream.record_realtime_failure();
+                        None
+                    }
+                }
+            };
+            let result = worker_loop(
+                stream,
+                audio_fd,
+                &input.stop,
+                &input.buffers,
+                &input.active,
+                input.callbacks,
+                input.time_info,
+                input.rate,
+                input.period_frames,
+                &mut capture,
+                &mut playback,
+                &input.sample_position,
+                &input.time_stamp,
+            );
+            drop(realtime);
+            result
+        }
         Err(error) => Err(error.into()),
     };
     let stop_result = stream.stop();
@@ -881,38 +958,53 @@ fn worker_loop(
         let Some(sequence) = sequence else {
             break;
         };
-        let captured_sequence = stream.capture_buffer_for_sequence(sequence, capture)?;
-        let block_sequence = captured_sequence.unwrap_or(sequence);
-        if captured_sequence.is_none() {
-            for (channel, is_active) in active.input.iter().copied().enumerate() {
-                if is_active {
-                    buffers.input[channel].half_mut(buffer_index).fill(0.0);
-                }
-            }
-        } else {
-            copy_capture_to_host(capture, buffers, active, buffer_index, period_frames);
-        }
+        let Some(block_sequence) = stream.capture_buffer_for_sequence(sequence, capture)? else {
+            continue;
+        };
+        let (next_buffer_index, samples) = advance_asio_cycle(
+            previous_sequence,
+            block_sequence,
+            u64::try_from(period_frames).unwrap_or(0),
+            buffer_index,
+            sample_position.load(Ordering::Relaxed),
+        );
+        buffer_index = next_buffer_index;
+        sample_position.store(samples, Ordering::Release);
+        previous_sequence = Some(block_sequence);
+        copy_capture_to_host(capture, buffers, active, buffer_index, period_frames);
         let stamp = monotonic_nanos();
         time_stamp.store(stamp, Ordering::Release);
-        let samples = sample_position.load(Ordering::Relaxed);
+        let callback_start = stamp;
         invoke_callback(callbacks, time_info, buffer_index, samples, stamp, rate)?;
+        let callback_duration = monotonic_nanos().saturating_sub(callback_start);
+        let period_nanos = u64::try_from(period_frames)
+            .unwrap_or(0)
+            .saturating_mul(1_000_000_000)
+            / u64::from(rate);
+        stream.record_callback_timing(callback_duration, period_nanos);
         copy_host_to_playback(buffers, active, buffer_index, playback, period_frames);
-        let _ = stream.submit_playback(block_sequence, playback)?;
-        let elapsed_periods = previous_sequence
-            .map(|previous| block_sequence.wrapping_sub(previous).max(1))
-            .unwrap_or(1);
-        previous_sequence = Some(block_sequence);
-        sample_position.store(
-            samples.saturating_add(
-                u64::try_from(period_frames)
-                    .unwrap_or(0)
-                    .saturating_mul(elapsed_periods),
-            ),
-            Ordering::Release,
-        );
-        buffer_index ^= 1;
+        if !stream.submit_playback(block_sequence, playback)? {
+            continue;
+        }
     }
     Ok(())
+}
+
+fn advance_asio_cycle(
+    previous_sequence: Option<u64>,
+    sequence: u64,
+    period_frames: u64,
+    buffer_index: usize,
+    sample_position: u64,
+) -> (usize, u64) {
+    let Some(previous) = previous_sequence else {
+        return (buffer_index, sample_position);
+    };
+    let elapsed_periods = sequence.wrapping_sub(previous).max(1);
+    (
+        buffer_index ^ (elapsed_periods as usize & 1),
+        sample_position.saturating_add(period_frames.saturating_mul(elapsed_periods)),
+    )
 }
 
 fn wait_cycle(
@@ -933,6 +1025,14 @@ fn wait_cycle(
         },
     ];
     loop {
+        if stop.is_requested() {
+            return Ok(None);
+        }
+        match stream.wait_period(Duration::ZERO) {
+            Ok(sequence) => return Ok(Some(sequence)),
+            Err(ClientError::Timeout) => {}
+            Err(error) => return Err(error.into()),
+        }
         let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
         if result < 0 {
             let error = std::io::Error::last_os_error();
@@ -945,11 +1045,7 @@ fn wait_cycle(
             return Ok(None);
         }
         if fds[0].revents & libc::POLLIN != 0 {
-            return match stream.wait_period(Duration::ZERO) {
-                Ok(sequence) => Ok(Some(sequence)),
-                Err(ClientError::Timeout) => continue,
-                Err(error) => Err(error.into()),
-            };
+            continue;
         }
     }
 }
@@ -1433,7 +1529,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn one_period_is_reported_as_fixed_asio_size() {
+    fn configured_pro_lead_is_reported_as_output_latency() {
         let driver = AsioDriver::new();
         let mut inner = driver.inner.lock().expect("lock should work");
         inner.state = DriverState::Initialized;
@@ -1442,6 +1538,8 @@ mod tests {
             rate: 48000,
             period_size: 64,
             buffer_size: 192,
+            pro_latency_periods: 2,
+            pro_realtime_priority: 86,
             shared_latency_periods: 3,
             playback_channels: 8,
             capture_channels: 10,
@@ -1456,7 +1554,7 @@ mod tests {
         );
         assert_eq!(
             driver.get_latencies().expect("latencies should work"),
-            (64, 64)
+            (64, 128)
         );
     }
 
@@ -1476,5 +1574,19 @@ mod tests {
         assert!(!pointers[0].is_null());
         assert!(!pointers[1].is_null());
         assert_ne!(pointers[0], pointers[1]);
+    }
+
+    #[test]
+    fn sequence_gap_advances_position_and_buffer_parity_before_callback() {
+        let mut previous = None;
+        let mut index = 0;
+        let mut position = 0;
+        let mut observed = Vec::new();
+        for sequence in [10, 11, 13, 14] {
+            (index, position) = advance_asio_cycle(previous, sequence, 64, index, position);
+            observed.push((index, position));
+            previous = Some(sequence);
+        }
+        assert_eq!(observed, [(0, 0), (1, 64), (1, 192), (0, 256)]);
     }
 }

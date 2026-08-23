@@ -40,12 +40,27 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
             stats.shared_underruns, stats.shared_overruns, stats.timeline_resets, stats.generation,
         );
         println!(
+            "sample_position={} playback_position={} capture_position={}",
+            stats.sample_position, stats.playback_position, stats.capture_position,
+        );
+        println!(
             "playback_delay={} capture_delay={} playback_low_watermarks={}",
             stats.playback_delay_frames, stats.capture_delay_frames, stats.playback_low_watermarks,
         );
         println!(
             "pro_playback_blocks={} pro_playback_nonzero_blocks={}",
             stats.pro_playback_blocks, stats.pro_playback_nonzero_blocks,
+        );
+        println!(
+            "pro_capture_overruns={} expired_capture={} submit_failures={} rt_failures={}",
+            stats.pro_capture_overruns,
+            stats.pro_expired_capture_blocks,
+            stats.pro_playback_submit_failures,
+            stats.pro_realtime_failures,
+        );
+        println!(
+            "callback_overruns={} callback_max_nanos={}",
+            stats.pro_callback_overruns, stats.pro_callback_max_nanos,
         );
         thread::sleep(Duration::from_millis(args.interval_ms));
     }

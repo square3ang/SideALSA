@@ -56,6 +56,9 @@ Current Topping E1x2 checks passed with raw S32_LE streams:
   one shared underrun, zero hardware XRUNs, zero timeline resets.
 
 Unit tests cover the ioplug buffer minimum and interleaved S32_LE area copies.
+SHARED playback also realigns its sequence after a late callback. If PipeWire
+has no catch-up block, one missing sequence becomes one daemon underrun; the
+next block resumes at the configured lookahead instead of remaining late.
 
 ## Limitations
 
