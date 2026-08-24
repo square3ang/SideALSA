@@ -2,6 +2,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::StreamDirection;
 
+const PRO_TIMING_SLOT_COUNT: usize = 8;
+
+#[derive(Debug, Default)]
+struct ProTimingSlot {
+    sequence: AtomicU64,
+    capture_read_nanos: AtomicU64,
+}
+
 #[derive(Debug, Default)]
 pub struct HardwareTimeline {
     generation: AtomicU64,
@@ -12,6 +20,26 @@ pub struct HardwareTimeline {
     capture_xruns: AtomicU64,
     playback_delay_frames: AtomicU64,
     capture_delay_frames: AtomicU64,
+    playback_delay_min_frames: AtomicU64,
+    playback_delay_max_frames: AtomicU64,
+    playback_ring_delay_frames: AtomicU64,
+    playback_ring_delay_min_frames: AtomicU64,
+    playback_ring_delay_max_frames: AtomicU64,
+    playback_driver_delay_frames: AtomicU64,
+    playback_driver_delay_min_frames: AtomicU64,
+    playback_driver_delay_max_frames: AtomicU64,
+    capture_delay_min_frames: AtomicU64,
+    capture_delay_max_frames: AtomicU64,
+    playback_target_overshoot_max_frames: AtomicU64,
+    capture_clock_wait_max_nanos: AtomicU64,
+    pro_wait_budget_min_nanos: AtomicU64,
+    pro_wait_budget_max_nanos: AtomicU64,
+    pro_ready_wait_max_nanos: AtomicU64,
+    playback_write_max_nanos: AtomicU64,
+    capture_to_playback_write_nanos: AtomicU64,
+    capture_to_playback_write_min_nanos: AtomicU64,
+    capture_to_playback_write_max_nanos: AtomicU64,
+    pro_timing: [ProTimingSlot; PRO_TIMING_SLOT_COUNT],
     playback_low_watermarks: AtomicU64,
     pro_deadline_misses: AtomicU64,
     pro_client_deadline_misses: AtomicU64,
@@ -35,6 +63,25 @@ pub struct HardwareStats {
     pub hw_capture_xruns: u64,
     pub playback_delay_frames: u64,
     pub capture_delay_frames: u64,
+    pub playback_delay_min_frames: u64,
+    pub playback_delay_max_frames: u64,
+    pub playback_ring_delay_frames: u64,
+    pub playback_ring_delay_min_frames: u64,
+    pub playback_ring_delay_max_frames: u64,
+    pub playback_driver_delay_frames: u64,
+    pub playback_driver_delay_min_frames: u64,
+    pub playback_driver_delay_max_frames: u64,
+    pub capture_delay_min_frames: u64,
+    pub capture_delay_max_frames: u64,
+    pub playback_target_overshoot_max_frames: u64,
+    pub capture_clock_wait_max_nanos: u64,
+    pub pro_wait_budget_min_nanos: u64,
+    pub pro_wait_budget_max_nanos: u64,
+    pub pro_ready_wait_max_nanos: u64,
+    pub playback_write_max_nanos: u64,
+    pub capture_to_playback_write_nanos: u64,
+    pub capture_to_playback_write_min_nanos: u64,
+    pub capture_to_playback_write_max_nanos: u64,
     pub playback_low_watermarks: u64,
     pub pro_deadline_misses: u64,
     pub pro_client_deadline_misses: u64,
@@ -63,6 +110,49 @@ impl HardwareTimeline {
             hw_capture_xruns: self.capture_xruns.load(Ordering::Relaxed),
             playback_delay_frames: self.playback_delay_frames.load(Ordering::Relaxed),
             capture_delay_frames: self.capture_delay_frames.load(Ordering::Relaxed),
+            playback_delay_min_frames: decode_minimum(
+                self.playback_delay_min_frames.load(Ordering::Relaxed),
+            ),
+            playback_delay_max_frames: self.playback_delay_max_frames.load(Ordering::Relaxed),
+            playback_ring_delay_frames: self.playback_ring_delay_frames.load(Ordering::Relaxed),
+            playback_ring_delay_min_frames: decode_minimum(
+                self.playback_ring_delay_min_frames.load(Ordering::Relaxed),
+            ),
+            playback_ring_delay_max_frames: self
+                .playback_ring_delay_max_frames
+                .load(Ordering::Relaxed),
+            playback_driver_delay_frames: self.playback_driver_delay_frames.load(Ordering::Relaxed),
+            playback_driver_delay_min_frames: decode_minimum(
+                self.playback_driver_delay_min_frames
+                    .load(Ordering::Relaxed),
+            ),
+            playback_driver_delay_max_frames: self
+                .playback_driver_delay_max_frames
+                .load(Ordering::Relaxed),
+            capture_delay_min_frames: decode_minimum(
+                self.capture_delay_min_frames.load(Ordering::Relaxed),
+            ),
+            capture_delay_max_frames: self.capture_delay_max_frames.load(Ordering::Relaxed),
+            playback_target_overshoot_max_frames: self
+                .playback_target_overshoot_max_frames
+                .load(Ordering::Relaxed),
+            capture_clock_wait_max_nanos: self.capture_clock_wait_max_nanos.load(Ordering::Relaxed),
+            pro_wait_budget_min_nanos: decode_minimum(
+                self.pro_wait_budget_min_nanos.load(Ordering::Relaxed),
+            ),
+            pro_wait_budget_max_nanos: self.pro_wait_budget_max_nanos.load(Ordering::Relaxed),
+            pro_ready_wait_max_nanos: self.pro_ready_wait_max_nanos.load(Ordering::Relaxed),
+            playback_write_max_nanos: self.playback_write_max_nanos.load(Ordering::Relaxed),
+            capture_to_playback_write_nanos: self
+                .capture_to_playback_write_nanos
+                .load(Ordering::Relaxed),
+            capture_to_playback_write_min_nanos: decode_minimum(
+                self.capture_to_playback_write_min_nanos
+                    .load(Ordering::Relaxed),
+            ),
+            capture_to_playback_write_max_nanos: self
+                .capture_to_playback_write_max_nanos
+                .load(Ordering::Relaxed),
             playback_low_watermarks: self.playback_low_watermarks.load(Ordering::Relaxed),
             pro_deadline_misses: self.pro_deadline_misses.load(Ordering::Relaxed),
             pro_client_deadline_misses: self.pro_client_deadline_misses.load(Ordering::Relaxed),
@@ -103,14 +193,82 @@ impl HardwareTimeline {
             StreamDirection::Playback => {
                 self.playback_delay_frames
                     .store(delay_frames, Ordering::Relaxed);
+                update_minimum(&self.playback_delay_min_frames, delay_frames);
+                update_maximum(&self.playback_delay_max_frames, delay_frames);
                 if delay_frames < period_frames {
                     self.playback_low_watermarks.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            StreamDirection::Capture => self
-                .capture_delay_frames
-                .store(delay_frames, Ordering::Relaxed),
+            StreamDirection::Capture => {
+                self.capture_delay_frames
+                    .store(delay_frames, Ordering::Relaxed);
+                update_minimum(&self.capture_delay_min_frames, delay_frames);
+                update_maximum(&self.capture_delay_max_frames, delay_frames);
+            }
         }
+    }
+
+    pub(crate) fn record_playback_target_overshoot(&self, frames: u64) {
+        update_maximum(&self.playback_target_overshoot_max_frames, frames);
+    }
+
+    pub(crate) fn update_playback_delay_breakdown(
+        &self,
+        total_delay: i64,
+        available: i64,
+        buffer: i64,
+    ) {
+        let ring_delay = u64::try_from(buffer.saturating_sub(available.min(buffer))).unwrap_or(0);
+        let total_delay = u64::try_from(total_delay).unwrap_or(0);
+        let driver_delay = total_delay.saturating_sub(ring_delay);
+
+        self.playback_ring_delay_frames
+            .store(ring_delay, Ordering::Relaxed);
+        update_minimum(&self.playback_ring_delay_min_frames, ring_delay);
+        update_maximum(&self.playback_ring_delay_max_frames, ring_delay);
+        self.playback_driver_delay_frames
+            .store(driver_delay, Ordering::Relaxed);
+        update_minimum(&self.playback_driver_delay_min_frames, driver_delay);
+        update_maximum(&self.playback_driver_delay_max_frames, driver_delay);
+    }
+
+    pub(crate) fn record_capture_clock_wait(&self, nanos: u64) {
+        update_maximum(&self.capture_clock_wait_max_nanos, nanos);
+    }
+
+    pub(crate) fn record_pro_wait_budget(&self, nanos: u64) {
+        update_minimum(&self.pro_wait_budget_min_nanos, nanos);
+        update_maximum(&self.pro_wait_budget_max_nanos, nanos);
+    }
+
+    pub fn record_pro_ready_wait(&self, nanos: u64) {
+        update_maximum(&self.pro_ready_wait_max_nanos, nanos);
+    }
+
+    pub(crate) fn record_playback_write(&self, nanos: u64) {
+        update_maximum(&self.playback_write_max_nanos, nanos);
+    }
+
+    pub(crate) fn record_pro_capture_read(&self, sequence: u64, nanos: u64) {
+        let slot = &self.pro_timing[sequence as usize % PRO_TIMING_SLOT_COUNT];
+        slot.capture_read_nanos.store(nanos, Ordering::Relaxed);
+        slot.sequence.store(sequence, Ordering::Release);
+    }
+
+    pub(crate) fn record_pro_playback_write(&self, sequence: u64, nanos: u64) {
+        let slot = &self.pro_timing[sequence as usize % PRO_TIMING_SLOT_COUNT];
+        if slot.sequence.load(Ordering::Acquire) != sequence {
+            return;
+        }
+        let capture_read_nanos = slot.capture_read_nanos.load(Ordering::Relaxed);
+        if capture_read_nanos == 0 || nanos < capture_read_nanos {
+            return;
+        }
+        let duration = nanos - capture_read_nanos;
+        self.capture_to_playback_write_nanos
+            .store(duration, Ordering::Relaxed);
+        update_minimum(&self.capture_to_playback_write_min_nanos, duration);
+        update_maximum(&self.capture_to_playback_write_max_nanos, duration);
     }
 
     pub fn record_pro_deadline_miss(&self) {
@@ -160,6 +318,31 @@ impl HardwareTimeline {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.timeline_resets.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+fn update_minimum(target: &AtomicU64, value: u64) {
+    let encoded = value.saturating_add(1);
+    let mut current = target.load(Ordering::Relaxed);
+    while current == 0 || encoded < current {
+        match target.compare_exchange_weak(current, encoded, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn update_maximum(target: &AtomicU64, value: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    while value > current {
+        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn decode_minimum(encoded: u64) -> u64 {
+    encoded.saturating_sub(1)
 }
 
 #[cfg(test)]
@@ -239,7 +422,63 @@ mod tests {
         let stats = timeline.snapshot();
         assert_eq!(stats.playback_delay_frames, 63);
         assert_eq!(stats.capture_delay_frames, 32);
+        assert_eq!(stats.playback_delay_min_frames, 63);
+        assert_eq!(stats.playback_delay_max_frames, 128);
+        assert_eq!(stats.capture_delay_min_frames, 32);
+        assert_eq!(stats.capture_delay_max_frames, 32);
         assert_eq!(stats.playback_low_watermarks, 1);
         assert_eq!(stats.hw_playback_xruns, 0);
+    }
+
+    #[test]
+    fn playback_delay_breakdown_separates_ring_and_driver() {
+        let timeline = HardwareTimeline::default();
+
+        timeline.update_playback_delay_breakdown(256, 128, 192);
+        timeline.update_playback_delay_breakdown(200, 160, 192);
+
+        let stats = timeline.snapshot();
+        assert_eq!(stats.playback_ring_delay_frames, 32);
+        assert_eq!(stats.playback_ring_delay_min_frames, 32);
+        assert_eq!(stats.playback_ring_delay_max_frames, 64);
+        assert_eq!(stats.playback_driver_delay_frames, 168);
+        assert_eq!(stats.playback_driver_delay_min_frames, 168);
+        assert_eq!(stats.playback_driver_delay_max_frames, 192);
+    }
+
+    #[test]
+    fn exact_sequence_timing_tracks_capture_to_playback() {
+        let timeline = HardwareTimeline::default();
+
+        timeline.record_pro_capture_read(9, 100);
+        timeline.record_pro_playback_write(8, 140);
+        timeline.record_pro_playback_write(9, 160);
+
+        let stats = timeline.snapshot();
+        assert_eq!(stats.capture_to_playback_write_nanos, 60);
+        assert_eq!(stats.capture_to_playback_write_min_nanos, 60);
+        assert_eq!(stats.capture_to_playback_write_max_nanos, 60);
+    }
+
+    #[test]
+    fn timing_diagnostics_track_bounds() {
+        let timeline = HardwareTimeline::default();
+
+        timeline.record_playback_target_overshoot(4);
+        timeline.record_playback_target_overshoot(2);
+        timeline.record_capture_clock_wait(20);
+        timeline.record_capture_clock_wait(10);
+        timeline.record_pro_wait_budget(0);
+        timeline.record_pro_wait_budget(50);
+        timeline.record_pro_ready_wait(30);
+        timeline.record_playback_write(40);
+
+        let stats = timeline.snapshot();
+        assert_eq!(stats.playback_target_overshoot_max_frames, 4);
+        assert_eq!(stats.capture_clock_wait_max_nanos, 20);
+        assert_eq!(stats.pro_wait_budget_min_nanos, 0);
+        assert_eq!(stats.pro_wait_budget_max_nanos, 50);
+        assert_eq!(stats.pro_ready_wait_max_nanos, 30);
+        assert_eq!(stats.playback_write_max_nanos, 40);
     }
 }

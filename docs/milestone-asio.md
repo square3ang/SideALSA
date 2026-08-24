@@ -5,9 +5,9 @@ SideALSA PRO client, double-buffered float32 host buffers, worker lifecycle,
 sequence handling, and callback dispatch. The C shim supplies the Wine COM,
 registration, DLL ABI, and `CreateThread` bridge required for Wine TEB setup.
 
-The adapter expects the daemon profile to expose a `64`-frame period. The
-reference E1x2 profile uses `period_size = 64` and `buffer_size = 192` to give
-the shared client path three periods of scheduling margin.
+The adapter expects the daemon profile to expose a `64`-frame logical period.
+The reference E1x2 profile uses physical ALSA Q32, aggregates transfers into
+Q64 client cycles, and keeps `buffer_size = 192` for scheduling margin.
 
 ASIO input latency reports one operational period. Output latency reports the
 configured PRO lookahead in periods. The 192-frame ALSA value is ring capacity,
@@ -25,9 +25,11 @@ zero-filled fallback period, while stale playback is discarded and cannot
 affect later sequences. The ALSA write deadline and queue guard never move for
 the client.
 
-Protocol v7 carries the playback-ready eventfd and shared-memory v4 adds the
-daemon's authoritative playback watermark. Shared-memory slot state and
-sequence ownership remain authoritative for whether a playback block is ready.
+Protocol v10 carries the playback-ready eventfd, timing diagnostics, and
+physical hardware period, while shared-memory v4 adds the daemon's
+authoritative playback watermark.
+Shared-memory slot state and sequence ownership remain authoritative for
+whether a playback block is ready.
 The client chooses the oldest capture target not older than that watermark, so
 a newly published future block cannot displace an exact block the daemon still
 needs. Sequence gaps advance sample position and double-buffer parity before

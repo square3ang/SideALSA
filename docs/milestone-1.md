@@ -2,10 +2,11 @@
 
 Current scope is direct duplex access from `sidealsa-core`.
 
-The engine opens profile-selected playback and capture PCM streams, configures
-`S32_LE` interleaved ALSA access at `48 kHz`, `64` frames per period, and a
-`192`-frame hardware buffer. It discards capture data and writes zero-filled
-playback data.
+The engine opens profile-selected playback and capture PCM streams and
+configures `S32_LE` interleaved ALSA access at `48 kHz`. `period_size` is the
+logical transfer/client block. An optional `hardware_period_size` may divide it
+for ALSA devices that need smaller interrupt periods. The E1x2 uses logical
+Q64 over physical Q32 with a `192`-frame hardware buffer.
 
 The RT cycle uses preallocated sample buffers and fixed sample counts. It does
 not parse configuration, allocate buffers, use locks, or log.
@@ -44,7 +45,8 @@ Release `hw:OTG,0` from PipeWire first. Then run a finite test:
 cargo run -p sidealsa-core --bin sidealsa-hw-test -- --profile profiles/topping-e1x2.toml --periods 15000
 ```
 
-`7500` periods equals ten seconds at `48 kHz` and `64` frames per period.
+`7500` logical periods equals ten seconds at `48 kHz` and `64` frames per
+period.
 Without `--periods`, stop with Ctrl-C. Shutdown drops both PCM streams and
 prints diagnostics after the RT loop exits.
 
@@ -55,8 +57,11 @@ prints diagnostics after the RT loop exits.
 - Capture is discarded.
 - Playback is silence only.
 - Only `S32_LE` is supported.
-- Exact `period_size = 64` and `buffer_size = 192` are required. Devices rejecting that setup fail before streaming.
-- E1x2 hardware uses three periods for the current low-latency profile; `64/128` is insufficient for the shared client path.
+- Exact logical `period_size = 64`, physical `hardware_period_size = 32`, and
+  `buffer_size = 192` are required by the E1x2 profile. Devices rejecting that
+  setup fail before streaming.
+- The E1x2 hardware buffer holds six physical periods; `64/128` is insufficient
+  for the shared client path.
 - Optimized release `64/192` completed `7500` periods with `generation=0`,
   `timeline_resets=0`, `hw_playback_xruns=0`, and `hw_capture_xruns=0`.
 - Reported playback and capture positions currently count successful transfers; ALSA hardware pointer queries are not implemented yet.

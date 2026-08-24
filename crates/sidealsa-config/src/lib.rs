@@ -21,6 +21,8 @@ pub struct HardwareConfig {
     pub name: String,
     pub rate: u32,
     pub period_size: u32,
+    #[serde(default)]
+    pub hardware_period_size: Option<u32>,
     pub buffer_size: u32,
     #[serde(default)]
     pub playback_queue_periods: Option<u32>,
@@ -126,6 +128,19 @@ impl HardwareConfig {
         if self.period_size == 0 {
             return Err(ProfileError::Invalid("period_size must be non-zero".into()));
         }
+        let hardware_period_size = self.effective_hardware_period_size();
+        if hardware_period_size == 0 {
+            return Err(ProfileError::Invalid(
+                "hardware_period_size must be non-zero".into(),
+            ));
+        }
+        if hardware_period_size > self.period_size
+            || !self.period_size.is_multiple_of(hardware_period_size)
+        {
+            return Err(ProfileError::Invalid(
+                "hardware_period_size must divide period_size".into(),
+            ));
+        }
         if self.buffer_size == 0 {
             return Err(ProfileError::Invalid("buffer_size must be non-zero".into()));
         }
@@ -155,6 +170,11 @@ impl HardwareConfig {
             )));
         }
         if self.pro_latency_periods == 0 {
+            if !self.effective_duplex_link() {
+                return Err(ProfileError::Invalid(
+                    "pro_latency_periods = 0 requires duplex_link = true".into(),
+                ));
+            }
             if !self.playback_timer_scheduling {
                 return Err(ProfileError::Invalid(
                     "pro_latency_periods = 0 requires playback_timer_scheduling = true".into(),
@@ -162,7 +182,7 @@ impl HardwareConfig {
             }
             if self.buffer_size < self.period_size.saturating_mul(2) {
                 return Err(ProfileError::Invalid(
-                    "pro_latency_periods = 0 requires at least two hardware periods".into(),
+                    "pro_latency_periods = 0 requires at least two logical periods".into(),
                 ));
             }
         }
@@ -205,6 +225,10 @@ impl HardwareConfig {
     pub fn effective_duplex_link(&self) -> bool {
         self.duplex_link
             .unwrap_or_else(|| self.playback.device == self.capture.device)
+    }
+
+    pub fn effective_hardware_period_size(&self) -> u32 {
+        self.hardware_period_size.unwrap_or(self.period_size)
     }
 }
 
@@ -358,6 +382,8 @@ mod tests {
         let profile = Profile::from_toml(PROFILE).expect("profile should parse");
 
         assert_eq!(profile.device.name, "Test interface");
+        assert_eq!(profile.device.hardware_period_size, None);
+        assert_eq!(profile.device.effective_hardware_period_size(), 32);
         assert_eq!(profile.device.pro_latency_periods, 1);
         assert_eq!(profile.device.pro_realtime_priority, Some(15));
         assert_eq!(profile.device.effective_pro_realtime_priority(), 15);
@@ -378,6 +404,33 @@ mod tests {
         let profile = Profile::from_toml(&text).expect("profile should parse");
 
         assert_eq!(profile.device.pro_latency_periods, 3);
+    }
+
+    #[test]
+    fn parses_smaller_hardware_period() {
+        let text = PROFILE.replace(
+            "period_size = 32",
+            "period_size = 32\n        hardware_period_size = 16",
+        );
+        let profile = Profile::from_toml(&text).expect("profile should parse");
+
+        assert_eq!(profile.device.hardware_period_size, Some(16));
+        assert_eq!(profile.device.effective_hardware_period_size(), 16);
+    }
+
+    #[test]
+    fn rejects_hardware_period_that_does_not_divide_client_period() {
+        let text = PROFILE.replace(
+            "period_size = 32",
+            "period_size = 32\n        hardware_period_size = 24",
+        );
+
+        let error = Profile::from_toml(&text).expect_err("profile should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("hardware_period_size must divide period_size")
+        );
     }
 
     #[test]
@@ -406,6 +459,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_pro_latency_without_linked_duplex() {
+        let text = PROFILE
+            .replace("pro_latency_periods = 1", "pro_latency_periods = 0")
+            .replace("duplex_link = true", "duplex_link = false");
+
+        let error = Profile::from_toml(&text).expect_err("profile should fail");
+        assert!(error.to_string().contains("requires duplex_link = true"));
+    }
+
+    #[test]
     fn rejects_zero_pro_latency_with_one_hardware_period() {
         let text = PROFILE
             .replace("buffer_size = 64", "buffer_size = 32")
@@ -415,7 +478,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("requires at least two hardware periods")
+                .contains("requires at least two logical periods")
         );
     }
 

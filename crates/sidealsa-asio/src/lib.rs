@@ -1537,6 +1537,7 @@ mod tests {
             name: "Test".into(),
             rate: 48000,
             period_size: 64,
+            hardware_period_size: 32,
             buffer_size: 192,
             pro_latency_periods: 2,
             pro_realtime_priority: 86,

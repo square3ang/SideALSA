@@ -171,7 +171,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
                     (not_owner(), Vec::new())
                 }
             }
-            Request::GetStats => (Response::Stats(state.stats()), Vec::new()),
+            Request::GetStats => (Response::Stats(Box::new(state.stats())), Vec::new()),
         };
 
         if send_response(&mut stream, &response, &fds).is_err() {

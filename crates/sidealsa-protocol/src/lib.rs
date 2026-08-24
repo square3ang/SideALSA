@@ -6,7 +6,7 @@ use std::{
 
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 10;
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"SALS";
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 pub const FEATURE_PRO: u32 = 1 << 0;
@@ -53,7 +53,7 @@ pub enum Response {
     Ack,
     Busy,
     Unsupported,
-    Stats(Stats),
+    Stats(Box<Stats>),
     Error {
         code: ErrorCode,
         message: String,
@@ -65,6 +65,7 @@ pub struct DeviceInfo {
     pub name: String,
     pub rate: u32,
     pub period_size: u32,
+    pub hardware_period_size: u32,
     pub buffer_size: u32,
     pub pro_latency_periods: u32,
     pub pro_realtime_priority: u32,
@@ -111,6 +112,25 @@ pub struct Stats {
     pub hw_capture_xruns: u64,
     pub playback_delay_frames: u64,
     pub capture_delay_frames: u64,
+    pub playback_delay_min_frames: u64,
+    pub playback_delay_max_frames: u64,
+    pub playback_ring_delay_frames: u64,
+    pub playback_ring_delay_min_frames: u64,
+    pub playback_ring_delay_max_frames: u64,
+    pub playback_driver_delay_frames: u64,
+    pub playback_driver_delay_min_frames: u64,
+    pub playback_driver_delay_max_frames: u64,
+    pub capture_delay_min_frames: u64,
+    pub capture_delay_max_frames: u64,
+    pub playback_target_overshoot_max_frames: u64,
+    pub capture_clock_wait_max_nanos: u64,
+    pub pro_wait_budget_min_nanos: u64,
+    pub pro_wait_budget_max_nanos: u64,
+    pub pro_ready_wait_max_nanos: u64,
+    pub playback_write_max_nanos: u64,
+    pub capture_to_playback_write_nanos: u64,
+    pub capture_to_playback_write_min_nanos: u64,
+    pub capture_to_playback_write_max_nanos: u64,
     pub playback_low_watermarks: u64,
     pub pro_deadline_misses: u64,
     pub pro_client_deadline_misses: u64,
@@ -469,7 +489,7 @@ fn decode_response_payload(code: ResponseCode, payload: &[u8]) -> Result<Respons
         ResponseCode::Ack => Response::Ack,
         ResponseCode::Busy => Response::Busy,
         ResponseCode::Unsupported => Response::Unsupported,
-        ResponseCode::Stats => Response::Stats(decode_stats(&mut decoder)?),
+        ResponseCode::Stats => Response::Stats(Box::new(decode_stats(&mut decoder)?)),
         ResponseCode::Error => Response::Error {
             code: ErrorCode::try_from(decoder.u16()?)?,
             message: decoder.string()?,
@@ -483,6 +503,7 @@ fn encode_info(payload: &mut Vec<u8>, info: &DeviceInfo) -> Result<(), ProtocolE
     put_string(payload, &info.name)?;
     put_u32(payload, info.rate);
     put_u32(payload, info.period_size);
+    put_u32(payload, info.hardware_period_size);
     put_u32(payload, info.buffer_size);
     put_u32(payload, info.pro_latency_periods);
     put_u32(payload, info.pro_realtime_priority);
@@ -498,6 +519,7 @@ fn decode_info(decoder: &mut Decoder<'_>) -> Result<DeviceInfo, ProtocolError> {
         name: decoder.string()?,
         rate: decoder.u32()?,
         period_size: decoder.u32()?,
+        hardware_period_size: decoder.u32()?,
         buffer_size: decoder.u32()?,
         pro_latency_periods: decoder.u32()?,
         pro_realtime_priority: decoder.u32()?,
@@ -575,6 +597,25 @@ fn encode_stats(payload: &mut Vec<u8>, stats: &Stats) {
         stats.hw_capture_xruns,
         stats.playback_delay_frames,
         stats.capture_delay_frames,
+        stats.playback_delay_min_frames,
+        stats.playback_delay_max_frames,
+        stats.playback_ring_delay_frames,
+        stats.playback_ring_delay_min_frames,
+        stats.playback_ring_delay_max_frames,
+        stats.playback_driver_delay_frames,
+        stats.playback_driver_delay_min_frames,
+        stats.playback_driver_delay_max_frames,
+        stats.capture_delay_min_frames,
+        stats.capture_delay_max_frames,
+        stats.playback_target_overshoot_max_frames,
+        stats.capture_clock_wait_max_nanos,
+        stats.pro_wait_budget_min_nanos,
+        stats.pro_wait_budget_max_nanos,
+        stats.pro_ready_wait_max_nanos,
+        stats.playback_write_max_nanos,
+        stats.capture_to_playback_write_nanos,
+        stats.capture_to_playback_write_min_nanos,
+        stats.capture_to_playback_write_max_nanos,
         stats.playback_low_watermarks,
         stats.pro_deadline_misses,
         stats.pro_client_deadline_misses,
@@ -606,6 +647,25 @@ fn decode_stats(decoder: &mut Decoder<'_>) -> Result<Stats, ProtocolError> {
         hw_capture_xruns: decoder.u64()?,
         playback_delay_frames: decoder.u64()?,
         capture_delay_frames: decoder.u64()?,
+        playback_delay_min_frames: decoder.u64()?,
+        playback_delay_max_frames: decoder.u64()?,
+        playback_ring_delay_frames: decoder.u64()?,
+        playback_ring_delay_min_frames: decoder.u64()?,
+        playback_ring_delay_max_frames: decoder.u64()?,
+        playback_driver_delay_frames: decoder.u64()?,
+        playback_driver_delay_min_frames: decoder.u64()?,
+        playback_driver_delay_max_frames: decoder.u64()?,
+        capture_delay_min_frames: decoder.u64()?,
+        capture_delay_max_frames: decoder.u64()?,
+        playback_target_overshoot_max_frames: decoder.u64()?,
+        capture_clock_wait_max_nanos: decoder.u64()?,
+        pro_wait_budget_min_nanos: decoder.u64()?,
+        pro_wait_budget_max_nanos: decoder.u64()?,
+        pro_ready_wait_max_nanos: decoder.u64()?,
+        playback_write_max_nanos: decoder.u64()?,
+        capture_to_playback_write_nanos: decoder.u64()?,
+        capture_to_playback_write_min_nanos: decoder.u64()?,
+        capture_to_playback_write_max_nanos: decoder.u64()?,
         playback_low_watermarks: decoder.u64()?,
         pro_deadline_misses: decoder.u64()?,
         pro_client_deadline_misses: decoder.u64()?,
@@ -927,7 +987,7 @@ mod tests {
 
     #[test]
     fn response_round_trip() {
-        let response = Response::Stats(Stats {
+        let response = Response::Stats(Box::new(Stats {
             generation: 4,
             sample_position: 128,
             playback_position: 64,
@@ -936,6 +996,25 @@ mod tests {
             hw_capture_xruns: 2,
             playback_delay_frames: 128,
             capture_delay_frames: 32,
+            playback_delay_min_frames: 64,
+            playback_delay_max_frames: 192,
+            playback_ring_delay_frames: 63,
+            playback_ring_delay_min_frames: 31,
+            playback_ring_delay_max_frames: 95,
+            playback_driver_delay_frames: 160,
+            playback_driver_delay_min_frames: 128,
+            playback_driver_delay_max_frames: 192,
+            capture_delay_min_frames: 0,
+            capture_delay_max_frames: 64,
+            playback_target_overshoot_max_frames: 4,
+            capture_clock_wait_max_nanos: 20,
+            pro_wait_budget_min_nanos: 30,
+            pro_wait_budget_max_nanos: 40,
+            pro_ready_wait_max_nanos: 50,
+            playback_write_max_nanos: 60,
+            capture_to_playback_write_nanos: 70,
+            capture_to_playback_write_min_nanos: 65,
+            capture_to_playback_write_max_nanos: 75,
             playback_low_watermarks: 1,
             pro_deadline_misses: 3,
             pro_client_deadline_misses: 4,
@@ -952,7 +1031,7 @@ mod tests {
             shared_overruns: 15,
             timeline_resets: 16,
             periods_processed: 17,
-        });
+        }));
         let bytes = encode_response(&response).expect("response should encode");
         let decoded = decode_response(&bytes).expect("response should decode");
         assert_eq!(decoded, response);

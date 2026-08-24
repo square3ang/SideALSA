@@ -91,7 +91,7 @@ impl SideAlsaClient {
 
     pub fn get_stats(&mut self) -> Result<Stats, ClientError> {
         match request(&mut self.control, Request::GetStats)? {
-            Response::Stats(stats) => Ok(stats),
+            Response::Stats(stats) => Ok(*stats),
             response => Err(response_error(response)),
         }
     }
@@ -317,7 +317,7 @@ impl AudioStream {
     pub fn get_stats(&mut self) -> Result<Stats, ClientError> {
         self.ensure_open()?;
         match request(&mut self.control, Request::GetStats)? {
-            Response::Stats(stats) => Ok(stats),
+            Response::Stats(stats) => Ok(*stats),
             response => Err(response_error(response)),
         }
     }
@@ -702,6 +702,7 @@ mod tests {
             name: "Test".into(),
             rate: 48000,
             period_size: 32,
+            hardware_period_size: 16,
             buffer_size: 64,
             pro_latency_periods: 1,
             pro_realtime_priority: 15,

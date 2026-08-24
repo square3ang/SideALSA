@@ -551,6 +551,7 @@ impl ProPlaybackSource for DaemonPlaybackBridge {
         playback.fill(0);
         let session_id = self.pro_active.load(Ordering::Acquire);
         if session_id != 0 && self.pro_region.client_state() != SHARED_CLIENT_IDLE {
+            let wait_started = Instant::now();
             let deadline = Instant::now()
                 .checked_add(wait_budget)
                 .unwrap_or_else(Instant::now);
@@ -588,6 +589,9 @@ impl ProPlaybackSource for DaemonPlaybackBridge {
                     }
                 }
             };
+            self.timeline.record_pro_ready_wait(
+                u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            );
             if consumed {
                 self.timeline
                     .record_pro_playback_block(playback.iter().any(|sample| *sample != 0));
@@ -626,6 +630,7 @@ fn device_info(profile: &Profile) -> DeviceInfo {
         name: profile.device.name.clone(),
         rate: profile.device.rate,
         period_size: profile.device.period_size,
+        hardware_period_size: profile.device.effective_hardware_period_size(),
         buffer_size: profile.device.buffer_size,
         pro_latency_periods: profile.device.pro_latency_periods,
         pro_realtime_priority: profile.device.effective_pro_realtime_priority(),
@@ -655,6 +660,25 @@ fn stats_from_core(stats: HardwareStats, pro_region: &SharedRegion) -> Stats {
         hw_capture_xruns: stats.hw_capture_xruns,
         playback_delay_frames: stats.playback_delay_frames,
         capture_delay_frames: stats.capture_delay_frames,
+        playback_delay_min_frames: stats.playback_delay_min_frames,
+        playback_delay_max_frames: stats.playback_delay_max_frames,
+        playback_ring_delay_frames: stats.playback_ring_delay_frames,
+        playback_ring_delay_min_frames: stats.playback_ring_delay_min_frames,
+        playback_ring_delay_max_frames: stats.playback_ring_delay_max_frames,
+        playback_driver_delay_frames: stats.playback_driver_delay_frames,
+        playback_driver_delay_min_frames: stats.playback_driver_delay_min_frames,
+        playback_driver_delay_max_frames: stats.playback_driver_delay_max_frames,
+        capture_delay_min_frames: stats.capture_delay_min_frames,
+        capture_delay_max_frames: stats.capture_delay_max_frames,
+        playback_target_overshoot_max_frames: stats.playback_target_overshoot_max_frames,
+        capture_clock_wait_max_nanos: stats.capture_clock_wait_max_nanos,
+        pro_wait_budget_min_nanos: stats.pro_wait_budget_min_nanos,
+        pro_wait_budget_max_nanos: stats.pro_wait_budget_max_nanos,
+        pro_ready_wait_max_nanos: stats.pro_ready_wait_max_nanos,
+        playback_write_max_nanos: stats.playback_write_max_nanos,
+        capture_to_playback_write_nanos: stats.capture_to_playback_write_nanos,
+        capture_to_playback_write_min_nanos: stats.capture_to_playback_write_min_nanos,
+        capture_to_playback_write_max_nanos: stats.capture_to_playback_write_max_nanos,
         playback_low_watermarks: stats.playback_low_watermarks,
         pro_deadline_misses: stats.pro_deadline_misses,
         pro_client_deadline_misses: stats.pro_client_deadline_misses,

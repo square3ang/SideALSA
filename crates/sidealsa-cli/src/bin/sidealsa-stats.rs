@@ -48,6 +48,43 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
             stats.playback_delay_frames, stats.capture_delay_frames, stats.playback_low_watermarks,
         );
         println!(
+            "playback_delay_min={} playback_delay_max={}",
+            stats.playback_delay_min_frames, stats.playback_delay_max_frames,
+        );
+        println!(
+            "playback_ring_delay={} playback_ring_delay_min={} playback_ring_delay_max={}",
+            stats.playback_ring_delay_frames,
+            stats.playback_ring_delay_min_frames,
+            stats.playback_ring_delay_max_frames,
+        );
+        println!(
+            "playback_driver_delay={} playback_driver_delay_min={} playback_driver_delay_max={}",
+            stats.playback_driver_delay_frames,
+            stats.playback_driver_delay_min_frames,
+            stats.playback_driver_delay_max_frames,
+        );
+        println!(
+            "capture_delay_min={} capture_delay_max={}",
+            stats.capture_delay_min_frames, stats.capture_delay_max_frames,
+        );
+        println!(
+            "playback_overshoot_max={} capture_clock_wait_max_nanos={}",
+            stats.playback_target_overshoot_max_frames, stats.capture_clock_wait_max_nanos,
+        );
+        println!(
+            "pro_wait_budget_nanos_min={} pro_wait_budget_nanos_max={} pro_ready_wait_max_nanos={} playback_write_max_nanos={}",
+            stats.pro_wait_budget_min_nanos,
+            stats.pro_wait_budget_max_nanos,
+            stats.pro_ready_wait_max_nanos,
+            stats.playback_write_max_nanos,
+        );
+        println!(
+            "capture_to_playback_write_nanos={} capture_to_playback_write_min_nanos={} capture_to_playback_write_max_nanos={}",
+            stats.capture_to_playback_write_nanos,
+            stats.capture_to_playback_write_min_nanos,
+            stats.capture_to_playback_write_max_nanos,
+        );
+        println!(
             "pro_playback_blocks={} pro_playback_nonzero_blocks={}",
             stats.pro_playback_blocks, stats.pro_playback_nonzero_blocks,
         );

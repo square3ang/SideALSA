@@ -114,6 +114,9 @@ impl SharedRegion {
     }
 
     fn map(fd: RawFd, layout: SharedRegionLayout) -> Result<Self, SharedError> {
+        let info = layout.info();
+        let capture_samples = sample_count(info.period_frames, info.capture_channels)?;
+        let playback_samples = sample_count(info.period_frames, info.playback_channels)?;
         let ptr = unsafe {
             libc::mmap(
                 ptr::null_mut(),
@@ -128,9 +131,13 @@ impl SharedRegion {
             return Err(SharedError::Map);
         }
         let ptr = NonNull::new(ptr.cast::<u8>()).ok_or(SharedError::Map)?;
-        let info = layout.info();
-        let capture_samples = sample_count(info.period_frames, info.capture_channels)?;
-        let playback_samples = sample_count(info.period_frames, info.playback_channels)?;
+        if unsafe { libc::mlock(ptr.as_ptr().cast(), layout.size()) } != 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::munmap(ptr.as_ptr().cast(), layout.size());
+            }
+            return Err(error.into());
+        }
         Ok(Self {
             fd,
             ptr,

@@ -125,15 +125,8 @@ fn notify(fd: RawFd) {
 }
 
 fn drain(fd: RawFd) {
-    loop {
-        let mut value = 0_u64;
-        let result = unsafe { libc::read(fd, (&mut value as *mut u64).cast(), size_of::<u64>()) };
-        if result == size_of::<u64>() as isize {
-            continue;
-        }
-        if result < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-            continue;
-        }
-        break;
+    let mut value = 0_u64;
+    unsafe {
+        libc::read(fd, (&mut value as *mut u64).cast(), size_of::<u64>());
     }
 }
