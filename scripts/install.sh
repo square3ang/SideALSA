@@ -10,6 +10,7 @@ ALSA_PLUGIN_DIR="${ALSA_PLUGIN_DIR:-}"
 NO_BUILD=0
 WITH_ASIO=0
 FORCE=0
+REPLACE_PROFILE=0
 NO_START=0
 INSTALL_PIPEWIRE=1
 USER_AUDIO_WAS_STOPPED=0
@@ -97,6 +98,7 @@ Options:
   --no-build                Use existing target/release artifacts
   --with-asio               Build and install Wine ASIO binaries
   --force                   Replace files not owned by previous install
+  --replace-profile         Replace existing device profile
   --no-start                Enable service without starting it
   --no-pipewire             Skip PipeWire adapter configuration
   -h, --help                Show this help
@@ -138,6 +140,10 @@ while (($# > 0)); do
             ;;
         --force)
             FORCE=1
+            shift
+            ;;
+        --replace-profile)
+            REPLACE_PROFILE=1
             shift
             ;;
         --no-start)
@@ -353,11 +359,11 @@ for binary in sidealsa-hw-test sidealsa-pro-test sidealsa-stats sidealsa-pro-cli
 done
 run_privileged install -D -m 0755 "$PLUGIN_SOURCE" "$(destination "$ALSA_PLUGIN_DIR/libasound_module_pcm_sidealsa.so")"
 PROFILE_ACTUAL="$(destination "$PROFILE_PATH")"
-if [[ -e "$PROFILE_ACTUAL" ]]; then
+if [[ -e "$PROFILE_ACTUAL" && "$REPLACE_PROFILE" -eq 0 ]]; then
     info "preserving existing profile: $PROFILE_ACTUAL"
 else
     run_privileged install -D -m 0644 "$PROFILE_SOURCE" "$PROFILE_ACTUAL"
-    info "created initial profile: $PROFILE_ACTUAL"
+    info "installed profile: $PROFILE_ACTUAL"
 fi
 run_privileged install -D -m 0644 "$ROOT/LICENSE" "$(destination "$LICENSE_PATH")"
 
