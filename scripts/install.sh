@@ -14,6 +14,7 @@ REPLACE_PROFILE=0
 NO_START=0
 INSTALL_PIPEWIRE=1
 USER_AUDIO_WAS_STOPPED=0
+TMP_DIR=
 
 if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != root \
     && -z "${SIDEALSA_INSTALL_REEXEC:-}" ]]; then
@@ -82,7 +83,17 @@ restore_user_audio() {
     USER_AUDIO_WAS_STOPPED=0
 }
 
-trap restore_user_audio EXIT
+cleanup() {
+    local status=$?
+    trap - EXIT
+    if [[ -n "$TMP_DIR" ]]; then
+        rm -rf -- "$TMP_DIR"
+    fi
+    restore_user_audio || true
+    exit "$status"
+}
+
+trap cleanup EXIT
 
 usage() {
     cat <<'EOF'
@@ -339,7 +350,6 @@ for path in "${RETIRED_MANAGED_PATHS[@]}"; do
 done
 
 TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
 
 install_managed_copy() {
     local source=$1
