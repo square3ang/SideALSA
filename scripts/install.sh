@@ -14,6 +14,9 @@ REPLACE_PROFILE=0
 NO_START=0
 INSTALL_PIPEWIRE=1
 USER_AUDIO_WAS_STOPPED=0
+USER_AUDIO_UNITS=()
+DAEMON_RESTART_PENDING=0
+DAEMON_WAS_ENABLED=0
 TMP_DIR=
 
 if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != root \
@@ -41,13 +44,17 @@ info() {
 }
 
 wait_for_socket() {
-    local attempts=50
-    while ((attempts > 0)); do
-        if [[ -S "$SOCKET_PATH" ]]; then
+    local deadline=$((SECONDS + 20))
+    command -v timeout >/dev/null 2>&1 || die "timeout command not found"
+    while ((SECONDS < deadline)); do
+        if [[ -S "$SOCKET_PATH" ]] \
+            && systemctl is-active --quiet sidealsad.service \
+            && timeout --signal=KILL 0.5s "$PREFIX/bin/sidealsa-stats" \
+                --socket "$SOCKET_PATH" --samples 1 --interval-ms 0 \
+                >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.1
-        ((attempts--))
     done
     die "sidealsad socket did not appear: $SOCKET_PATH"
 }
@@ -57,30 +64,33 @@ stop_user_audio() {
         return
     fi
     command -v systemctl >/dev/null 2>&1 || return
-    if ! systemctl --user is-active --quiet pipewire.service \
-        && ! systemctl --user is-active --quiet pipewire-pulse.service \
-        && ! systemctl --user is-active --quiet wireplumber.service \
-        && ! systemctl --user is-active --quiet pipewire.socket \
-        && ! systemctl --user is-active --quiet pipewire-pulse.socket; then
+    local unit
+    local units=(
+        pipewire-pulse.socket pipewire.socket pipewire-pulse.service
+        wireplumber.service pipewire.service
+    )
+    USER_AUDIO_UNITS=()
+    for unit in "${units[@]}"; do
+        if systemctl --user is-active --quiet "$unit"; then
+            USER_AUDIO_UNITS+=("$unit")
+        fi
+    done
+    if ((${#USER_AUDIO_UNITS[@]} == 0)); then
         return
     fi
     info "stopping user PipeWire session before replacing SideALSA daemon"
-    systemctl --user stop \
-        pipewire-pulse.socket pipewire.socket pipewire-pulse.service \
-        wireplumber.service pipewire.service
     USER_AUDIO_WAS_STOPPED=1
+    systemctl --user stop "${USER_AUDIO_UNITS[@]}"
 }
 
 restore_user_audio() {
     if ((USER_AUDIO_WAS_STOPPED == 0)); then
         return
     fi
-    systemctl --user reset-failed \
-        pipewire.socket pipewire.service pipewire-pulse.socket \
-        pipewire-pulse.service wireplumber.service || true
-    systemctl --user start pipewire.socket pipewire-pulse.socket
-    systemctl --user start pipewire.service pipewire-pulse.service wireplumber.service
+    systemctl --user reset-failed "${USER_AUDIO_UNITS[@]}" || true
+    systemctl --user start "${USER_AUDIO_UNITS[@]}"
     USER_AUDIO_WAS_STOPPED=0
+    USER_AUDIO_UNITS=()
 }
 
 cleanup() {
@@ -88,6 +98,12 @@ cleanup() {
     trap - EXIT
     if [[ -n "$TMP_DIR" ]]; then
         rm -rf -- "$TMP_DIR"
+    fi
+    if ((status != 0 && DAEMON_RESTART_PENDING == 1)); then
+        run_privileged systemctl stop sidealsad.service || true
+        if ((DAEMON_WAS_ENABLED == 0)); then
+            run_privileged systemctl disable sidealsad.service || true
+        fi
     fi
     restore_user_audio || true
     exit "$status"
@@ -446,9 +462,14 @@ if [[ -z "$DESTDIR" ]]; then
         if ((NO_START == 1)); then
             run_privileged systemctl enable sidealsad.service
         else
-            run_privileged systemctl enable sidealsad.service
+            if systemctl is-enabled --quiet sidealsad.service; then
+                DAEMON_WAS_ENABLED=1
+            fi
+            DAEMON_RESTART_PENDING=1
             run_privileged systemctl restart sidealsad.service
             wait_for_socket
+            run_privileged systemctl enable sidealsad.service
+            DAEMON_RESTART_PENDING=0
             restore_user_audio
         fi
     else

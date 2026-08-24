@@ -85,6 +85,13 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
             stats.capture_to_playback_write_max_nanos,
         );
         println!(
+            "linked_phase_attempts={} linked_phase_rebases={} linked_phase_score_nanos={} linked_phase_target_met={}",
+            stats.linked_phase_attempts,
+            stats.linked_phase_rebases,
+            stats.linked_phase_score_nanos,
+            stats.linked_phase_target_met,
+        );
+        println!(
             "pro_playback_blocks={} pro_playback_nonzero_blocks={}",
             stats.pro_playback_blocks, stats.pro_playback_nonzero_blocks,
         );

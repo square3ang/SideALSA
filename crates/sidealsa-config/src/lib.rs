@@ -6,6 +6,9 @@ use thiserror::Error;
 pub const MAX_PRO_LATENCY_PERIODS: u32 = 7;
 pub const MAX_SHARED_LATENCY_PERIODS: u32 = 7;
 pub const MAX_REALTIME_PRIORITY: u32 = 99;
+pub const MAX_LINKED_PHASE_ATTEMPTS: u32 = 64;
+pub const LINKED_PRO_HANDOFF_NANOS: u64 = 125_000;
+pub const LINKED_PHASE_OVERHEAD_DIVISOR: u32 = 8;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +33,8 @@ pub struct HardwareConfig {
     pub playback_timer_scheduling: bool,
     #[serde(default)]
     pub duplex_link: Option<bool>,
+    #[serde(default)]
+    pub linked_phase_max_attempts: u32,
     #[serde(default = "default_pro_latency_periods")]
     pub pro_latency_periods: u32,
     #[serde(default)]
@@ -183,6 +188,30 @@ impl HardwareConfig {
             if self.buffer_size < self.period_size.saturating_mul(2) {
                 return Err(ProfileError::Invalid(
                     "pro_latency_periods = 0 requires at least two logical periods".into(),
+                ));
+            }
+        }
+        if self.linked_phase_max_attempts > MAX_LINKED_PHASE_ATTEMPTS {
+            return Err(ProfileError::Invalid(format!(
+                "linked_phase_max_attempts must be <= {MAX_LINKED_PHASE_ATTEMPTS}"
+            )));
+        }
+        if self.linked_phase_max_attempts > 0
+            && (!self.effective_duplex_link() || self.pro_latency_periods != 0)
+        {
+            return Err(ProfileError::Invalid(
+                "linked_phase_max_attempts requires linked zero-lead PRO".into(),
+            ));
+        }
+        if self.linked_phase_max_attempts > 0 {
+            let target_nanos =
+                u128::from(hardware_period_size) * 1_000_000_000 / (u128::from(self.rate) * 2);
+            let overhead_frames = (hardware_period_size / LINKED_PHASE_OVERHEAD_DIVISOR).max(1);
+            let required_nanos = u128::from(LINKED_PRO_HANDOFF_NANOS)
+                + u128::from(overhead_frames) * 1_000_000_000 / u128::from(self.rate);
+            if target_nanos < required_nanos {
+                return Err(ProfileError::Invalid(
+                    "linked phase target is too short for PRO handoff and overhead".into(),
                 ));
             }
         }
@@ -391,6 +420,7 @@ mod tests {
         assert!(profile.device.playback_timer_scheduling);
         assert_eq!(profile.device.duplex_link, Some(true));
         assert!(profile.device.effective_duplex_link());
+        assert_eq!(profile.device.linked_phase_max_attempts, 0);
         assert_eq!(profile.device.shared_latency_periods, 4);
         assert!(profile.device.realtime);
         assert_eq!(profile.device.realtime_priority, 50);
@@ -404,6 +434,64 @@ mod tests {
         let profile = Profile::from_toml(&text).expect("profile should parse");
 
         assert_eq!(profile.device.pro_latency_periods, 3);
+    }
+
+    #[test]
+    fn parses_linked_phase_attempts() {
+        let text = PROFILE
+            .replace("pro_latency_periods = 1", "pro_latency_periods = 0")
+            .replace(
+                "duplex_link = true",
+                "duplex_link = true\n        linked_phase_max_attempts = 32",
+            );
+        let profile = Profile::from_toml(&text).expect("profile should parse");
+
+        assert_eq!(profile.device.linked_phase_max_attempts, 32);
+    }
+
+    #[test]
+    fn rejects_linked_phase_attempts_without_zero_lead() {
+        let text = PROFILE.replace(
+            "duplex_link = true",
+            "duplex_link = true\n        linked_phase_max_attempts = 1",
+        );
+
+        let error = Profile::from_toml(&text).expect_err("profile should fail");
+        assert!(error.to_string().contains("requires linked zero-lead PRO"));
+    }
+
+    #[test]
+    fn rejects_too_many_linked_phase_attempts() {
+        let text = PROFILE
+            .replace("pro_latency_periods = 1", "pro_latency_periods = 0")
+            .replace(
+                "duplex_link = true",
+                "duplex_link = true\n        linked_phase_max_attempts = 65",
+            );
+
+        let error = Profile::from_toml(&text).expect_err("profile should fail");
+        assert!(error.to_string().contains("must be <= 64"));
+    }
+
+    #[test]
+    fn rejects_linked_phase_target_shorter_than_handoff() {
+        let text = PROFILE
+            .replace("pro_latency_periods = 1", "pro_latency_periods = 0")
+            .replace(
+                "period_size = 32",
+                "period_size = 32\n        hardware_period_size = 8",
+            )
+            .replace(
+                "duplex_link = true",
+                "duplex_link = true\n        linked_phase_max_attempts = 1",
+            );
+
+        let error = Profile::from_toml(&text).expect_err("profile should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("too short for PRO handoff and overhead")
+        );
     }
 
     #[test]

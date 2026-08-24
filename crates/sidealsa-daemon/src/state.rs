@@ -6,7 +6,7 @@ use sidealsa_protocol::{
 };
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -183,6 +183,7 @@ impl SharedPortState {
 pub struct DaemonState {
     info: DeviceInfo,
     timeline: Arc<HardwareTimeline>,
+    hardware_ready: Arc<AtomicBool>,
     pro: SessionState,
     shared: Box<[SharedPortState]>,
     next_session: AtomicU64,
@@ -237,6 +238,7 @@ impl DaemonState {
         Ok(Self {
             info: device_info(profile),
             timeline,
+            hardware_ready: Arc::new(AtomicBool::new(false)),
             pro,
             shared: shared.into_boxed_slice(),
             next_session: AtomicU64::new(1),
@@ -253,6 +255,14 @@ impl DaemonState {
 
     pub fn stats(&self) -> Stats {
         stats_from_core(self.timeline.snapshot(), &self.pro.region)
+    }
+
+    pub fn hardware_ready(&self) -> bool {
+        self.hardware_ready.load(Ordering::Acquire)
+    }
+
+    pub fn hardware_ready_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.hardware_ready)
     }
 
     pub fn open_pro(&self) -> Option<(u64, SharedRegionInfo, [std::os::fd::RawFd; 4])> {
@@ -679,6 +689,10 @@ fn stats_from_core(stats: HardwareStats, pro_region: &SharedRegion) -> Stats {
         capture_to_playback_write_nanos: stats.capture_to_playback_write_nanos,
         capture_to_playback_write_min_nanos: stats.capture_to_playback_write_min_nanos,
         capture_to_playback_write_max_nanos: stats.capture_to_playback_write_max_nanos,
+        linked_phase_attempts: stats.linked_phase_attempts,
+        linked_phase_rebases: stats.linked_phase_rebases,
+        linked_phase_score_nanos: stats.linked_phase_score_nanos,
+        linked_phase_target_met: stats.linked_phase_target_met,
         playback_low_watermarks: stats.playback_low_watermarks,
         pro_deadline_misses: stats.pro_deadline_misses,
         pro_client_deadline_misses: stats.pro_client_deadline_misses,

@@ -6,7 +6,7 @@ use std::{
 
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"SALS";
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 pub const FEATURE_PRO: u32 = 1 << 0;
@@ -131,6 +131,10 @@ pub struct Stats {
     pub capture_to_playback_write_nanos: u64,
     pub capture_to_playback_write_min_nanos: u64,
     pub capture_to_playback_write_max_nanos: u64,
+    pub linked_phase_attempts: u64,
+    pub linked_phase_rebases: u64,
+    pub linked_phase_score_nanos: u64,
+    pub linked_phase_target_met: bool,
     pub playback_low_watermarks: u64,
     pub pro_deadline_misses: u64,
     pub pro_client_deadline_misses: u64,
@@ -616,6 +620,10 @@ fn encode_stats(payload: &mut Vec<u8>, stats: &Stats) {
         stats.capture_to_playback_write_nanos,
         stats.capture_to_playback_write_min_nanos,
         stats.capture_to_playback_write_max_nanos,
+        stats.linked_phase_attempts,
+        stats.linked_phase_rebases,
+        stats.linked_phase_score_nanos,
+        u64::from(stats.linked_phase_target_met),
         stats.playback_low_watermarks,
         stats.pro_deadline_misses,
         stats.pro_client_deadline_misses,
@@ -666,6 +674,10 @@ fn decode_stats(decoder: &mut Decoder<'_>) -> Result<Stats, ProtocolError> {
         capture_to_playback_write_nanos: decoder.u64()?,
         capture_to_playback_write_min_nanos: decoder.u64()?,
         capture_to_playback_write_max_nanos: decoder.u64()?,
+        linked_phase_attempts: decoder.u64()?,
+        linked_phase_rebases: decoder.u64()?,
+        linked_phase_score_nanos: decoder.u64()?,
+        linked_phase_target_met: decoder.u64()? != 0,
         playback_low_watermarks: decoder.u64()?,
         pro_deadline_misses: decoder.u64()?,
         pro_client_deadline_misses: decoder.u64()?,
@@ -1015,6 +1027,10 @@ mod tests {
             capture_to_playback_write_nanos: 70,
             capture_to_playback_write_min_nanos: 65,
             capture_to_playback_write_max_nanos: 75,
+            linked_phase_attempts: 3,
+            linked_phase_rebases: 2,
+            linked_phase_score_nanos: 333_333,
+            linked_phase_target_met: true,
             playback_low_watermarks: 1,
             pro_deadline_misses: 3,
             pro_client_deadline_misses: 4,

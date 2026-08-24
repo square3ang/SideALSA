@@ -39,6 +39,11 @@ pub struct HardwareTimeline {
     capture_to_playback_write_nanos: AtomicU64,
     capture_to_playback_write_min_nanos: AtomicU64,
     capture_to_playback_write_max_nanos: AtomicU64,
+    linked_phase_result_epoch: AtomicU64,
+    linked_phase_attempts: AtomicU64,
+    linked_phase_rebases: AtomicU64,
+    linked_phase_score_nanos: AtomicU64,
+    linked_phase_target_met: AtomicU64,
     pro_timing: [ProTimingSlot; PRO_TIMING_SLOT_COUNT],
     playback_low_watermarks: AtomicU64,
     pro_deadline_misses: AtomicU64,
@@ -82,6 +87,10 @@ pub struct HardwareStats {
     pub capture_to_playback_write_nanos: u64,
     pub capture_to_playback_write_min_nanos: u64,
     pub capture_to_playback_write_max_nanos: u64,
+    pub linked_phase_attempts: u64,
+    pub linked_phase_rebases: u64,
+    pub linked_phase_score_nanos: u64,
+    pub linked_phase_target_met: bool,
     pub playback_low_watermarks: u64,
     pub pro_deadline_misses: u64,
     pub pro_client_deadline_misses: u64,
@@ -101,6 +110,8 @@ impl HardwareTimeline {
     }
 
     pub fn snapshot(&self) -> HardwareStats {
+        let (linked_phase_attempts, linked_phase_score_nanos, linked_phase_target_met) =
+            self.linked_phase_calibration();
         HardwareStats {
             generation: self.generation.load(Ordering::Relaxed),
             sample_position: self.sample_position.load(Ordering::Relaxed),
@@ -153,6 +164,10 @@ impl HardwareTimeline {
             capture_to_playback_write_max_nanos: self
                 .capture_to_playback_write_max_nanos
                 .load(Ordering::Relaxed),
+            linked_phase_attempts,
+            linked_phase_rebases: self.linked_phase_rebases.load(Ordering::Relaxed),
+            linked_phase_score_nanos,
+            linked_phase_target_met,
             playback_low_watermarks: self.playback_low_watermarks.load(Ordering::Relaxed),
             pro_deadline_misses: self.pro_deadline_misses.load(Ordering::Relaxed),
             pro_client_deadline_misses: self.pro_client_deadline_misses.load(Ordering::Relaxed),
@@ -249,6 +264,40 @@ impl HardwareTimeline {
         update_maximum(&self.playback_write_max_nanos, nanos);
     }
 
+    pub(crate) fn record_linked_phase_calibration(
+        &self,
+        attempts: u64,
+        score_nanos: u64,
+        target_met: bool,
+    ) {
+        self.linked_phase_result_epoch
+            .fetch_add(1, Ordering::AcqRel);
+        self.linked_phase_attempts
+            .store(attempts, Ordering::Relaxed);
+        self.linked_phase_score_nanos
+            .store(score_nanos, Ordering::Relaxed);
+        self.linked_phase_target_met
+            .store(u64::from(target_met), Ordering::Relaxed);
+        self.linked_phase_result_epoch
+            .fetch_add(1, Ordering::Release);
+    }
+
+    fn linked_phase_calibration(&self) -> (u64, u64, bool) {
+        loop {
+            let start = self.linked_phase_result_epoch.load(Ordering::Acquire);
+            if !start.is_multiple_of(2) {
+                std::hint::spin_loop();
+                continue;
+            }
+            let attempts = self.linked_phase_attempts.load(Ordering::Relaxed);
+            let score_nanos = self.linked_phase_score_nanos.load(Ordering::Relaxed);
+            let target_met = self.linked_phase_target_met.load(Ordering::Relaxed) != 0;
+            if start == self.linked_phase_result_epoch.load(Ordering::Acquire) {
+                return (attempts, score_nanos, target_met);
+            }
+        }
+    }
+
     pub(crate) fn record_pro_capture_read(&self, sequence: u64, nanos: u64) {
         let slot = &self.pro_timing[sequence as usize % PRO_TIMING_SLOT_COUNT];
         slot.capture_read_nanos.store(nanos, Ordering::Relaxed);
@@ -317,6 +366,13 @@ impl HardwareTimeline {
     pub(crate) fn reset_after_hardware_xrun(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.timeline_resets.fetch_add(1, Ordering::Relaxed);
+        self.record_linked_phase_calibration(0, 0, false);
+    }
+
+    pub(crate) fn reset_after_hardware_rebase(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.timeline_resets.fetch_add(1, Ordering::Relaxed);
+        self.linked_phase_rebases.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -379,6 +435,33 @@ mod tests {
         assert_eq!(stats.hw_playback_xruns, 1);
         assert_eq!(stats.generation, 0);
         assert_eq!(stats.timeline_resets, 0);
+    }
+
+    #[test]
+    fn intentional_rebase_resets_timeline_without_counting_xrun() {
+        let timeline = HardwareTimeline::default();
+
+        timeline.reset_after_hardware_rebase();
+
+        let stats = timeline.snapshot();
+        assert_eq!(stats.generation, 1);
+        assert_eq!(stats.timeline_resets, 1);
+        assert_eq!(stats.linked_phase_rebases, 1);
+        assert_eq!(stats.hw_playback_xruns, 0);
+        assert_eq!(stats.hw_capture_xruns, 0);
+    }
+
+    #[test]
+    fn xrun_invalidates_linked_phase_score() {
+        let timeline = HardwareTimeline::default();
+        timeline.record_linked_phase_calibration(3, 300_000, true);
+
+        timeline.reset_after_hardware_xrun();
+
+        let stats = timeline.snapshot();
+        assert_eq!(stats.linked_phase_attempts, 0);
+        assert_eq!(stats.linked_phase_score_nanos, 0);
+        assert!(!stats.linked_phase_target_met);
     }
 
     #[test]

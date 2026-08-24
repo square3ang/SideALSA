@@ -2,6 +2,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
     thread,
+    time::Duration,
 };
 
 use sidealsa_config::Profile;
@@ -58,6 +59,45 @@ fn main() {
         eprintln!("could not register SIGTERM handler: {error}");
         std::process::exit(1);
     }
+    if args.socket.exists()
+        && let Err(error) = std::fs::remove_file(&args.socket)
+    {
+        eprintln!("could not remove stale control socket: {error}");
+        std::process::exit(1);
+    }
+
+    let hardware_stop = Arc::clone(&stop);
+    let hardware_ready = state.hardware_ready_handle();
+    let (capture_bridge, playback_bridge) = state.bridges();
+    let hardware_handle = thread::spawn(move || {
+        let mut engine = engine;
+        let run_result = engine.run_pro_with_ready(
+            &hardware_stop,
+            None,
+            capture_bridge,
+            playback_bridge,
+            &hardware_ready,
+        );
+        let stop_result = engine.stop();
+        (run_result, stop_result)
+    });
+
+    while !state.hardware_ready()
+        && !hardware_handle.is_finished()
+        && !stop.load(std::sync::atomic::Ordering::Acquire)
+    {
+        thread::sleep(Duration::from_millis(1));
+    }
+    if !state.hardware_ready() || hardware_handle.is_finished() {
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        match hardware_handle.join() {
+            Ok((Err(error), _)) => eprintln!("hardware stopped before ready: {error}"),
+            Ok((_, Err(error))) => eprintln!("hardware cleanup failed before ready: {error}"),
+            Ok((Ok(()), Ok(()))) => eprintln!("hardware stopped before ready"),
+            Err(_) => eprintln!("sidealsad hardware thread panicked before ready"),
+        }
+        std::process::exit(1);
+    }
 
     let control_state = Arc::clone(&state);
     let control_stop = Arc::clone(&stop);
@@ -68,15 +108,6 @@ fn main() {
             control_stop.store(true, std::sync::atomic::Ordering::Release);
         }
         result
-    });
-
-    let hardware_stop = Arc::clone(&stop);
-    let (capture_bridge, playback_bridge) = state.bridges();
-    let hardware_handle = thread::spawn(move || {
-        let mut engine = engine;
-        let run_result = engine.run_pro(&hardware_stop, None, capture_bridge, playback_bridge);
-        let stop_result = engine.stop();
-        (run_result, stop_result)
     });
 
     let (run_result, stop_result) = match hardware_handle.join() {
@@ -107,6 +138,13 @@ fn main() {
     println!("sample_position={}", stats.sample_position);
     println!("playback_position={}", stats.playback_position);
     println!("capture_position={}", stats.capture_position);
+    println!("linked_phase_attempts={}", stats.linked_phase_attempts);
+    println!("linked_phase_rebases={}", stats.linked_phase_rebases);
+    println!(
+        "linked_phase_score_nanos={}",
+        stats.linked_phase_score_nanos
+    );
+    println!("linked_phase_target_met={}", stats.linked_phase_target_met);
     println!("generation={}", stats.generation);
     println!("timeline_resets={}", stats.timeline_resets);
     println!("hw_playback_xruns={}", stats.hw_playback_xruns);

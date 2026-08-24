@@ -15,8 +15,8 @@ not queued ASIO software latency.
 
 PRO duplex clients use cycle notifications for a prepared-buffer pipeline. The
 playback worker defines the initial sequence target. Synchronized duplex start
-fixes capture/playback hardware phase, and capture advances one sequence for
-each completed period. A real hardware-generation change rebases it to the
+starts both directions together, and capture advances one sequence for each
+completed period. A real hardware-generation change rebases it to the
 playback target. The client may publish playback for
 that target any time before the hardware writer consumes it. The writer prepares
 output before its ALSA wait and may block on `playback_ready` only for the budget
@@ -25,9 +25,9 @@ zero-filled fallback period, while stale playback is discarded and cannot
 affect later sequences. The ALSA write deadline and queue guard never move for
 the client.
 
-Protocol v10 carries the playback-ready eventfd, timing diagnostics, and
-physical hardware period, while shared-memory v4 adds the daemon's
-authoritative playback watermark.
+Protocol v11 carries the playback-ready eventfd, timing diagnostics, physical
+hardware period, and linked-start phase calibration result. Shared-memory v4
+adds the daemon's authoritative playback watermark.
 Shared-memory slot state and sequence ownership remain authoritative for
 whether a playback block is ready.
 The client chooses the oldest capture target not older than that watermark, so
@@ -36,6 +36,27 @@ needs. Sequence gaps advance sample position and double-buffer parity before
 callback dispatch.
 Playback keeps its original sequence; the daemon discards it if its exact
 deadline has already passed.
+
+`device.linked_phase_max_attempts` optionally calibrates linked zero-lead
+startup before the control socket opens. Each attempt runs two warmup and four
+measured silence cycles. Each cycle reads synchronized playback occupancy after
+the capture block, predicts the normal writer's wait and reserve with a
+four-frame processing margin, then writes silence immediately without draining
+toward an underrun. At least three of four
+measurements must fit within half a physical period while retaining half a
+physical period of queued playback. A rejected attempt drops, prepares, primes,
+relinks, dithers, and restarts the hardware. These intentional starts increment
+generation, timeline-reset, and phase-rebase counters, but not hardware-XRUN
+counters. Exhaustion uses the final running phase instead of stopping the
+daemon. This timing score classifies starts; analog loopback remains the latency
+authority. Linked XRUN recovery repeats calibration before client callbacks
+resume. Warmup and measured maintenance transfers do not advance
+`sample_position`, playback/capture positions, or `periods_processed`;
+generation and reset counters identify the discontinuity.
+
+The E1x2 reference profile leaves phase calibration disabled. Rapid intentional
+ALSA restarts produced linked capture XRUNs on this device, so the stable B192
+startup remains the default while alternate rebasing mechanisms are evaluated.
 
 The reference profile keeps ALSA hardware `buffer_size = 192`. E1x2 experiments
 with delayed period writes fail even with a 32-frame guard. PipeWire's 96-frame
@@ -76,7 +97,8 @@ ASIO begins with the first playback-clock target and publishes playback under
 that exact sequence. The E1x2 profile keeps one safe engine period. The bounded
 ready barrier lets the lower-priority callback run while ALSA drains queued
 audio. The daemon derives each wait budget from current ALSA availability and
-reserves one quarter-period for the hardware write.
+reserves one quarter-period for the hardware write. The linked Q64 cycle keeps
+a minimum `125 us` scheduler handoff before playback retrieval.
 
 The ASIO frontend owns its callback thread and attempts to raise it to the
 profile's `device.pro_realtime_priority`. When omitted, it defaults to two below
