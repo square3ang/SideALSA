@@ -344,6 +344,7 @@ impl DuplexEngine {
             self.period,
             i64::from(self.config.effective_hardware_period_size()),
             self.buffer,
+            self.config.rate,
         );
         let start_samples = usize::try_from(start_frames)
             .ok()
@@ -1274,18 +1275,15 @@ fn linked_phase_prediction(
     )
     .unwrap_or(1);
     let overhead_nanos = overhead_frames.saturating_mul(1_000_000_000) / u64::from(rate);
-    let score_nanos = wait_nanos
-        .max(LINKED_PRO_HANDOFF_NANOS)
-        .saturating_add(overhead_nanos);
-    let handoff_frames = LINKED_PRO_HANDOFF_NANOS
-        .saturating_mul(u64::from(rate))
-        .div_ceil(1_000_000_000);
-    let drained_frames = wait_frames
-        .max(handoff_frames)
-        .saturating_add(overhead_frames);
-    let reserve_frames = queued_frames.saturating_sub(
-        alsa::pcm::Frames::try_from(drained_frames).unwrap_or(alsa::pcm::Frames::MAX),
-    );
+    let score_nanos = wait_nanos.saturating_add(overhead_nanos);
+    let reserve_frames = if wait_nanos < LINKED_PRO_HANDOFF_NANOS {
+        0
+    } else {
+        let drained_frames = wait_frames.saturating_add(overhead_frames);
+        queued_frames.saturating_sub(
+            alsa::pcm::Frames::try_from(drained_frames).unwrap_or(alsa::pcm::Frames::MAX),
+        )
+    };
     (score_nanos, reserve_frames)
 }
 
@@ -1321,7 +1319,6 @@ fn linked_pro_cycle_loop(
             control.done.store(true, Ordering::Release);
             return Ok(());
         }
-
         let read = match read_capture_samples(
             capture_pcm,
             capture_scratch,
@@ -1375,6 +1372,10 @@ fn linked_pro_cycle_loop(
         control
             .timeline
             .record_pro_capture_read(sequence, capture_read_nanos);
+        let pro_handoff_started = Instant::now();
+        let pro_deadline = pro_handoff_started
+            .checked_add(Duration::from_nanos(LINKED_PRO_HANDOFF_NANOS))
+            .unwrap_or(pro_handoff_started);
         if catch_unwind(AssertUnwindSafe(|| {
             capture_sink.process_capture(sequence, capture_scratch);
         }))
@@ -1384,43 +1385,13 @@ fn linked_pro_cycle_loop(
             return Err(EngineError::WorkerPanic);
         }
         control.mark_capture_cycle_ready();
-        let handoff_started = Instant::now();
-
-        let occupancy_budget = match playback_preparation_budget(
-            playback_pcm,
-            config.buffer,
-            config.playback_floor,
-            config.period,
-            config.rate,
-        ) {
-            Ok(budget) => budget,
-            Err(error) if error.is_xrun() => {
-                recover_and_calibrate_linked_streams(
-                    playback_pcm,
-                    capture_pcm,
-                    StreamDirection::Playback,
-                    capture_scratch,
-                    config,
-                    control,
-                )?;
-                sequence = sequence.wrapping_add(1);
-                continue;
-            }
-            Err(error) => {
-                control.done.store(true, Ordering::Release);
-                return Err(error);
-            }
-        };
-        let wait_budget = occupancy_budget.max(Duration::from_nanos(LINKED_PRO_HANDOFF_NANOS));
-        control
-            .timeline
-            .record_pro_wait_budget(duration_nanos(wait_budget));
 
         match wait_for_playback_target(
             playback_pcm,
             config.buffer,
             config.playback_floor,
             config.rate,
+            0,
             control,
         ) {
             Ok(()) => {}
@@ -1441,20 +1412,20 @@ fn linked_pro_cycle_loop(
                 return Err(error);
             }
         }
-        let handoff_remaining = minimum_handoff_remaining(handoff_started.elapsed());
-        if !handoff_remaining.is_zero() {
-            std::thread::sleep(handoff_remaining);
-        }
         if control.stop.load(Ordering::Relaxed) {
             continue;
         }
 
+        let wait_budget = linked_pro_wait_budget(pro_deadline, Instant::now());
+        control
+            .timeline
+            .record_pro_wait_budget(duration_nanos(wait_budget));
         playback_scratch[..config.playback_period_samples].fill(0);
         if catch_unwind(AssertUnwindSafe(|| {
             playback_source.process_playback(
                 sequence,
                 &mut playback_scratch[..config.playback_period_samples],
-                Duration::ZERO,
+                pro_deadline,
             );
         }))
         .is_err()
@@ -1690,12 +1661,15 @@ fn playback_worker_loop(
                 control
                     .timeline
                     .record_pro_wait_budget(duration_nanos(wait_budget));
+                let deadline = Instant::now()
+                    .checked_add(wait_budget)
+                    .unwrap_or_else(Instant::now);
                 scratch[..config.period_samples].fill(0);
                 if catch_unwind(AssertUnwindSafe(|| {
                     source.process_playback(
                         sequence,
                         &mut scratch[..config.period_samples],
-                        wait_budget,
+                        deadline,
                     );
                 }))
                 .is_err()
@@ -1717,6 +1691,7 @@ fn playback_worker_loop(
                 config.buffer,
                 config.guard_frames,
                 config.rate,
+                50_000,
                 control,
             )
         } else {
@@ -2168,6 +2143,7 @@ fn wait_for_playback_target(
     buffer: alsa::pcm::Frames,
     guard_frames: alsa::pcm::Frames,
     rate: u32,
+    prewake_nanos: u64,
     control: WorkerControl<'_>,
 ) -> Result<(), EngineError> {
     let target_avail = buffer - guard_frames;
@@ -2187,7 +2163,7 @@ fn wait_for_playback_target(
             return Ok(());
         }
         let remaining = target_avail - available;
-        let sleep = playback_target_sleep(remaining, rate);
+        let sleep = playback_target_sleep(remaining, rate, prewake_nanos);
         if sleep.is_zero() {
             hint::spin_loop();
         } else {
@@ -2198,10 +2174,6 @@ fn wait_for_playback_target(
 
 fn duration_nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-}
-
-fn minimum_handoff_remaining(elapsed: Duration) -> Duration {
-    Duration::from_nanos(LINKED_PRO_HANDOFF_NANOS).saturating_sub(elapsed)
 }
 
 fn monotonic_nanos() -> u64 {
@@ -2218,12 +2190,14 @@ fn monotonic_nanos() -> u64 {
         .saturating_add(u64::try_from(timestamp.tv_nsec).unwrap_or(0))
 }
 
-fn playback_target_sleep(remaining: alsa::pcm::Frames, rate: u32) -> Duration {
-    const PREWAKE_NANOS: u64 = 50_000;
-
+fn playback_target_sleep(remaining: alsa::pcm::Frames, rate: u32, prewake_nanos: u64) -> Duration {
     let frames = u64::try_from(remaining).unwrap_or(0);
     let nanos = frames.saturating_mul(1_000_000_000) / u64::from(rate);
-    Duration::from_nanos(nanos.saturating_sub(PREWAKE_NANOS))
+    Duration::from_nanos(nanos.saturating_sub(prewake_nanos))
+}
+
+fn linked_pro_wait_budget(deadline: Instant, now: Instant) -> Duration {
+    deadline.saturating_duration_since(now)
 }
 
 fn playback_preparation_budget(
@@ -2259,8 +2233,17 @@ fn linked_start_frames(
     period: alsa::pcm::Frames,
     hardware_period: alsa::pcm::Frames,
     buffer: alsa::pcm::Frames,
+    rate: u32,
 ) -> alsa::pcm::Frames {
-    buffer.min(period.saturating_add(hardware_period))
+    let handoff_frames = LINKED_PRO_HANDOFF_NANOS
+        .saturating_mul(u64::from(rate))
+        .div_ceil(1_000_000_000);
+    let headroom = alsa::pcm::Frames::try_from(handoff_frames).unwrap_or(alsa::pcm::Frames::MAX);
+    buffer.min(
+        period
+            .saturating_add(hardware_period)
+            .saturating_add(headroom),
+    )
 }
 
 fn linked_playback_floor(hardware_period: alsa::pcm::Frames) -> alsa::pcm::Frames {
@@ -2700,15 +2683,15 @@ impl EngineError {
 mod tests {
     use super::{
         WorkerControl, align_sequence_forward, linked_phase_dither_frames, linked_phase_prediction,
-        linked_phase_score, linked_phase_target_nanos, linked_playback_floor, linked_start_frames,
-        minimum_handoff_remaining, playback_startup_priority, playback_target_sleep,
-        preparation_budget_frames, pro_capture_target_ready, pro_target_sequence,
-        take_pro_capture_sequence,
+        linked_phase_score, linked_phase_target_nanos, linked_playback_floor,
+        linked_pro_wait_budget, linked_start_frames, playback_startup_priority,
+        playback_target_sleep, preparation_budget_frames, pro_capture_target_ready,
+        pro_target_sequence, take_pro_capture_sequence,
     };
     use crate::HardwareTimeline;
     use std::{
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     #[test]
@@ -2787,10 +2770,33 @@ mod tests {
     #[test]
     fn playback_target_sleep_leaves_bounded_prewake_margin() {
         assert_eq!(
-            playback_target_sleep(64, 48_000),
+            playback_target_sleep(64, 48_000, 50_000),
             Duration::from_nanos(1_283_333)
         );
-        assert_eq!(playback_target_sleep(2, 48_000), Duration::ZERO);
+        assert_eq!(
+            playback_target_sleep(12, 48_000, 0),
+            Duration::from_micros(250)
+        );
+        assert_eq!(playback_target_sleep(2, 48_000, 50_000), Duration::ZERO);
+    }
+
+    #[test]
+    fn linked_pro_handoff_uses_only_remaining_budget() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_micros(250);
+        assert_eq!(
+            linked_pro_wait_budget(deadline, started),
+            Duration::from_micros(250)
+        );
+        assert_eq!(
+            linked_pro_wait_budget(deadline, started + Duration::from_micros(100)),
+            Duration::from_micros(150)
+        );
+        assert_eq!(linked_pro_wait_budget(deadline, deadline), Duration::ZERO);
+        assert_eq!(
+            linked_pro_wait_budget(deadline, deadline + Duration::from_micros(50)),
+            Duration::ZERO
+        );
     }
 
     #[test]
@@ -2803,31 +2809,15 @@ mod tests {
 
     #[test]
     fn linked_start_primes_one_period_plus_physical_headroom() {
-        assert_eq!(linked_start_frames(64, 32, 192), 96);
-        assert_eq!(linked_start_frames(64, 64, 192), 128);
-        assert_eq!(linked_start_frames(64, 32, 128), 96);
+        assert_eq!(linked_start_frames(64, 32, 192, 48_000), 108);
+        assert_eq!(linked_start_frames(64, 64, 192, 48_000), 140);
+        assert_eq!(linked_start_frames(64, 32, 128, 48_000), 108);
     }
 
     #[test]
     fn linked_playback_keeps_one_physical_period_in_alsa() {
         assert_eq!(linked_playback_floor(32), 32);
         assert_eq!(linked_playback_floor(1), 1);
-    }
-
-    #[test]
-    fn linked_client_gets_a_bounded_scheduler_handoff() {
-        assert_eq!(
-            minimum_handoff_remaining(Duration::from_micros(25)),
-            Duration::from_micros(100)
-        );
-        assert_eq!(
-            minimum_handoff_remaining(Duration::from_micros(125)),
-            Duration::ZERO
-        );
-        assert_eq!(
-            minimum_handoff_remaining(Duration::from_millis(1)),
-            Duration::ZERO
-        );
     }
 
     #[test]
@@ -2842,10 +2832,10 @@ mod tests {
 
     #[test]
     fn linked_phase_predicts_runtime_wait_without_draining_hardware() {
-        assert_eq!(linked_phase_prediction(32, 32, 32, 48_000), (208_333, 22));
+        assert_eq!(linked_phase_prediction(32, 32, 32, 48_000), (83_333, 0));
         assert_eq!(linked_phase_prediction(44, 32, 32, 48_000), (333_333, 28));
         assert_eq!(linked_phase_prediction(45, 32, 32, 48_000), (354_166, 28));
-        assert_eq!(linked_phase_prediction(20, 32, 32, 48_000), (208_333, 10));
+        assert_eq!(linked_phase_prediction(20, 32, 32, 48_000), (83_333, 0));
     }
 
     #[test]

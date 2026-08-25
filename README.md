@@ -135,6 +135,10 @@ period_size: 64
 buffer_size: 192
 ```
 
+The reference profile exposes a separate `shared_buffer_size = 256` to ALSA and
+PipeWire clients. This does not change the physical B192 hardware queue or the
+Q64 PRO block size.
+
 The card number can differ. Find it with:
 
 ```sh
@@ -208,8 +212,8 @@ pw-cat --record \
 ```
 
 PipeWire `ERR=0` is not sufficient proof by itself. Also inspect SideALSA
-`shared_underruns`, because a client can receive silence without a PipeWire
-graph xrun.
+`shared_underruns` and `shared_overruns`, because a client can receive silence
+or lose capture blocks without a PipeWire graph xrun.
 
 ## Build ASIO
 

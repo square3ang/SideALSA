@@ -892,39 +892,36 @@ fn run_worker(stream: &mut AudioStream, input: &WorkerInput) -> Result<(), AsioE
     let mut capture = vec![0_i32; input.capture_samples].into_boxed_slice();
     let mut playback = vec![0_i32; input.playback_samples].into_boxed_slice();
     let audio_fd = stream.notification_fd()?;
-    let result = match stream.start() {
-        Ok(()) => {
-            let realtime = if input.realtime_priority == 0 {
+    let realtime = if input.realtime_priority == 0 {
+        None
+    } else {
+        match RealtimeGuard::enter(input.realtime_priority) {
+            Ok(realtime) => Some(realtime),
+            Err(_) => {
+                stream.record_realtime_failure();
                 None
-            } else {
-                match RealtimeGuard::enter(input.realtime_priority) {
-                    Ok(realtime) => Some(realtime),
-                    Err(_) => {
-                        stream.record_realtime_failure();
-                        None
-                    }
-                }
-            };
-            let result = worker_loop(
-                stream,
-                audio_fd,
-                &input.stop,
-                &input.buffers,
-                &input.active,
-                input.callbacks,
-                input.time_info,
-                input.rate,
-                input.period_frames,
-                &mut capture,
-                &mut playback,
-                &input.sample_position,
-                &input.time_stamp,
-            );
-            drop(realtime);
-            result
+            }
         }
+    };
+    let result = match stream.start() {
+        Ok(()) => worker_loop(
+            stream,
+            audio_fd,
+            &input.stop,
+            &input.buffers,
+            &input.active,
+            input.callbacks,
+            input.time_info,
+            input.rate,
+            input.period_frames,
+            &mut capture,
+            &mut playback,
+            &input.sample_position,
+            &input.time_stamp,
+        ),
         Err(error) => Err(error.into()),
     };
+    drop(realtime);
     let stop_result = stream.stop();
     unsafe {
         libc::close(audio_fd);
@@ -1539,6 +1536,7 @@ mod tests {
             period_size: 64,
             hardware_period_size: 32,
             buffer_size: 192,
+            shared_buffer_size: 256,
             pro_latency_periods: 2,
             pro_realtime_priority: 86,
             shared_latency_periods: 3,

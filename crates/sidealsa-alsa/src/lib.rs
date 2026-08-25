@@ -150,7 +150,12 @@ pub unsafe extern "C" fn sidealsa_stream_open(
             0
         };
         let poll_fd = stream.notification_fd().map_err(client_error_code)?;
-        let buffer_size = plugin_buffer_size(device_info.period_size, device_info.buffer_size);
+        let requested_buffer_size = requested_buffer_size(
+            mode,
+            device_info.buffer_size,
+            device_info.shared_buffer_size,
+        );
+        let buffer_size = plugin_buffer_size(device_info.period_size, requested_buffer_size);
         let buffer_frames = usize::try_from(buffer_size).map_err(|_| libc::EINVAL)?;
         let fifo_len = buffer_frames.checked_mul(channels).ok_or(libc::EINVAL)?;
         let playback_latency_periods = if playback && mode == MODE_SHARED {
@@ -198,10 +203,14 @@ pub unsafe extern "C" fn sidealsa_stream_start(stream: *mut SideAlsaStream) -> c
         let stream = stream.as_mut().ok_or(libc::EINVAL)?;
         stream.stream.start().map_err(client_error_code)?;
         if !stream.running {
-            stream.start_sequence = Some(stream.stream.cycle_sequence());
+            stream.start_sequence = stream.stream.activation_sequence();
             stream.position = 0;
+            if let Err(error) = stream.flush_partial_playback() {
+                let _ = stream.stream.stop();
+                stream.reset_transfer_state();
+                return Err(error);
+            }
             stream.running = true;
-            stream.flush_partial_playback()?;
         }
         Ok(())
     })
@@ -214,8 +223,10 @@ pub unsafe extern "C" fn sidealsa_stream_start(stream: *mut SideAlsaStream) -> c
 pub unsafe extern "C" fn sidealsa_stream_stop(stream: *mut SideAlsaStream) -> c_int {
     ffi_status(|| unsafe {
         let stream = stream.as_mut().ok_or(libc::EINVAL)?;
+        let position = stream.position();
         stream.stream.stop().map_err(client_error_code)?;
         stream.reset_transfer_state();
+        stream.position = position;
         stream.running = false;
         Ok(())
     })
@@ -279,7 +290,13 @@ pub unsafe extern "C" fn sidealsa_stream_close(stream: *mut SideAlsaStream) -> c
 
 impl SideAlsaStream {
     fn position(&self) -> u64 {
-        if let Some(origin) = self.start_sequence {
+        if !self.running {
+            return self.position;
+        }
+        if let Some(origin) = self
+            .start_sequence
+            .or_else(|| self.stream.activation_sequence())
+        {
             self.stream
                 .cycle_sequence()
                 .saturating_sub(origin)
@@ -532,7 +549,7 @@ impl SideAlsaStream {
             match self.stream.wait_period(wait_timeout(self.nonblock)) {
                 Ok(sequence) => {
                     if self.start_sequence.is_none() {
-                        self.start_sequence = Some(sequence);
+                        self.start_sequence = self.stream.activation_sequence();
                     }
                     let sequence = if self.playback && self.pro {
                         self.stream
@@ -552,7 +569,10 @@ impl SideAlsaStream {
     }
 
     fn update_position(&mut self, sequence: u64) -> Result<(), c_int> {
-        let origin = self.start_sequence.unwrap_or(sequence);
+        let origin = self
+            .start_sequence
+            .or_else(|| self.stream.activation_sequence())
+            .ok_or(libc::EIO)?;
         self.position = sequence
             .saturating_sub(origin)
             .checked_mul(self.period_frames as u64)
@@ -627,6 +647,14 @@ fn copy_into_fifo(
 fn plugin_buffer_size(period_size: u32, buffer_size: u32) -> u32 {
     let periods = buffer_size.div_ceil(period_size).max(2);
     period_size.saturating_mul(periods)
+}
+
+fn requested_buffer_size(mode: c_int, hardware: u32, shared: u32) -> u32 {
+    if mode == MODE_SHARED {
+        shared
+    } else {
+        hardware
+    }
 }
 
 unsafe fn copy_from_area(
@@ -712,7 +740,9 @@ fn client_error_code(error: ClientError) -> c_int {
             sidealsa_protocol::ErrorCode::Internal => libc::EIO,
         },
         ClientError::InvalidDescriptorCount(_) => libc::EPROTO,
-        ClientError::Closed | ClientError::NotStarted => libc::EPIPE,
+        ClientError::Closed | ClientError::NotStarted | ClientError::CaptureDiscontinuity => {
+            libc::EPIPE
+        }
         ClientError::MissingDirection(_) | ClientError::BufferNotReady => libc::EINVAL,
         ClientError::Timeout => libc::EAGAIN,
     }
@@ -744,6 +774,8 @@ mod tests {
         assert_eq!(plugin_buffer_size(64, 64), 128);
         assert_eq!(plugin_buffer_size(64, 160), 192);
         assert_eq!(plugin_buffer_size(64, 256), 256);
+        assert_eq!(requested_buffer_size(MODE_PRO, 192, 256), 192);
+        assert_eq!(requested_buffer_size(MODE_SHARED, 192, 256), 256);
     }
 
     #[test]

@@ -5,9 +5,10 @@ use thiserror::Error;
 
 pub const MAX_PRO_LATENCY_PERIODS: u32 = 7;
 pub const MAX_SHARED_LATENCY_PERIODS: u32 = 7;
+pub const MAX_SHARED_BUFFER_PERIODS: u32 = 8;
 pub const MAX_REALTIME_PRIORITY: u32 = 99;
 pub const MAX_LINKED_PHASE_ATTEMPTS: u32 = 64;
-pub const LINKED_PRO_HANDOFF_NANOS: u64 = 125_000;
+pub const LINKED_PRO_HANDOFF_NANOS: u64 = 250_000;
 pub const LINKED_PHASE_OVERHEAD_DIVISOR: u32 = 8;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -27,6 +28,8 @@ pub struct HardwareConfig {
     #[serde(default)]
     pub hardware_period_size: Option<u32>,
     pub buffer_size: u32,
+    #[serde(default)]
+    pub shared_buffer_size: Option<u32>,
     #[serde(default)]
     pub playback_queue_periods: Option<u32>,
     #[serde(default)]
@@ -154,6 +157,23 @@ impl HardwareConfig {
                 "buffer_size must not be smaller than period_size".into(),
             ));
         }
+        if let Some(shared_buffer_size) = self.shared_buffer_size {
+            if shared_buffer_size < self.period_size.saturating_mul(2) {
+                return Err(ProfileError::Invalid(
+                    "shared_buffer_size must contain at least two periods".into(),
+                ));
+            }
+            if !shared_buffer_size.is_multiple_of(self.period_size) {
+                return Err(ProfileError::Invalid(
+                    "shared_buffer_size must be a multiple of period_size".into(),
+                ));
+            }
+            if shared_buffer_size > self.period_size.saturating_mul(MAX_SHARED_BUFFER_PERIODS) {
+                return Err(ProfileError::Invalid(format!(
+                    "shared_buffer_size must contain at most {MAX_SHARED_BUFFER_PERIODS} periods"
+                )));
+            }
+        }
         if let Some(periods) = self.playback_queue_periods {
             if periods == 0 {
                 return Err(ProfileError::Invalid(
@@ -189,6 +209,17 @@ impl HardwareConfig {
                 return Err(ProfileError::Invalid(
                     "pro_latency_periods = 0 requires at least two logical periods".into(),
                 ));
+            }
+            let handoff_frames = LINKED_PRO_HANDOFF_NANOS
+                .saturating_mul(u64::from(self.rate))
+                .div_ceil(1_000_000_000);
+            let required_buffer = u64::from(self.period_size)
+                .saturating_add(u64::from(hardware_period_size))
+                .saturating_add(handoff_frames);
+            if u64::from(self.buffer_size) < required_buffer {
+                return Err(ProfileError::Invalid(format!(
+                    "pro_latency_periods = 0 requires buffer_size >= {required_buffer} for linked handoff"
+                )));
             }
         }
         if self.linked_phase_max_attempts > MAX_LINKED_PHASE_ATTEMPTS {
@@ -258,6 +289,16 @@ impl HardwareConfig {
 
     pub fn effective_hardware_period_size(&self) -> u32 {
         self.hardware_period_size.unwrap_or(self.period_size)
+    }
+
+    pub fn effective_shared_buffer_size(&self) -> u32 {
+        self.shared_buffer_size.unwrap_or_else(|| {
+            self.period_size.saturating_mul(
+                self.buffer_size
+                    .div_ceil(self.period_size)
+                    .clamp(2, MAX_SHARED_BUFFER_PERIODS),
+            )
+        })
     }
 }
 
@@ -413,6 +454,8 @@ mod tests {
         assert_eq!(profile.device.name, "Test interface");
         assert_eq!(profile.device.hardware_period_size, None);
         assert_eq!(profile.device.effective_hardware_period_size(), 32);
+        assert_eq!(profile.device.shared_buffer_size, None);
+        assert_eq!(profile.device.effective_shared_buffer_size(), 64);
         assert_eq!(profile.device.pro_latency_periods, 1);
         assert_eq!(profile.device.pro_realtime_priority, Some(15));
         assert_eq!(profile.device.effective_pro_realtime_priority(), 15);
@@ -440,6 +483,7 @@ mod tests {
     fn parses_linked_phase_attempts() {
         let text = PROFILE
             .replace("pro_latency_periods = 1", "pro_latency_periods = 0")
+            .replace("buffer_size = 64", "buffer_size = 96")
             .replace(
                 "duplex_link = true",
                 "duplex_link = true\n        linked_phase_max_attempts = 32",
@@ -464,6 +508,7 @@ mod tests {
     fn rejects_too_many_linked_phase_attempts() {
         let text = PROFILE
             .replace("pro_latency_periods = 1", "pro_latency_periods = 0")
+            .replace("buffer_size = 64", "buffer_size = 96")
             .replace(
                 "duplex_link = true",
                 "duplex_link = true\n        linked_phase_max_attempts = 65",
@@ -507,6 +552,50 @@ mod tests {
     }
 
     #[test]
+    fn parses_independent_shared_buffer() {
+        let text = PROFILE.replace(
+            "buffer_size = 64",
+            "buffer_size = 64\n        shared_buffer_size = 256",
+        );
+        let profile = Profile::from_toml(&text).expect("profile should parse");
+
+        assert_eq!(profile.device.effective_shared_buffer_size(), 256);
+    }
+
+    #[test]
+    fn rejects_shared_buffer_shorter_than_two_periods() {
+        let text = PROFILE.replace(
+            "buffer_size = 64",
+            "buffer_size = 64\n        shared_buffer_size = 32",
+        );
+
+        let error = Profile::from_toml(&text).expect_err("profile should fail");
+        assert!(error.to_string().contains("at least two periods"));
+    }
+
+    #[test]
+    fn rejects_unaligned_shared_buffer() {
+        let text = PROFILE.replace(
+            "buffer_size = 64",
+            "buffer_size = 64\n        shared_buffer_size = 200",
+        );
+
+        let error = Profile::from_toml(&text).expect_err("profile should fail");
+        assert!(error.to_string().contains("multiple of period_size"));
+    }
+
+    #[test]
+    fn rejects_shared_buffer_larger_than_slot_ring() {
+        let text = PROFILE.replace(
+            "buffer_size = 64",
+            "buffer_size = 64\n        shared_buffer_size = 288",
+        );
+
+        let error = Profile::from_toml(&text).expect_err("profile should fail");
+        assert!(error.to_string().contains("at most 8 periods"));
+    }
+
+    #[test]
     fn rejects_hardware_period_that_does_not_divide_client_period() {
         let text = PROFILE.replace(
             "period_size = 32",
@@ -523,10 +612,20 @@ mod tests {
 
     #[test]
     fn accepts_zero_pro_latency() {
-        let text = PROFILE.replace("pro_latency_periods = 1", "pro_latency_periods = 0");
+        let text = PROFILE
+            .replace("pro_latency_periods = 1", "pro_latency_periods = 0")
+            .replace("buffer_size = 64", "buffer_size = 96");
         let profile = Profile::from_toml(&text).expect("zero lead should parse");
 
         assert_eq!(profile.device.pro_latency_periods, 0);
+    }
+
+    #[test]
+    fn rejects_zero_pro_latency_without_handoff_buffer() {
+        let text = PROFILE.replace("pro_latency_periods = 1", "pro_latency_periods = 0");
+
+        let error = Profile::from_toml(&text).expect_err("profile should fail");
+        assert!(error.to_string().contains("requires buffer_size >= 76"));
     }
 
     #[test]

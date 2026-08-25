@@ -4,6 +4,7 @@ rate = 48000
 period_size = 64
 hardware_period_size = 32
 buffer_size = 192
+shared_buffer_size = 256
 playback_timer_scheduling = true
 duplex_link = true
 pro_latency_periods = 0

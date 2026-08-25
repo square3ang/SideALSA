@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo:rerun-if-changed=src/plugin.c");
     cc::Build::new()
         .file("src/plugin.c")
         .define("PIC", None)

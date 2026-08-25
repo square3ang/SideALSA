@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::Instant;
 
 pub trait ProCaptureSink: Send {
     /// Publishes one capture block without allocation, locking, or waiting for client work.
@@ -6,6 +6,6 @@ pub trait ProCaptureSink: Send {
 }
 
 pub trait ProPlaybackSource: Send {
-    /// Tries to obtain one playback block without allocation or locking and returns within `wait_budget`.
-    fn process_playback(&mut self, sequence: u64, playback: &mut [i32], wait_budget: Duration);
+    /// Tries an already-ready block, otherwise waits without allocation or locking until `deadline`.
+    fn process_playback(&mut self, sequence: u64, playback: &mut [i32], deadline: Instant);
 }

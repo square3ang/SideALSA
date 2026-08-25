@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# don't execute this file as sudo.
+
 set -Eeuo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -228,7 +231,7 @@ SUDO_READY=0
 run_privileged() {
     if ((USE_SUDO == 1)); then
         if ((SUDO_READY == 0)); then
-            sudo -v
+            sudo -n true 2>/dev/null || sudo -v
             SUDO_READY=1
         fi
         sudo "$@"

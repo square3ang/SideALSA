@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# don't execute this file as sudo.
+
+
 set -Eeuo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"

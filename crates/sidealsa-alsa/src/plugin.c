@@ -32,6 +32,7 @@ typedef struct {
 	unsigned int channels;
 	snd_pcm_uframes_t period_size;
 	snd_pcm_uframes_t buffer_size;
+	snd_pcm_uframes_t boundary;
 } sidealsa_pcm_t;
 
 static int sidealsa_start(snd_pcm_ioplug_t *io)
@@ -58,16 +59,30 @@ static snd_pcm_sframes_t sidealsa_transfer(snd_pcm_ioplug_t *io,
 						   snd_pcm_uframes_t size)
 {
 	sidealsa_pcm_t *pcm = io->private_data;
-	return sidealsa_stream_transfer(pcm->stream, areas, offset, size);
+	snd_pcm_sframes_t result = sidealsa_stream_transfer(pcm->stream, areas, offset, size);
+	if (result == -EPIPE)
+		snd_pcm_ioplug_set_state(io, SND_PCM_STATE_XRUN);
+	return result;
 }
 
 static snd_pcm_sframes_t sidealsa_pointer(snd_pcm_ioplug_t *io)
 {
 	sidealsa_pcm_t *pcm = io->private_data;
 	uint64_t position = sidealsa_stream_position(pcm->stream);
-	if (io->buffer_size == 0)
+	snd_pcm_uframes_t boundary = pcm->boundary ? pcm->boundary : io->buffer_size;
+	if (!boundary)
 		return 0;
-	return position % io->buffer_size;
+	snd_pcm_uframes_t hw_ptr = position % boundary;
+	if (io->state == SND_PCM_STATE_RUNNING &&
+	    snd_pcm_ioplug_avail(io, hw_ptr, io->appl_ptr) > io->buffer_size)
+		return -EPIPE;
+	return (snd_pcm_sframes_t)hw_ptr;
+}
+
+static int sidealsa_sw_params(snd_pcm_ioplug_t *io, snd_pcm_sw_params_t *params)
+{
+	sidealsa_pcm_t *pcm = io->private_data;
+	return snd_pcm_sw_params_get_boundary(params, &pcm->boundary);
 }
 
 static int sidealsa_poll_revents(snd_pcm_ioplug_t *io, struct pollfd *pfds,
@@ -152,6 +167,7 @@ static const snd_pcm_ioplug_callback_t sidealsa_callback = {
 	.transfer = sidealsa_transfer,
 	.close = sidealsa_close,
 	.hw_params = sidealsa_hw_params,
+	.sw_params = sidealsa_sw_params,
 	.prepare = sidealsa_prepare,
 	.poll_revents = sidealsa_poll_revents,
 };
@@ -231,7 +247,8 @@ int sidealsa_plugin_open(snd_pcm_t **pcmp, const char *name,
 
 	pcm->io.version = SND_PCM_IOPLUG_VERSION;
 	pcm->io.name = "SideALSA PCM";
-	pcm->io.flags = SND_PCM_IOPLUG_FLAG_MONOTONIC;
+	pcm->io.flags = SND_PCM_IOPLUG_FLAG_MONOTONIC |
+			SND_PCM_IOPLUG_FLAG_BOUNDARY_WA;
 	pcm->io.poll_fd = pcm->poll_fd;
 	pcm->io.poll_events = POLLIN;
 	pcm->io.mmap_rw = 0;

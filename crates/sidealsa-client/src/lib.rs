@@ -43,6 +43,8 @@ pub enum ClientError {
     MissingDirection(&'static str),
     #[error("audio buffer is not ready")]
     BufferNotReady,
+    #[error("shared capture stream lost buffered periods")]
+    CaptureDiscontinuity,
     #[error("timed out waiting for audio period")]
     Timeout,
 }
@@ -153,6 +155,7 @@ pub struct AudioStream {
     playback_index: usize,
     last_sequence: Option<u64>,
     lifecycle_generation: u64,
+    capture_discontinuities: u64,
     started: bool,
     closed: bool,
 }
@@ -180,6 +183,7 @@ impl AudioStream {
             }
         };
         let lifecycle_generation = region.lifecycle_generation();
+        let capture_discontinuities = region.capture_discontinuities();
         Ok(Self {
             control,
             session_id,
@@ -193,6 +197,7 @@ impl AudioStream {
             playback_index: 0,
             last_sequence: None,
             lifecycle_generation,
+            capture_discontinuities,
             started: false,
             closed: false,
         })
@@ -214,6 +219,12 @@ impl AudioStream {
         self.region.playback_sequence()
     }
 
+    pub fn activation_sequence(&self) -> Option<u64> {
+        self.region
+            .activation_ready()
+            .then(|| self.region.start_sequence())
+    }
+
     pub fn record_realtime_failure(&self) {
         self.region.record_client_realtime_failure();
     }
@@ -233,6 +244,7 @@ impl AudioStream {
         self.playback_index = 0;
         self.last_sequence = None;
         self.lifecycle_generation = self.region.lifecycle_generation();
+        self.capture_discontinuities = self.region.capture_discontinuities();
         self.capture_event.drain();
         self.playback_event.drain();
         self.playback_ready_event.drain();
@@ -268,6 +280,7 @@ impl AudioStream {
                 self.capture_index = 0;
                 self.playback_index = 0;
                 self.last_sequence = None;
+                self.capture_discontinuities = self.region.capture_discontinuities();
                 self.capture_event.drain();
                 self.playback_event.drain();
                 self.playback_ready_event.drain();
@@ -286,6 +299,7 @@ impl AudioStream {
         self.capture_index = 0;
         self.playback_index = 0;
         self.last_sequence = None;
+        self.capture_discontinuities = self.region.capture_discontinuities();
         self.capture_event.drain();
         self.playback_event.drain();
         self.playback_ready_event.drain();
@@ -345,6 +359,7 @@ impl AudioStream {
             .unwrap_or_else(Instant::now);
         loop {
             self.refresh_generation();
+            self.check_capture_discontinuity()?;
             if self.info.capture_channels > 0 {
                 let ready_sequence = match self.mode {
                     StreamMode::Pro => self
@@ -357,6 +372,10 @@ impl AudioStream {
                 if let Some(sequence) = ready_sequence
                     && self.last_sequence != Some(sequence)
                 {
+                    self.capture_event.drain();
+                    if self.region.has_multiple_ready_capture_slots() {
+                        self.capture_event.notify()?;
+                    }
                     self.last_sequence = Some(sequence);
                     return Ok(sequence);
                 }
@@ -367,6 +386,7 @@ impl AudioStream {
                 return Err(ClientError::MissingDirection("audio"));
             }
             self.refresh_generation();
+            self.check_capture_discontinuity()?;
             if self.info.capture_channels > 0 {
                 continue;
             }
@@ -381,6 +401,8 @@ impl AudioStream {
 
     pub fn capture_buffer(&mut self, samples: &mut [i32]) -> Result<Option<u64>, ClientError> {
         self.ensure_started()?;
+        self.refresh_generation();
+        self.check_capture_discontinuity()?;
         if self.info.capture_channels == 0 {
             return Err(ClientError::MissingDirection("capture"));
         }
@@ -476,13 +498,27 @@ impl AudioStream {
             self.last_sequence = None;
         }
     }
+
+    fn check_capture_discontinuity(&mut self) -> Result<(), ClientError> {
+        if self.info.capture_channels == 0 {
+            return Ok(());
+        }
+        let current = self.region.capture_discontinuities();
+        if current == self.capture_discontinuities {
+            return Ok(());
+        }
+        self.capture_discontinuities = current;
+        self.capture_index = 0;
+        self.last_sequence = None;
+        self.capture_event.drain();
+        Err(ClientError::CaptureDiscontinuity)
+    }
 }
 
 impl Drop for AudioStream {
     fn drop(&mut self) {
         if !self.closed {
             self.region.set_client_state(SHARED_CLIENT_IDLE);
-            self.region.reset_slots();
             let _ = write_request(
                 &mut self.control,
                 &Request::Close {
@@ -704,6 +740,7 @@ mod tests {
             period_size: 32,
             hardware_period_size: 16,
             buffer_size: 64,
+            shared_buffer_size: 256,
             pro_latency_periods: 1,
             pro_realtime_priority: 15,
             shared_latency_periods: 3,
@@ -914,6 +951,173 @@ mod tests {
         assert_eq!(server_region.client_expired_capture_blocks(), 4);
         assert_eq!(server_region.oldest_valid_client_capture_sequence(25), None);
         stream.closed = true;
+    }
+
+    #[test]
+    fn ready_capture_fast_path_drains_notification() {
+        let server_region = SharedRegion::create(1, 0, 1).expect("region should create");
+        let client_fd = unsafe { libc::dup(server_region.fd()) };
+        assert!(client_fd >= 0);
+        let capture_fd = event_fd();
+        let observed_capture_fd = unsafe { libc::dup(capture_fd) };
+        assert!(observed_capture_fd >= 0);
+        let (peer, control) = UnixStream::pair().expect("socket pair should create");
+        drop(peer);
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Shared(PortDirection::Capture),
+            server_region.info(),
+            vec![client_fd, capture_fd, event_fd(), event_fd()],
+        )
+        .expect("stream should create");
+        stream.started = true;
+        let mut producer_index = 0;
+        assert!(server_region.try_publish_capture(&mut producer_index, 7, &[7]));
+        signal_event(observed_capture_fd);
+
+        assert_eq!(
+            stream
+                .wait_period(Duration::ZERO)
+                .expect("ready capture should return"),
+            7
+        );
+        let mut value = 0_u64;
+        assert_eq!(
+            unsafe {
+                libc::read(
+                    observed_capture_fd,
+                    (&mut value as *mut u64).cast(),
+                    size_of::<u64>(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::EAGAIN)
+        );
+
+        unsafe { libc::close(observed_capture_fd) };
+        stream.closed = true;
+    }
+
+    #[test]
+    fn ready_capture_fast_path_rearms_when_another_slot_is_ready() {
+        let server_region = SharedRegion::create(1, 0, 1).expect("region should create");
+        let client_fd = unsafe { libc::dup(server_region.fd()) };
+        assert!(client_fd >= 0);
+        let capture_fd = event_fd();
+        let observed_capture_fd = unsafe { libc::dup(capture_fd) };
+        assert!(observed_capture_fd >= 0);
+        let (peer, control) = UnixStream::pair().expect("socket pair should create");
+        drop(peer);
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Shared(PortDirection::Capture),
+            server_region.info(),
+            vec![client_fd, capture_fd, event_fd(), event_fd()],
+        )
+        .expect("stream should create");
+        stream.started = true;
+        let mut producer_index = 0;
+        assert!(server_region.try_publish_capture(&mut producer_index, 7, &[7]));
+        assert!(server_region.try_publish_capture(&mut producer_index, 8, &[8]));
+        signal_event(observed_capture_fd);
+        signal_event(observed_capture_fd);
+
+        assert_eq!(
+            stream
+                .wait_period(Duration::ZERO)
+                .expect("first capture should return"),
+            7
+        );
+        let mut descriptor = libc::pollfd {
+            fd: observed_capture_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 1);
+        assert_ne!(descriptor.revents & libc::POLLIN, 0);
+
+        let mut samples = [0];
+        assert_eq!(
+            stream
+                .capture_buffer(&mut samples)
+                .expect("capture should read"),
+            Some(7)
+        );
+        assert_eq!(
+            stream
+                .wait_period(Duration::ZERO)
+                .expect("second capture should return"),
+            8
+        );
+
+        unsafe { libc::close(observed_capture_fd) };
+        stream.closed = true;
+    }
+
+    #[test]
+    fn shared_capture_discontinuity_requests_pcm_recovery() {
+        let server_region = SharedRegion::create(1, 0, 1).expect("region should create");
+        let client_fd = unsafe { libc::dup(server_region.fd()) };
+        assert!(client_fd >= 0);
+        let (peer, control) = UnixStream::pair().expect("socket pair should create");
+        drop(peer);
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Shared(PortDirection::Capture),
+            server_region.info(),
+            vec![client_fd, event_fd(), event_fd(), event_fd()],
+        )
+        .expect("stream should create");
+        stream.started = true;
+        server_region.record_capture_discontinuity();
+
+        assert!(matches!(
+            stream.wait_period(Duration::ZERO),
+            Err(ClientError::CaptureDiscontinuity)
+        ));
+        stream.closed = true;
+    }
+
+    #[test]
+    fn shared_capture_detects_loss_while_start_waits_for_ack() {
+        let server_region = SharedRegion::create(1, 0, 1).expect("region should create");
+        let client_fd = unsafe { libc::dup(server_region.fd()) };
+        assert!(client_fd >= 0);
+        let info = server_region.info();
+        let (mut peer, control) = UnixStream::pair().expect("socket pair should create");
+        let server = thread::spawn(move || {
+            assert_eq!(
+                sidealsa_protocol::read_request(&mut peer).expect("start should arrive"),
+                Request::Start { session_id: 9 }
+            );
+            server_region.set_lifecycle_generation(1);
+            server_region.record_capture_discontinuity();
+            sidealsa_protocol::write_response(&mut peer, &Response::Ack)
+                .expect("start ack should write");
+        });
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Shared(PortDirection::Capture),
+            info,
+            vec![client_fd, event_fd(), event_fd(), event_fd()],
+        )
+        .expect("stream should create");
+
+        stream.start().expect("stream should start");
+        assert!(matches!(
+            stream.wait_period(Duration::ZERO),
+            Err(ClientError::CaptureDiscontinuity)
+        ));
+
+        stream.closed = true;
+        server.join().expect("server should not panic");
     }
 
     fn event_fd() -> RawFd {
