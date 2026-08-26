@@ -1,12 +1,14 @@
 use std::{
     io::{self, Write},
     os::fd::{AsRawFd, RawFd},
+    os::linux::fs::MetadataExt,
+    os::unix::fs::FileTypeExt,
     os::unix::net::{UnixListener, UnixStream},
     path::Path,
     ptr,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
@@ -18,7 +20,18 @@ use sidealsa_protocol::{
 };
 use thiserror::Error;
 
-use crate::DaemonState;
+use crate::{DaemonState, OpenSharedError};
+
+const MAX_CONTROL_CLIENTS: usize = 64;
+const CONTROL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct ActiveClient(Arc<AtomicUsize>);
+
+impl Drop for ActiveClient {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ControlError {
@@ -33,17 +46,34 @@ pub fn run_control_listener(
     state: Arc<DaemonState>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), ControlError> {
-    if path.exists() {
-        std::fs::remove_file(path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    remove_stale_socket(path)?;
     let listener = UnixListener::bind(path)?;
+    let listener_metadata = std::fs::metadata(path)?;
     listener.set_nonblocking(true)?;
+    let active_clients = Arc::new(AtomicUsize::new(0));
 
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
+                if active_clients.fetch_add(1, Ordering::AcqRel) >= MAX_CONTROL_CLIENTS {
+                    active_clients.fetch_sub(1, Ordering::AcqRel);
+                    continue;
+                }
                 let state = Arc::clone(&state);
-                thread::spawn(move || handle_client(stream, state));
+                let client_count = Arc::clone(&active_clients);
+                if thread::Builder::new()
+                    .name("sidealsa-control".into())
+                    .spawn(move || {
+                        let _active = ActiveClient(client_count);
+                        handle_client(stream, state);
+                    })
+                    .is_err()
+                {
+                    active_clients.fetch_sub(1, Ordering::AcqRel);
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
@@ -52,11 +82,54 @@ pub fn run_control_listener(
         }
     }
 
-    let _ = std::fs::remove_file(path);
+    if std::fs::metadata(path).is_ok_and(|metadata| {
+        metadata.st_dev() == listener_metadata.st_dev()
+            && metadata.st_ino() == listener_metadata.st_ino()
+    }) {
+        let _ = std::fs::remove_file(path);
+    }
     Ok(())
 }
 
+fn remove_stale_socket(path: &Path) -> Result<(), io::Error> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "control path exists and is not a Unix socket",
+        ));
+    }
+    match UnixStream::connect(path) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "another daemon is listening on the control socket",
+        )),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
+            std::fs::remove_file(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
+    if stream
+        .set_read_timeout(Some(CONTROL_HANDSHAKE_TIMEOUT))
+        .is_err()
+        || stream
+            .set_write_timeout(Some(CONTROL_HANDSHAKE_TIMEOUT))
+            .is_err()
+    {
+        return;
+    }
     let mut hello = false;
     let mut session = None;
 
@@ -102,6 +175,9 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
                     )
                 } else {
                     hello = true;
+                    if stream.set_read_timeout(None).is_err() {
+                        break;
+                    }
                     (
                         Response::Hello {
                             version: PROTOCOL_VERSION,
@@ -121,34 +197,63 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
                         },
                         Vec::new(),
                     )
-                } else if let Some((session_id, shared, fds)) = state.open_pro() {
-                    session = Some(session_id);
-                    (Response::OpenPro { session_id, shared }, fds.to_vec())
                 } else {
-                    (Response::Busy, Vec::new())
+                    match state.open_pro() {
+                        Ok(Some((session_id, shared, fds))) => {
+                            session = Some(session_id);
+                            (Response::OpenPro { session_id, shared }, fds.to_vec())
+                        }
+                        Ok(None) => (Response::Busy, Vec::new()),
+                        Err(error) => (
+                            Response::Error {
+                                code: ErrorCode::Internal,
+                                message: error.to_string(),
+                            },
+                            Vec::new(),
+                        ),
+                    }
                 }
             }
-            Request::OpenShared { port_id } => match state.open_shared(&port_id) {
-                Ok(Some(open)) => {
-                    session = Some(open.session_id);
+            Request::OpenShared { port_id } => {
+                if session.is_some() {
                     (
-                        Response::OpenShared {
-                            session_id: open.session_id,
-                            direction: open.direction,
-                            shared: open.shared,
+                        Response::Error {
+                            code: ErrorCode::BadState,
+                            message: "client already owns a session".into(),
                         },
-                        open.fds.to_vec(),
+                        Vec::new(),
                     )
+                } else {
+                    match state.open_shared(&port_id) {
+                        Ok(Some(open)) => {
+                            session = Some(open.session_id);
+                            (
+                                Response::OpenShared {
+                                    session_id: open.session_id,
+                                    direction: open.direction,
+                                    shared: open.shared,
+                                },
+                                open.fds.to_vec(),
+                            )
+                        }
+                        Ok(None) => (Response::Busy, Vec::new()),
+                        Err(error @ OpenSharedError::UnknownPort(_)) => (
+                            Response::Error {
+                                code: ErrorCode::InvalidRequest,
+                                message: error.to_string(),
+                            },
+                            Vec::new(),
+                        ),
+                        Err(error @ OpenSharedError::Resources(_)) => (
+                            Response::Error {
+                                code: ErrorCode::Internal,
+                                message: error.to_string(),
+                            },
+                            Vec::new(),
+                        ),
+                    }
                 }
-                Ok(None) => (Response::Busy, Vec::new()),
-                Err(error) => (
-                    Response::Error {
-                        code: ErrorCode::InvalidRequest,
-                        message: error.to_string(),
-                    },
-                    Vec::new(),
-                ),
-            },
+            }
             Request::Start { session_id } => {
                 if session == Some(session_id) && state.start(session_id) {
                     (Response::Ack, Vec::new())
@@ -359,7 +464,36 @@ mod tests {
     }
 
     #[test]
-    fn control_enforces_exclusive_pro_owner() {
+    fn stale_socket_cleanup_preserves_non_socket_paths() {
+        let path = unique_socket_path();
+        fs::write(&path, b"not a socket").expect("test file should create");
+        let error = remove_stale_socket(&path).expect_err("regular file must be preserved");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(&path).expect("test file should remain"),
+            b"not a socket"
+        );
+        fs::remove_file(&path).expect("test file should remove");
+
+        let listener = UnixListener::bind(&path).expect("test socket should bind");
+        drop(listener);
+        remove_stale_socket(&path).expect("stale socket should remove");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn stale_socket_cleanup_preserves_live_listener() {
+        let path = unique_socket_path();
+        let listener = UnixListener::bind(&path).expect("test socket should bind");
+        let error = remove_stale_socket(&path).expect_err("live listener must be preserved");
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(path.exists());
+        drop(listener);
+        fs::remove_file(path).expect("test socket should remove");
+    }
+
+    #[test]
+    fn control_rejects_a_second_session_and_releases_pro_on_disconnect() {
         let profile = Profile::from_toml(PROFILE).expect("profile should parse");
         let state = Arc::new(
             DaemonState::new(&profile, Arc::new(HardwareTimeline::default()))
@@ -394,6 +528,18 @@ mod tests {
             Response::OpenPro { session_id, .. } => session_id,
             response => panic!("unexpected response: {response:?}"),
         };
+        assert!(matches!(
+            request(
+                &mut first,
+                Request::OpenShared {
+                    port_id: "line1".into()
+                }
+            ),
+            Response::Error {
+                code: ErrorCode::BadState,
+                ..
+            }
+        ));
 
         let mut second = connect(&path);
         assert!(matches!(
@@ -459,19 +605,14 @@ mod tests {
         ));
         drop(shared);
 
-        assert!(matches!(
-            request(&mut first, Request::Start { session_id }),
-            Response::Ack
-        ));
-        assert!(matches!(
-            request(&mut first, Request::Stop { session_id }),
-            Response::Ack
-        ));
-        assert!(matches!(
-            request(&mut first, Request::Close { session_id }),
-            Response::Ack
-        ));
         drop(first);
+        for _ in 0..100 {
+            if !state.owns(session_id) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!state.owns(session_id), "disconnect should release PRO");
 
         let mut third = connect(&path);
         assert!(matches!(

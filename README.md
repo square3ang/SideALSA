@@ -11,8 +11,10 @@ miss becomes silence and a diagnostic counter, not an ALSA restart.
 
 Initial reference device: **Topping E1x2 OTG**.
 
-Current profile: `48 kHz`, `S32_LE`, `64`-frame periods, `192`-frame hardware
-buffer, 8 playback channels, 10 capture channels.
+Current profile: `48 kHz`, `S32_LE`, `64`-frame client periods, `32`-frame
+physical periods, `192`-frame hardware buffer, 8 playback channels, and 10
+capture channels. The linked zero-lead PRO path reports 64 input frames and 64
+output frames.
 
 ## Status
 
@@ -94,11 +96,14 @@ Install daemon, ALSA plugin, initial profile, ALSA definitions, PipeWire adapter
 systemd service:
 
 ```sh
-sudo ./scripts/install.sh --no-build
+./scripts/install.sh --no-build
 ```
 
 The installer creates the selected profile only when it does not exist. Later
 installs preserve `/etc/sidealsa/profiles/*.toml`, including with `--force`.
+After reviewing local changes, use `--replace-profile` to adopt a new reference
+profile. The current Q64/Q32 pipeline requires
+`linked_playback_guard_frames = 32` and `pro_latency_periods = 0`.
 
 Installer defaults:
 
@@ -131,13 +136,14 @@ Expected physical playback parameters:
 format: S32_LE
 channels: 8
 rate: 48000
-period_size: 64
+period_size: 32
 buffer_size: 192
 ```
 
-The reference profile exposes a separate `shared_buffer_size = 256` to ALSA and
-PipeWire clients. This does not change the physical B192 hardware queue or the
-Q64 PRO block size.
+The reference profile exposes a separate `shared_buffer_size = 512` to ALSA and
+PipeWire clients. Playback advertises a four-period minimum, so PipeWire
+negotiates Q64/B256 while the shared-memory ring retains eight periods. Neither
+value changes the physical B192 queue or Q64 PRO block size.
 
 The card number can differ. Find it with:
 
@@ -173,8 +179,10 @@ target/release/sidealsa-stats --samples 100 --interval-ms 100
 ```
 
 Expected hardware counters stay at zero. Shared startup is armed by its first
-consumed block, so startup silence does not count as an underrun. Genuine
-missing blocks after arming increment `shared_underruns`.
+consumed block, so startup silence does not count as an underrun. The first
+missing block after arming increments `shared_underruns` and disarms that
+episode; the next valid block rearms it. A paused client therefore does not add
+one underrun per hardware period.
 
 ### osu! Exclusive ALSA
 
@@ -225,7 +233,8 @@ Build 64-bit Wine ASIO artifacts:
 cmake -S crates/sidealsa-asio \
   -B build-asio \
   -DCMAKE_BUILD_TYPE=Release
-cmake --build build-asio --target sidealsa-asio sidealsa-asio-probe
+cmake --build build-asio --target \
+  sidealsa-asio sidealsa-asio-probe sidealsa-asio-loopback-test
 ```
 
 Artifacts:
@@ -234,13 +243,15 @@ Artifacts:
 build-asio/sidealsa-asio64.dll
 build-asio/sidealsa-asio64.dll.so
 build-asio/sidealsa-asio-probe.exe
+build-asio/sidealsa-asio-loopback-test.exe
 ```
 
 The runtime layout also provides Wine 10+ `sidealsa-asio.dll` aliases.
 
 The ASIO frontend expects `64`-frame ASIO buffers, `48 kHz`, 10 inputs, and 8
-outputs. Only one PRO owner is allowed. Close any other PRO client before
-starting a DAW or ASIO probe.
+outputs. It reports 64 input frames and 64 output frames in the zero-lead
+reference profile. Only one PRO owner is allowed. Close any other PRO client
+before starting a DAW or ASIO probe.
 
 ## Install ASIO Into Steam Prefixes
 
@@ -285,6 +296,10 @@ Reuse an existing ASIO build:
 ```sh
 ./scripts/install-asio.sh --no-build --all-steam
 ```
+
+When the daemon protocol changes, rebuild the Rust workspace and ASIO artifacts
+before using `--no-build`. Replace both system and user-local Wine copies, then
+restart `wineserver` so it does not retain an old Unix DLL.
 
 Use a different user-local install root:
 
@@ -342,11 +357,36 @@ Run the built probe against the running daemon:
 SIDEALSA_SOCKET=/tmp/sidealsad.sock \
 WINEDLLPATH="$HOME/.local/lib/wine" \
 WINEPREFIX="$HOME/.wine" \
-wine build-asio/sidealsa-asio-probe.exe
+WINELOADER=wine build-asio/sidealsa-asio-probe.exe
 ```
 
 The probe checks COM activation, channel counts, `64`-frame buffer negotiation,
-sample rate, buffer pointers, start/stop, and callback delivery.
+64-frame output latency, sample rate, buffer pointers, callback quiescence after
+`Stop`, and reuse of the same Wine callback thread after the next `Start`.
+
+With playback channel 0 physically looped to capture channel 4, run strict
+latency and abrupt-reacquisition checks:
+
+```sh
+WINELOADER=wine WINEDLLPATH="$PWD/build-asio" \
+  build-asio/sidealsa-asio-loopback-test.exe
+scripts/test-asio-reacquire.sh
+```
+
+The first command rejects pulse loss or frame variation across two Start legs.
+The harness records a baseline, kills a streaming process without `Stop`, then
+requires stable reacquisition, parity with an immediately following native PRO
+loopback, and unchanged hardware timeline counters. Absolute analog phase may
+move between processes on explicit-feedback USB hardware. The harness derives
+the serving daemon PID from `SO_PEERCRED` on the tested socket.
+`SIDEALSA_DAEMON_PID` may be set as an additional assertion.
+
+The harness analyzes `raw loopback = common SideALSA/hardware path + ASIO
+frontend residual`. It prints raw ASIO and paired native values separately and
+accepts only the `ASIO - native` residual. A baseline-to-reacquisition shift in
+the common path is reported separately and is not misclassified as either an
+ASIO regression or a hardware-only event. The native reference runs at the same
+default realtime priority (`86`) as the ASIO worker.
 
 Probe result `77` means daemon or Wine driver unavailable. Check:
 
@@ -397,8 +437,8 @@ through PipeWire or logical shared ports.
 
 ```sh
 cargo fmt --all
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --release --workspace --all-targets
+cargo clippy --release --workspace --all-targets -- -D warnings
 cargo build --release --workspace
 ```
 
@@ -406,7 +446,8 @@ ASIO build check:
 
 ```sh
 cmake -S crates/sidealsa-asio -B build-asio -DCMAKE_BUILD_TYPE=Release
-cmake --build build-asio --target sidealsa-asio sidealsa-asio-probe
+cmake --build build-asio --target \
+  sidealsa-asio sidealsa-asio-probe sidealsa-asio-loopback-test
 ```
 
 ## License

@@ -24,10 +24,12 @@ fn main() {
 
 fn run(args: Args) -> Result<(), Box<dyn Error>> {
     let mut client = SideAlsaClient::connect(&args.socket)?;
+    let daemon_pid = client.peer_pid()?;
     for _ in 0..args.samples {
         let stats = client.get_stats()?;
         println!(
-            "periods={} pro={} client={} core={} hw_playback={} hw_capture={}",
+            "daemon_pid={} periods={} pro={} client={} core={} hw_playback={} hw_capture={}",
+            daemon_pid,
             stats.periods_processed,
             stats.pro_deadline_misses,
             stats.pro_client_deadline_misses,

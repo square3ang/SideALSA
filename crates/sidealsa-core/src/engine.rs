@@ -1,9 +1,9 @@
 use std::{
-    hint, io,
+    io,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -16,8 +16,8 @@ use thiserror::Error;
 
 use crate::pro::{ProCaptureSink, ProPlaybackSource};
 use crate::{
-    HardwareConfig, HardwareStats, HardwareTimeline, LINKED_PHASE_OVERHEAD_DIVISOR,
-    LINKED_PRO_HANDOFF_NANOS, Profile, RoutingError, RoutingTable, SampleFormat,
+    HardwareConfig, HardwareStats, HardwareTimeline, LINKED_PHASE_OVERHEAD_DIVISOR, Profile,
+    RoutingError, RoutingTable, SampleFormat,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +45,13 @@ pub enum EngineError {
     },
     #[error("ALSA XRUN during {operation} on {direction:?}: {source}")]
     Xrun {
+        operation: &'static str,
+        direction: StreamDirection,
+        #[source]
+        source: alsa::Error,
+    },
+    #[error("ALSA stream suspended during {operation} on {direction:?}: {source}")]
+    Suspended {
         operation: &'static str,
         direction: StreamDirection,
         #[source]
@@ -168,7 +175,12 @@ impl DuplexEngine {
             &config.capture,
             StreamDirection::Capture,
         )?;
-        configure_sw_params(&capture_pcm, buffer, period, StreamDirection::Capture)?;
+        configure_sw_params(
+            &capture_pcm,
+            buffer,
+            i64::from(config.effective_hardware_period_size()),
+            StreamDirection::Capture,
+        )?;
 
         Ok(Self {
             config,
@@ -217,36 +229,7 @@ impl DuplexEngine {
         if !self.config.realtime {
             return Ok(None);
         }
-
-        let previous_policy = unsafe { libc::sched_getscheduler(0) };
-        if previous_policy < 0 {
-            return Err(EngineError::RealtimeScheduling {
-                operation: "read current policy",
-                source: io::Error::last_os_error(),
-            });
-        }
-        let mut previous_parameters = libc::sched_param { sched_priority: 0 };
-        if unsafe { libc::sched_getparam(0, &mut previous_parameters) } != 0 {
-            return Err(EngineError::RealtimeScheduling {
-                operation: "read current priority",
-                source: io::Error::last_os_error(),
-            });
-        }
-
-        let parameters = libc::sched_param {
-            sched_priority: self.config.realtime_priority as i32,
-        };
-        if unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &parameters) } != 0 {
-            return Err(EngineError::RealtimeScheduling {
-                operation: "set SCHED_FIFO",
-                source: io::Error::last_os_error(),
-            });
-        }
-
-        Ok(Some(RealtimeGuard {
-            policy: previous_policy,
-            priority: previous_parameters.sched_priority,
-        }))
+        RealtimeGuard::enter(self.config.realtime_priority as i32, "set SCHED_FIFO").map(Some)
     }
 
     pub fn start(&mut self) -> Result<(), EngineError> {
@@ -263,7 +246,7 @@ impl DuplexEngine {
             ));
         }
 
-        if let Err(error) = self.prime_playback() {
+        if let Err(error) = self.prepare_pcms().and_then(|()| self.prime_playback()) {
             self.cleanup_startup_failure();
             return Err(error);
         }
@@ -313,6 +296,27 @@ impl DuplexEngine {
         Ok(())
     }
 
+    fn prepare_pcms(&self) -> Result<(), EngineError> {
+        let capture_pcm = self
+            .capture_pcm
+            .as_ref()
+            .ok_or_else(|| EngineError::InvalidConfig("capture worker is active".into()))?;
+        let playback_pcm = self
+            .playback_pcm
+            .as_ref()
+            .ok_or_else(|| EngineError::InvalidConfig("playback worker is active".into()))?;
+        alsa_call(
+            capture_pcm.prepare(),
+            "prepare capture stream for startup",
+            StreamDirection::Capture,
+        )?;
+        alsa_call(
+            playback_pcm.prepare(),
+            "prepare playback stream for startup",
+            StreamDirection::Playback,
+        )
+    }
+
     fn cleanup_startup_failure(&mut self) {
         if let Some(playback_pcm) = self.playback_pcm.as_ref() {
             let _ = playback_pcm.unlink();
@@ -329,23 +333,49 @@ impl DuplexEngine {
         self.streams_linked = false;
     }
 
-    fn uses_linked_pro_cycle(&self) -> bool {
-        self.duplex_link && self.config.pro_latency_periods == 0
+    fn linked_pro_sequence_lead(&self) -> Option<u64> {
+        if !self.duplex_link {
+            return None;
+        }
+        match self.config.pro_latency_periods {
+            0 => Some(0),
+            1 if self.buffer
+                >= self.period + i64::from(self.config.effective_hardware_period_size()) =>
+            {
+                Some(1)
+            }
+            _ => None,
+        }
     }
 
-    fn prepare_linked_pro_start(&mut self) -> Result<alsa::pcm::Frames, EngineError> {
+    fn prepare_linked_pro_start(
+        &mut self,
+        sequence_lead: u64,
+    ) -> Result<alsa::pcm::Frames, EngineError> {
         if self.started {
             return Err(EngineError::InvalidConfig(
                 "linked PRO cycle is already active".into(),
             ));
         }
 
-        let start_frames = linked_start_frames(
-            self.period,
-            i64::from(self.config.effective_hardware_period_size()),
-            self.buffer,
-            self.config.rate,
-        );
+        let hardware_period = i64::from(self.config.effective_hardware_period_size());
+        let start_frames = if sequence_lead == 0 {
+            let playback_floor = linked_zero_lead_playback_floor(
+                i64::from(self.config.effective_linked_playback_guard_frames()),
+                hardware_period,
+                self.buffer,
+                self.period,
+            );
+            linked_start_frames(
+                self.period,
+                playback_floor,
+                self.buffer,
+                self.config.rate,
+                self.config.pro_handoff_nanos(),
+            )
+        } else {
+            linked_ahead_start_frames(self.period, hardware_period, self.buffer)
+        };
         let start_samples = usize::try_from(start_frames)
             .ok()
             .and_then(|frames| frames.checked_mul(self.playback_channels))
@@ -360,6 +390,7 @@ impl DuplexEngine {
             .ok_or_else(|| EngineError::InvalidConfig("capture worker is active".into()))?;
 
         let start_result = (|| {
+            self.prepare_pcms()?;
             let written = write_playback_samples(
                 playback_pcm,
                 &self.playback_silence,
@@ -400,7 +431,7 @@ impl DuplexEngine {
             return Ok(());
         }
 
-        if let Err(error) = self.prime_playback() {
+        if let Err(error) = self.prepare_pcms().and_then(|()| self.prime_playback()) {
             self.cleanup_startup_failure();
             return Err(error);
         }
@@ -461,7 +492,6 @@ impl DuplexEngine {
     }
 
     pub fn run(&mut self, stop: &AtomicBool, max_periods: Option<u64>) -> Result<(), EngineError> {
-        let _realtime = self.enter_realtime()?;
         let deferred_worker_start = self.prepare_worker_start()?;
 
         let done = AtomicBool::new(false);
@@ -623,20 +653,20 @@ impl DuplexEngine {
         mut playback_source: P,
         hardware_ready: Option<&AtomicBool>,
     ) -> Result<(), EngineError> {
-        if self.uses_linked_pro_cycle() {
+        if let Some(sequence_lead) = self.linked_pro_sequence_lead() {
             return self.run_pro_linked(
                 stop,
                 max_periods,
                 &mut capture_sink,
                 &mut playback_source,
                 hardware_ready,
+                sequence_lead,
             );
         }
 
         let mut playback_scratch = vec![0; self.playback_period_samples];
         let sequence_lead = u64::from(self.config.pro_latency_periods);
         let pro_clock = ProClock::new(sequence_lead);
-        let _realtime = self.enter_realtime()?;
         let deferred_worker_start = self.prepare_worker_start()?;
 
         let done = AtomicBool::new(false);
@@ -767,10 +797,11 @@ impl DuplexEngine {
         capture_sink: &mut dyn ProCaptureSink,
         playback_source: &mut dyn ProPlaybackSource,
         hardware_ready: Option<&AtomicBool>,
+        sequence_lead: u64,
     ) -> Result<(), EngineError> {
         let mut playback_scratch = vec![0; self.playback_period_samples];
         let _realtime = self.enter_realtime()?;
-        let start_frames = self.prepare_linked_pro_start()?;
+        let start_frames = self.prepare_linked_pro_start(sequence_lead)?;
         let start_samples = usize::try_from(start_frames)
             .ok()
             .and_then(|frames| frames.checked_mul(self.playback_channels))
@@ -791,6 +822,19 @@ impl DuplexEngine {
         };
         let done = AtomicBool::new(false);
         let capture_cycle_generation = AtomicU64::new(u64::MAX);
+        let hardware_period = i64::from(self.config.effective_hardware_period_size());
+        let configured_playback_floor =
+            i64::from(self.config.effective_linked_playback_guard_frames());
+        let playback_floor = if sequence_lead == 0 {
+            linked_zero_lead_playback_floor(
+                configured_playback_floor,
+                hardware_period,
+                self.buffer,
+                self.period,
+            )
+        } else {
+            configured_playback_floor
+        };
         let control = WorkerControl {
             timeline: &self.timeline,
             stop,
@@ -809,12 +853,12 @@ impl DuplexEngine {
             start_frames,
             period: self.period,
             buffer: self.buffer,
-            hardware_period: i64::from(self.config.effective_hardware_period_size()),
-            playback_floor: linked_playback_floor(i64::from(
-                self.config.effective_hardware_period_size(),
-            )),
+            hardware_period,
+            playback_floor,
             phase_max_attempts: self.config.linked_phase_max_attempts,
             rate: self.config.rate,
+            handoff_nanos: self.config.pro_handoff_nanos(),
+            sequence_lead,
         };
         let result = calibrate_linked_phase(
             &playback_pcm,
@@ -838,10 +882,17 @@ impl DuplexEngine {
         });
         self.playback_pcm = Some(playback_pcm);
         self.capture_pcm = Some(capture_pcm);
-        if result.is_err() {
-            self.cleanup_startup_failure();
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_stopped() => {
+                self.cleanup_startup_failure();
+                Ok(())
+            }
+            Err(error) => {
+                self.cleanup_startup_failure();
+                Err(error)
+            }
         }
-        result
     }
 
     pub fn stop(&mut self) -> Result<(), EngineError> {
@@ -915,6 +966,31 @@ struct RealtimeGuard {
     priority: libc::c_int,
 }
 
+impl RealtimeGuard {
+    fn enter(priority: i32, operation: &'static str) -> Result<Self, EngineError> {
+        let policy = unsafe { libc::sched_getscheduler(0) };
+        if policy < 0 {
+            return Err(EngineError::RealtimeScheduling {
+                operation: "read current policy",
+                source: io::Error::last_os_error(),
+            });
+        }
+        let mut parameters = libc::sched_param { sched_priority: 0 };
+        if unsafe { libc::sched_getparam(0, &mut parameters) } != 0 {
+            return Err(EngineError::RealtimeScheduling {
+                operation: "read current priority",
+                source: io::Error::last_os_error(),
+            });
+        }
+
+        set_current_realtime(priority, operation)?;
+        Ok(Self {
+            policy,
+            priority: parameters.sched_priority,
+        })
+    }
+}
+
 impl Drop for RealtimeGuard {
     fn drop(&mut self) {
         let parameters = libc::sched_param {
@@ -926,13 +1002,13 @@ impl Drop for RealtimeGuard {
     }
 }
 
-fn set_current_realtime(priority: i32) -> Result<(), EngineError> {
+fn set_current_realtime(priority: i32, operation: &'static str) -> Result<(), EngineError> {
     let parameters = libc::sched_param {
         sched_priority: priority,
     };
     if unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &parameters) } != 0 {
         Err(EngineError::RealtimeScheduling {
-            operation: "set worker SCHED_FIFO",
+            operation,
             source: io::Error::last_os_error(),
         })
     } else {
@@ -951,6 +1027,18 @@ struct WorkerControl<'a> {
 }
 
 impl WorkerControl<'_> {
+    fn should_stop(self) -> bool {
+        self.stop.load(Ordering::Relaxed) || self.done.load(Ordering::Acquire)
+    }
+
+    fn ensure_running(self) -> Result<(), EngineError> {
+        if self.should_stop() {
+            Err(EngineError::Stopped)
+        } else {
+            Ok(())
+        }
+    }
+
     fn mark_capture_cycle_ready(self) {
         if let Some(generation) = self.capture_cycle_generation {
             generation.store(self.timeline.generation(), Ordering::Release);
@@ -992,15 +1080,13 @@ struct DuplexStartGate {
 }
 
 struct ProClock {
-    sequence: std::sync::atomic::AtomicU64,
-    epoch: AtomicU32,
+    sequence: AtomicU64,
 }
 
 impl ProClock {
     fn new(sequence: u64) -> Self {
         Self {
-            sequence: std::sync::atomic::AtomicU64::new(sequence),
-            epoch: AtomicU32::new(0),
+            sequence: AtomicU64::new(sequence),
         }
     }
 
@@ -1010,39 +1096,6 @@ impl ProClock {
 
     fn publish(&self, sequence: u64) {
         self.sequence.store(sequence, Ordering::Release);
-        self.epoch.fetch_add(1, Ordering::Release);
-        unsafe {
-            libc::syscall(
-                libc::SYS_futex,
-                self.epoch.as_ptr(),
-                libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
-                i32::MAX,
-            );
-        }
-    }
-
-    fn wait_for_publish(&self, epoch: u32) -> io::Result<()> {
-        let timeout = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 1_000_000,
-        };
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_futex,
-                self.epoch.as_ptr(),
-                libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
-                epoch,
-                &timeout,
-            )
-        };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::EAGAIN | libc::EINTR | libc::ETIMEDOUT) => Ok(()),
-            _ => Err(error),
-        }
     }
 }
 
@@ -1098,6 +1151,8 @@ struct LinkedProConfig<'a> {
     playback_floor: alsa::pcm::Frames,
     phase_max_attempts: u32,
     rate: u32,
+    handoff_nanos: u64,
+    sequence_lead: u64,
 }
 
 const LINKED_PHASE_WARMUP_CYCLES: usize = 2;
@@ -1144,14 +1199,13 @@ fn calibrate_linked_phase(
                 }
                 Ok(None) => return Ok(()),
                 Err(error) if error.is_stopped() => return Ok(()),
-                Err(error) if error.is_xrun() => {
-                    let direction = error.xrun_direction().unwrap_or(StreamDirection::Playback);
+                Err(error) if error.is_recoverable() => {
                     let dither_frames = linked_phase_dither_frames(attempt, config.hardware_period);
                     recover_linked_streams(
                         playback_pcm,
                         capture_pcm,
-                        direction,
-                        control.timeline,
+                        &error,
+                        control,
                         config,
                         dither_frames,
                     )?;
@@ -1184,13 +1238,7 @@ fn calibrate_linked_phase(
         }
 
         let dither_frames = linked_phase_dither_frames(attempt, config.hardware_period);
-        rebase_linked_streams(
-            playback_pcm,
-            capture_pcm,
-            control.timeline,
-            config,
-            dither_frames,
-        )?;
+        rebase_linked_streams(playback_pcm, capture_pcm, control, config, dither_frames)?;
     }
     Ok(())
 }
@@ -1231,6 +1279,7 @@ fn linked_phase_calibration_cycle(
         config.playback_floor,
         config.hardware_period,
         config.rate,
+        config.handoff_nanos,
     );
     let written = write_playback_samples(
         playback_pcm,
@@ -1267,6 +1316,7 @@ fn linked_phase_prediction(
     playback_floor: alsa::pcm::Frames,
     hardware_period: alsa::pcm::Frames,
     rate: u32,
+    handoff_nanos: u64,
 ) -> (u64, alsa::pcm::Frames) {
     let wait_frames = u64::try_from(queued_frames.saturating_sub(playback_floor)).unwrap_or(0);
     let wait_nanos = wait_frames.saturating_mul(1_000_000_000) / u64::from(rate);
@@ -1276,7 +1326,7 @@ fn linked_phase_prediction(
     .unwrap_or(1);
     let overhead_nanos = overhead_frames.saturating_mul(1_000_000_000) / u64::from(rate);
     let score_nanos = wait_nanos.saturating_add(overhead_nanos);
-    let reserve_frames = if wait_nanos < LINKED_PRO_HANDOFF_NANOS {
+    let reserve_frames = if wait_nanos < handoff_nanos {
         0
     } else {
         let drained_frames = wait_frames.saturating_add(overhead_frames);
@@ -1295,6 +1345,80 @@ fn linked_phase_dither_frames(
     alsa::pcm::Frames::from(attempt % hardware_period)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingProCapture {
+    hardware_sequence: u64,
+    playback_sequence: u64,
+    target_nanos: u64,
+}
+
+fn take_pending_pro_capture(
+    pending: &mut Option<PendingProCapture>,
+    playback_sequence: u64,
+) -> Option<PendingProCapture> {
+    if pending
+        .as_ref()
+        .is_some_and(|pending| pending.playback_sequence == playback_sequence)
+    {
+        pending.take()
+    } else {
+        None
+    }
+}
+
+fn wait_for_pro_handoff(
+    pending: PendingProCapture,
+    control: WorkerControl<'_>,
+) -> Result<(), EngineError> {
+    let now = monotonic_nanos();
+    let wait_nanos = pending.target_nanos.saturating_sub(now);
+    control.timeline.record_pro_wait_budget(wait_nanos);
+    if wait_nanos == 0 {
+        control.timeline.record_pro_core_deadline_miss();
+        return Ok(());
+    }
+    wait_for_handoff_target(pending.target_nanos, control)
+}
+
+fn prepare_pro_playback(
+    playback_source: &mut dyn ProPlaybackSource,
+    sequence: u64,
+) -> Result<(), EngineError> {
+    catch_unwind(AssertUnwindSafe(|| {
+        playback_source.prepare_playback(sequence);
+        playback_source.prepare_playback_mix(sequence);
+    }))
+    .map_err(|_| EngineError::WorkerPanic)
+}
+
+fn render_pro_playback(
+    playback_source: &mut dyn ProPlaybackSource,
+    sequence: u64,
+    cutoff_nanos: Option<u64>,
+    playback: &mut [i32],
+) -> Result<(), EngineError> {
+    catch_unwind(AssertUnwindSafe(|| {
+        if let Some(cutoff_nanos) = cutoff_nanos {
+            playback_source.process_playback_before(sequence, cutoff_nanos, playback);
+        } else {
+            playback_source.process_playback(sequence, playback);
+        }
+        playback_source.commit_playback(sequence, playback);
+    }))
+    .map_err(|_| EngineError::WorkerPanic)
+}
+
+fn publish_deferred_capture(
+    capture_sink: &mut dyn ProCaptureSink,
+    pending: PendingProCapture,
+    capture: &[i32],
+) -> Result<(), EngineError> {
+    catch_unwind(AssertUnwindSafe(|| {
+        capture_sink.process_deferred_capture(pending.hardware_sequence, capture);
+    }))
+    .map_err(|_| EngineError::WorkerPanic)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn linked_pro_cycle_loop(
     playback_pcm: &PCM,
@@ -1307,12 +1431,40 @@ fn linked_pro_cycle_loop(
     playback_source: &mut dyn ProPlaybackSource,
     max_periods: Option<u64>,
 ) -> Result<(), EngineError> {
+    if uses_staged_packet_cycle(config.sequence_lead, config.period, config.hardware_period) {
+        return linked_pro_packet_cycle_loop(
+            playback_pcm,
+            capture_pcm,
+            capture_scratch,
+            playback_scratch,
+            config,
+            control,
+            capture_sink,
+            playback_source,
+            max_periods,
+        );
+    }
+
+    if config.sequence_lead != 0 {
+        return linked_pro_ahead_cycle_loop(
+            playback_pcm,
+            capture_pcm,
+            capture_scratch,
+            playback_scratch,
+            config,
+            control,
+            capture_sink,
+            playback_source,
+            max_periods,
+        );
+    }
+
     let mut playback_position = 0_u64;
     let mut capture_position = 0_u64;
     let mut sequence = 0_u64;
     let mut periods_processed = 0_u64;
 
-    loop {
+    'cycles: loop {
         if control.stop.load(Ordering::Relaxed)
             || max_periods.is_some_and(|limit| periods_processed >= limit)
         {
@@ -1331,11 +1483,11 @@ fn linked_pro_cycle_loop(
                 control.done.store(true, Ordering::Release);
                 return Ok(());
             }
-            Err(error) if error.is_xrun() => {
+            Err(error) if error.is_recoverable() => {
                 recover_and_calibrate_linked_streams(
                     playback_pcm,
                     capture_pcm,
-                    StreamDirection::Capture,
+                    &error,
                     capture_scratch,
                     config,
                     control,
@@ -1369,15 +1521,20 @@ fn linked_pro_cycle_loop(
         }
         capture_position = capture_position.wrapping_add(config.period as u64);
         control.timeline.update_capture_position(capture_position);
+        let capture_sequence = sequence;
         control
             .timeline
-            .record_pro_capture_read(sequence, capture_read_nanos);
-        let pro_handoff_started = Instant::now();
-        let pro_deadline = pro_handoff_started
-            .checked_add(Duration::from_nanos(LINKED_PRO_HANDOFF_NANOS))
-            .unwrap_or(pro_handoff_started);
+            .record_pro_capture_read(capture_sequence, capture_read_nanos);
         if catch_unwind(AssertUnwindSafe(|| {
-            capture_sink.process_capture(sequence, capture_scratch);
+            playback_source.prepare_playback(sequence);
+        }))
+        .is_err()
+        {
+            control.done.store(true, Ordering::Release);
+            return Err(EngineError::WorkerPanic);
+        }
+        if catch_unwind(AssertUnwindSafe(|| {
+            capture_sink.process_capture_for_playback(sequence, capture_sequence, capture_scratch);
         }))
         .is_err()
         {
@@ -1385,21 +1542,75 @@ fn linked_pro_cycle_loop(
             return Err(EngineError::WorkerPanic);
         }
         control.mark_capture_cycle_ready();
+        if control.stop.load(Ordering::Relaxed) {
+            continue;
+        }
+
+        let pending_capture = PendingProCapture {
+            hardware_sequence: sequence,
+            playback_sequence: sequence,
+            target_nanos: monotonic_nanos().saturating_add(config.handoff_nanos),
+        };
+        if catch_unwind(AssertUnwindSafe(|| {
+            playback_source.prepare_playback_mix(sequence);
+        }))
+        .is_err()
+        {
+            control.done.store(true, Ordering::Release);
+            return Err(EngineError::WorkerPanic);
+        }
+        if let Err(error) = wait_for_pro_handoff(pending_capture, control) {
+            if error.is_stopped() {
+                control.done.store(true, Ordering::Release);
+                return Ok(());
+            }
+            control.done.store(true, Ordering::Release);
+            return Err(error);
+        }
+
+        playback_scratch[..config.playback_period_samples].fill(0);
+        if catch_unwind(AssertUnwindSafe(|| {
+            playback_source.process_playback_before(
+                sequence,
+                pending_capture.target_nanos,
+                &mut playback_scratch[..config.playback_period_samples],
+            );
+        }))
+        .is_err()
+        {
+            control.done.store(true, Ordering::Release);
+            return Err(EngineError::WorkerPanic);
+        }
+        if control.stop.load(Ordering::Relaxed) {
+            continue;
+        }
+
+        if catch_unwind(AssertUnwindSafe(|| {
+            playback_source.commit_playback(
+                sequence,
+                &mut playback_scratch[..config.playback_period_samples],
+            );
+        }))
+        .is_err()
+        {
+            control.done.store(true, Ordering::Release);
+            return Err(EngineError::WorkerPanic);
+        }
 
         match wait_for_playback_target(
             playback_pcm,
             config.buffer,
             config.playback_floor,
             config.rate,
-            0,
+            config.handoff_nanos,
             control,
         ) {
             Ok(()) => {}
-            Err(error) if error.is_xrun() => {
+            Err(error) if error.is_recoverable() => {
                 recover_and_calibrate_linked_streams(
                     playback_pcm,
                     capture_pcm,
-                    StreamDirection::Playback,
+                    &error,
                     capture_scratch,
                     config,
                     control,
@@ -1416,26 +1627,205 @@ fn linked_pro_cycle_loop(
             continue;
         }
 
-        let wait_budget = linked_pro_wait_budget(pro_deadline, Instant::now());
-        control
-            .timeline
-            .record_pro_wait_budget(duration_nanos(wait_budget));
-        playback_scratch[..config.playback_period_samples].fill(0);
-        if catch_unwind(AssertUnwindSafe(|| {
-            playback_source.process_playback(
-                sequence,
-                &mut playback_scratch[..config.playback_period_samples],
-                pro_deadline,
+        let write_frames = if config.sequence_lead == 0 {
+            config.period
+        } else {
+            config.hardware_period
+        };
+        let write_samples = usize::try_from(write_frames)
+            .ok()
+            .and_then(|frames| frames.checked_mul(config.playback_channels))
+            .ok_or_else(|| EngineError::InvalidConfig("playback chunk size overflow".into()))?;
+        let chunks = config.period / write_frames;
+
+        if let Ok(status) = playback_pcm.status() {
+            let delay = status.get_delay();
+            control.timeline.update_pcm_delay(
+                StreamDirection::Playback,
+                delay,
+                write_frames as u64,
             );
+            control.timeline.update_playback_delay_breakdown(
+                delay,
+                status.get_avail(),
+                config.buffer,
+            );
+        }
+
+        for chunk in 0..chunks {
+            if chunk > 0 {
+                match wait_for_playback_target(
+                    playback_pcm,
+                    config.buffer,
+                    config.playback_floor,
+                    config.rate,
+                    config.handoff_nanos,
+                    control,
+                ) {
+                    Ok(()) => {}
+                    Err(error) if error.is_recoverable() => {
+                        recover_and_calibrate_linked_streams(
+                            playback_pcm,
+                            capture_pcm,
+                            &error,
+                            capture_scratch,
+                            config,
+                            control,
+                        )?;
+                        sequence = sequence.wrapping_add(1);
+                        continue 'cycles;
+                    }
+                    Err(error) => {
+                        control.done.store(true, Ordering::Release);
+                        return Err(error);
+                    }
+                }
+                if control.stop.load(Ordering::Relaxed) {
+                    continue 'cycles;
+                }
+            }
+
+            let offset = usize::try_from(chunk)
+                .ok()
+                .and_then(|chunk| chunk.checked_mul(write_samples))
+                .ok_or_else(|| {
+                    EngineError::InvalidConfig("playback chunk offset overflow".into())
+                })?;
+            let write_started = Instant::now();
+            let write_result = write_playback_samples(
+                playback_pcm,
+                &playback_scratch[offset..offset + write_samples],
+                config.playback_channels,
+                write_samples,
+                Some(control),
+            );
+            control
+                .timeline
+                .record_playback_write(duration_nanos(write_started.elapsed()));
+            match write_result {
+                Ok(written) if written == write_frames => {
+                    playback_position = playback_position.wrapping_add(write_frames as u64);
+                    control.timeline.update_playback_position(playback_position);
+                    if chunk == 0 {
+                        control
+                            .timeline
+                            .record_pro_playback_write(sequence, monotonic_nanos());
+                    }
+                }
+                Ok(written) => {
+                    control.done.store(true, Ordering::Release);
+                    return Err(EngineError::ShortCommit {
+                        direction: StreamDirection::Playback,
+                        actual: written,
+                        required: write_frames,
+                    });
+                }
+                Err(error) if error.is_recoverable() => {
+                    recover_and_calibrate_linked_streams(
+                        playback_pcm,
+                        capture_pcm,
+                        &error,
+                        capture_scratch,
+                        config,
+                        control,
+                    )?;
+                    sequence = sequence.wrapping_add(1);
+                    continue 'cycles;
+                }
+                Err(error) if error.is_stopped() => {
+                    control.done.store(true, Ordering::Release);
+                    return Ok(());
+                }
+                Err(error) => {
+                    control.done.store(true, Ordering::Release);
+                    return Err(error);
+                }
+            }
+        }
+        if catch_unwind(AssertUnwindSafe(|| {
+            capture_sink.process_deferred_capture(sequence, capture_scratch);
         }))
         .is_err()
         {
             control.done.store(true, Ordering::Release);
             return Err(EngineError::WorkerPanic);
         }
-        if control.stop.load(Ordering::Relaxed) {
-            continue;
+        sequence = sequence.wrapping_add(1);
+        periods_processed = periods_processed.wrapping_add(1);
+        control.timeline.processed_frames(config.period as u64, 1);
+        control.publish_hardware_ready();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linked_pro_ahead_cycle_loop(
+    playback_pcm: &PCM,
+    capture_pcm: &PCM,
+    capture_scratch: &mut [i32],
+    playback_scratch: &mut [i32],
+    config: LinkedProConfig<'_>,
+    control: WorkerControl<'_>,
+    capture_sink: &mut dyn ProCaptureSink,
+    playback_source: &mut dyn ProPlaybackSource,
+    max_periods: Option<u64>,
+) -> Result<(), EngineError> {
+    let mut playback_position = 0_u64;
+    let mut capture_position = 0_u64;
+    let mut sequence = 0_u64;
+    let mut periods_processed = 0_u64;
+    let mut pending_capture = None;
+
+    loop {
+        if control.should_stop() || max_periods.is_some_and(|limit| periods_processed >= limit) {
+            control.done.store(true, Ordering::Release);
+            return Ok(());
         }
+
+        prepare_pro_playback(playback_source, sequence)?;
+        playback_scratch[..config.playback_period_samples].fill(0);
+        let current_capture = take_pending_pro_capture(&mut pending_capture, sequence);
+        if let Some(pending) = current_capture {
+            wait_for_pro_handoff(pending, control)?;
+        }
+        render_pro_playback(
+            playback_source,
+            sequence,
+            current_capture.map(|pending| pending.target_nanos),
+            &mut playback_scratch[..config.playback_period_samples],
+        )?;
+        if let Some(pending) = current_capture {
+            publish_deferred_capture(capture_sink, pending, capture_scratch)?;
+        }
+
+        if let Err(error) = wait_for_playback_target(
+            playback_pcm,
+            config.buffer,
+            config.playback_floor,
+            config.rate,
+            config.handoff_nanos,
+            control,
+        ) {
+            if error.is_recoverable() {
+                pending_capture = None;
+                recover_and_calibrate_linked_streams(
+                    playback_pcm,
+                    capture_pcm,
+                    &error,
+                    capture_scratch,
+                    config,
+                    control,
+                )?;
+                sequence = sequence.wrapping_add(1);
+                continue;
+            }
+            if error.is_stopped() {
+                control.done.store(true, Ordering::Release);
+                return Ok(());
+            }
+            control.done.store(true, Ordering::Release);
+            return Err(error);
+        }
+        control.ensure_running()?;
 
         if let Ok(status) = playback_pcm.status() {
             let delay = status.get_delay();
@@ -1450,10 +1840,6 @@ fn linked_pro_cycle_loop(
                 config.buffer,
             );
         }
-
-        control
-            .timeline
-            .record_pro_playback_write(sequence, monotonic_nanos());
         let write_started = Instant::now();
         let write_result = write_playback_samples(
             playback_pcm,
@@ -1468,11 +1854,10 @@ fn linked_pro_cycle_loop(
         match write_result {
             Ok(written) if written == config.period => {
                 playback_position = playback_position.wrapping_add(config.period as u64);
-                sequence = sequence.wrapping_add(1);
-                periods_processed = periods_processed.wrapping_add(1);
                 control.timeline.update_playback_position(playback_position);
-                control.timeline.processed_frames(config.period as u64, 1);
-                control.publish_hardware_ready();
+                control
+                    .timeline
+                    .record_pro_playback_write(sequence, monotonic_nanos());
             }
             Ok(written) => {
                 control.done.store(true, Ordering::Release);
@@ -1482,16 +1867,18 @@ fn linked_pro_cycle_loop(
                     required: config.period,
                 });
             }
-            Err(error) if error.is_xrun() => {
+            Err(error) if error.is_recoverable() => {
+                pending_capture = None;
                 recover_and_calibrate_linked_streams(
                     playback_pcm,
                     capture_pcm,
-                    StreamDirection::Playback,
+                    &error,
                     capture_scratch,
                     config,
                     control,
                 )?;
                 sequence = sequence.wrapping_add(1);
+                continue;
             }
             Err(error) if error.is_stopped() => {
                 control.done.store(true, Ordering::Release);
@@ -1502,6 +1889,384 @@ fn linked_pro_cycle_loop(
                 return Err(error);
             }
         }
+
+        let read = match read_capture_samples(
+            capture_pcm,
+            capture_scratch,
+            config.capture_channels,
+            config.capture_period_samples,
+            Some(control),
+        ) {
+            Ok(read) => read,
+            Err(error) if error.is_recoverable() => {
+                pending_capture = None;
+                recover_and_calibrate_linked_streams(
+                    playback_pcm,
+                    capture_pcm,
+                    &error,
+                    capture_scratch,
+                    config,
+                    control,
+                )?;
+                sequence = sequence.wrapping_add(1);
+                continue;
+            }
+            Err(error) if error.is_stopped() => {
+                control.done.store(true, Ordering::Release);
+                return Ok(());
+            }
+            Err(error) => {
+                control.done.store(true, Ordering::Release);
+                return Err(error);
+            }
+        };
+        if read != config.period {
+            control.done.store(true, Ordering::Release);
+            return Err(EngineError::ShortCommit {
+                direction: StreamDirection::Capture,
+                actual: read,
+                required: config.period,
+            });
+        }
+
+        let capture_read_nanos = monotonic_nanos();
+        if let Ok(delay) = capture_pcm.delay() {
+            control.timeline.update_pcm_delay(
+                StreamDirection::Capture,
+                delay,
+                config.period as u64,
+            );
+        }
+        capture_position = capture_position.wrapping_add(config.period as u64);
+        control.timeline.update_capture_position(capture_position);
+        let playback_sequence = pro_target_sequence(sequence, config.sequence_lead);
+        control
+            .timeline
+            .record_pro_capture_read(playback_sequence, capture_read_nanos);
+        if catch_unwind(AssertUnwindSafe(|| {
+            capture_sink.process_capture_for_playback(sequence, playback_sequence, capture_scratch);
+        }))
+        .is_err()
+        {
+            control.done.store(true, Ordering::Release);
+            return Err(EngineError::WorkerPanic);
+        }
+        control.mark_capture_cycle_ready();
+        pending_capture = Some(PendingProCapture {
+            hardware_sequence: sequence,
+            playback_sequence,
+            target_nanos: monotonic_nanos().saturating_add(config.handoff_nanos),
+        });
+        sequence = sequence.wrapping_add(1);
+        periods_processed = periods_processed.wrapping_add(1);
+        control.timeline.processed_frames(config.period as u64, 1);
+        control.publish_hardware_ready();
+    }
+}
+
+fn uses_staged_packet_cycle(
+    sequence_lead: u64,
+    period: alsa::pcm::Frames,
+    hardware_period: alsa::pcm::Frames,
+) -> bool {
+    sequence_lead != 0 && hardware_period < period
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linked_pro_packet_cycle_loop(
+    playback_pcm: &PCM,
+    capture_pcm: &PCM,
+    capture_scratch: &mut [i32],
+    playback_scratch: &mut [i32],
+    config: LinkedProConfig<'_>,
+    control: WorkerControl<'_>,
+    capture_sink: &mut dyn ProCaptureSink,
+    playback_source: &mut dyn ProPlaybackSource,
+    max_periods: Option<u64>,
+) -> Result<(), EngineError> {
+    let mut playback_position = 0_u64;
+    let mut capture_position = 0_u64;
+    let mut sequence = 0_u64;
+    let mut periods_processed = 0_u64;
+    let mut pending_capture = None;
+    let chunks = config.period / config.hardware_period;
+    let playback_chunk_samples = usize::try_from(config.hardware_period)
+        .ok()
+        .and_then(|frames| frames.checked_mul(config.playback_channels))
+        .ok_or_else(|| EngineError::InvalidConfig("playback chunk size overflow".into()))?;
+    let capture_chunk_samples = usize::try_from(config.hardware_period)
+        .ok()
+        .and_then(|frames| frames.checked_mul(config.capture_channels))
+        .ok_or_else(|| EngineError::InvalidConfig("capture chunk size overflow".into()))?;
+
+    loop {
+        if control.stop.load(Ordering::Relaxed)
+            || max_periods.is_some_and(|limit| periods_processed >= limit)
+        {
+            control.done.store(true, Ordering::Release);
+            return Ok(());
+        }
+
+        match linked_pro_packet_cycle(
+            playback_pcm,
+            capture_pcm,
+            capture_scratch,
+            playback_scratch,
+            playback_chunk_samples,
+            capture_chunk_samples,
+            chunks,
+            sequence,
+            config,
+            control,
+            capture_sink,
+            playback_source,
+            &mut playback_position,
+            &mut capture_position,
+            &mut pending_capture,
+        ) {
+            Ok(()) => {
+                sequence = sequence.wrapping_add(1);
+                periods_processed = periods_processed.wrapping_add(1);
+                control.timeline.processed_frames(config.period as u64, 1);
+                control.publish_hardware_ready();
+            }
+            Err(error) if error.is_stopped() => {
+                control.done.store(true, Ordering::Release);
+                return Ok(());
+            }
+            Err(error) if error.is_recoverable() => {
+                playback_scratch[..config.playback_period_samples].fill(0);
+                pending_capture = None;
+                recover_and_calibrate_linked_streams(
+                    playback_pcm,
+                    capture_pcm,
+                    &error,
+                    capture_scratch,
+                    config,
+                    control,
+                )?;
+                sequence = sequence.wrapping_add(1);
+            }
+            Err(error) => {
+                control.done.store(true, Ordering::Release);
+                return Err(error);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linked_pro_packet_cycle(
+    playback_pcm: &PCM,
+    capture_pcm: &PCM,
+    capture_scratch: &mut [i32],
+    playback_scratch: &mut [i32],
+    playback_chunk_samples: usize,
+    capture_chunk_samples: usize,
+    chunks: alsa::pcm::Frames,
+    sequence: u64,
+    config: LinkedProConfig<'_>,
+    control: WorkerControl<'_>,
+    capture_sink: &mut dyn ProCaptureSink,
+    playback_source: &mut dyn ProPlaybackSource,
+    playback_position: &mut u64,
+    capture_position: &mut u64,
+    pending_capture: &mut Option<PendingProCapture>,
+) -> Result<(), EngineError> {
+    prepare_pro_playback(playback_source, sequence)?;
+    refill_linked_playback_chunk(
+        playback_pcm,
+        playback_scratch,
+        chunks - 1,
+        playback_chunk_samples,
+        config,
+        control,
+        playback_position,
+    )?;
+    playback_scratch[..config.playback_period_samples].fill(0);
+
+    let current_capture = take_pending_pro_capture(pending_capture, sequence);
+    if let Some(pending) = current_capture {
+        wait_for_pro_handoff(pending, control)?;
+    }
+    render_pro_playback(
+        playback_source,
+        sequence,
+        current_capture.map(|pending| pending.target_nanos),
+        &mut playback_scratch[..config.playback_period_samples],
+    )?;
+    if let Some(pending) = current_capture {
+        publish_deferred_capture(capture_sink, pending, capture_scratch)?;
+    }
+
+    for chunk in 0..chunks {
+        if let Some(playback_chunk) = staged_playback_chunk_before_capture(chunk) {
+            if playback_chunk == 0
+                && let Ok(status) = playback_pcm.status()
+            {
+                let delay = status.get_delay();
+                control.timeline.update_pcm_delay(
+                    StreamDirection::Playback,
+                    delay,
+                    config.hardware_period as u64,
+                );
+                control.timeline.update_playback_delay_breakdown(
+                    delay,
+                    status.get_avail(),
+                    config.buffer,
+                );
+            }
+            refill_linked_playback_chunk(
+                playback_pcm,
+                playback_scratch,
+                playback_chunk,
+                playback_chunk_samples,
+                config,
+                control,
+                playback_position,
+            )?;
+            if playback_chunk == 0 {
+                control
+                    .timeline
+                    .record_pro_playback_write(sequence, monotonic_nanos());
+            }
+        }
+
+        let capture_offset = usize::try_from(chunk)
+            .ok()
+            .and_then(|chunk| chunk.checked_mul(capture_chunk_samples))
+            .ok_or_else(|| EngineError::InvalidConfig("capture chunk offset overflow".into()))?;
+        let read = read_capture_samples(
+            capture_pcm,
+            &mut capture_scratch
+                [capture_offset..capture_offset.saturating_add(capture_chunk_samples)],
+            config.capture_channels,
+            capture_chunk_samples,
+            Some(control),
+        )?;
+        if read != config.hardware_period {
+            return Err(EngineError::ShortCommit {
+                direction: StreamDirection::Capture,
+                actual: read,
+                required: config.hardware_period,
+            });
+        }
+        *capture_position = capture_position.wrapping_add(config.hardware_period as u64);
+        control.timeline.update_capture_position(*capture_position);
+
+        if chunk + 1 == chunks {
+            let capture_sequence = pro_target_sequence(sequence, config.sequence_lead);
+            let capture_read_nanos = monotonic_nanos();
+            if let Ok(delay) = capture_pcm.delay() {
+                control.timeline.update_pcm_delay(
+                    StreamDirection::Capture,
+                    delay,
+                    config.period as u64,
+                );
+            }
+            control
+                .timeline
+                .record_pro_capture_read(capture_sequence, capture_read_nanos);
+            if catch_unwind(AssertUnwindSafe(|| {
+                capture_sink.process_capture_for_playback(
+                    sequence,
+                    capture_sequence,
+                    capture_scratch,
+                );
+            }))
+            .is_err()
+            {
+                return Err(EngineError::WorkerPanic);
+            }
+            control.mark_capture_cycle_ready();
+            *pending_capture = Some(PendingProCapture {
+                hardware_sequence: sequence,
+                playback_sequence: capture_sequence,
+                target_nanos: monotonic_nanos().saturating_add(config.handoff_nanos),
+            });
+        }
+        if control.stop.load(Ordering::Relaxed) {
+            return Err(EngineError::Stopped);
+        }
+    }
+    Ok(())
+}
+
+fn staged_playback_chunk_before_capture(
+    capture_chunk: alsa::pcm::Frames,
+) -> Option<alsa::pcm::Frames> {
+    (capture_chunk > 0).then(|| capture_chunk - 1)
+}
+
+fn refill_linked_playback_chunk(
+    playback_pcm: &PCM,
+    playback_scratch: &[i32],
+    chunk: alsa::pcm::Frames,
+    playback_chunk_samples: usize,
+    config: LinkedProConfig<'_>,
+    control: WorkerControl<'_>,
+    playback_position: &mut u64,
+) -> Result<(), EngineError> {
+    wait_for_playback_target(
+        playback_pcm,
+        config.buffer,
+        config.playback_floor,
+        config.rate,
+        config.handoff_nanos,
+        control,
+    )?;
+    if control.stop.load(Ordering::Relaxed) || control.done.load(Ordering::Acquire) {
+        return Err(EngineError::Stopped);
+    }
+    write_linked_playback_chunk(
+        playback_pcm,
+        playback_scratch,
+        chunk,
+        playback_chunk_samples,
+        config,
+        control,
+        playback_position,
+    )
+}
+
+fn write_linked_playback_chunk(
+    playback_pcm: &PCM,
+    playback_scratch: &[i32],
+    chunk: alsa::pcm::Frames,
+    playback_chunk_samples: usize,
+    config: LinkedProConfig<'_>,
+    control: WorkerControl<'_>,
+    playback_position: &mut u64,
+) -> Result<(), EngineError> {
+    let playback_offset = usize::try_from(chunk)
+        .ok()
+        .and_then(|chunk| chunk.checked_mul(playback_chunk_samples))
+        .ok_or_else(|| EngineError::InvalidConfig("playback chunk offset overflow".into()))?;
+    let write_started = Instant::now();
+    let written = write_playback_samples(
+        playback_pcm,
+        &playback_scratch[playback_offset..playback_offset.saturating_add(playback_chunk_samples)],
+        config.playback_channels,
+        playback_chunk_samples,
+        Some(control),
+    );
+    control
+        .timeline
+        .record_playback_write(duration_nanos(write_started.elapsed()));
+    match written {
+        Ok(written) if written == config.hardware_period => {
+            *playback_position = playback_position.wrapping_add(config.hardware_period as u64);
+            control
+                .timeline
+                .update_playback_position(*playback_position);
+            Ok(())
+        }
+        Ok(written) => Err(EngineError::ShortCommit {
+            direction: StreamDirection::Playback,
+            actual: written,
+            required: config.hardware_period,
+        }),
+        Err(error) => Err(error),
     }
 }
 
@@ -1516,12 +2281,16 @@ fn playback_worker(
 ) -> (PCM, Result<(), EngineError>) {
     let startup_priority =
         playback_startup_priority(config.realtime_priority, control.start_gate.is_some());
-    if let Some(priority) = startup_priority
-        && let Err(error) = set_current_realtime(priority)
-    {
-        control.done.store(true, Ordering::Release);
-        return (pcm, Err(error));
-    }
+    let _scheduling = match startup_priority {
+        Some(priority) => match RealtimeGuard::enter(priority, "set worker SCHED_FIFO") {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                control.done.store(true, Ordering::Release);
+                return (pcm, Err(error));
+            }
+        },
+        None => None,
+    };
     if let Some(gate) = control.start_gate {
         gate.playback_ready.store(true, Ordering::Release);
         while !gate.capture_ready.load(Ordering::Acquire) {
@@ -1544,7 +2313,7 @@ fn playback_worker(
         }
         if config.realtime_priority != startup_priority
             && let Some(priority) = config.realtime_priority
-            && let Err(error) = set_current_realtime(priority)
+            && let Err(error) = set_current_realtime(priority, "raise playback SCHED_FIFO")
         {
             control.done.store(true, Ordering::Release);
             return (pcm, Err(error));
@@ -1604,86 +2373,32 @@ fn playback_worker_loop(
 ) -> Result<(), EngineError> {
     let mut position = 0_u64;
     let mut sequence = 0_u64;
+    let mut successful_periods = 0_u64;
     let mut output_scratch = output_scratch;
+    let mut announced_sequence = None;
     let mut prepared_sequence = None;
 
     loop {
         if control.stop.load(Ordering::Relaxed)
             || control.done.load(Ordering::Acquire)
-            || max_periods
-                .is_some_and(|limit| control.timeline.snapshot().periods_processed >= limit)
+            || period_limit_reached(successful_periods, max_periods)
         {
             control.done.store(true, Ordering::Release);
             return Ok(());
         }
 
-        if prepared_sequence != Some(sequence) {
-            let wait_budget = if config.timer_scheduling {
-                match playback_preparation_budget(
-                    pcm,
-                    config.buffer,
-                    config.guard_frames,
-                    config.period,
-                    config.rate,
-                ) {
-                    Ok(budget) => budget,
-                    Err(error) if error.is_xrun() => {
-                        if let Err(error) = recover_stream(
-                            pcm,
-                            StreamDirection::Playback,
-                            &error,
-                            control.timeline,
-                            Some((
-                                config.silence,
-                                config.channels,
-                                config.start_samples,
-                                config.start_frames,
-                            )),
-                        ) {
-                            control.done.store(true, Ordering::Release);
-                            return Err(error);
-                        }
-                        continue;
-                    }
-                    Err(error) => {
-                        control.done.store(true, Ordering::Release);
-                        return Err(error);
-                    }
-                }
-            } else {
-                Duration::ZERO
-            };
-
-            if let (Some(source), Some(scratch)) = (
-                playback_source.as_deref_mut(),
-                output_scratch.as_deref_mut(),
-            ) {
-                control
-                    .timeline
-                    .record_pro_wait_budget(duration_nanos(wait_budget));
-                let deadline = Instant::now()
-                    .checked_add(wait_budget)
-                    .unwrap_or_else(Instant::now);
-                scratch[..config.period_samples].fill(0);
-                if catch_unwind(AssertUnwindSafe(|| {
-                    source.process_playback(
-                        sequence,
-                        &mut scratch[..config.period_samples],
-                        deadline,
-                    );
+        if announced_sequence != Some(sequence) {
+            if let Some(source) = playback_source.as_deref_mut()
+                && catch_unwind(AssertUnwindSafe(|| {
+                    source.prepare_playback(sequence);
                 }))
                 .is_err()
-                {
-                    control.done.store(true, Ordering::Release);
-                    return Err(EngineError::WorkerPanic);
-                }
+            {
+                control.done.store(true, Ordering::Release);
+                return Err(EngineError::WorkerPanic);
             }
-            prepared_sequence = Some(sequence);
+            announced_sequence = Some(sequence);
         }
-
-        let samples = output_scratch
-            .as_deref()
-            .map_or(config.silence, |scratch| &scratch[..config.period_samples]);
 
         let wait_result = if config.timer_scheduling {
             wait_for_playback_target(
@@ -1702,12 +2417,12 @@ fn playback_worker_loop(
                 control.done.store(true, Ordering::Release);
                 return Ok(());
             }
-            if error.is_xrun() {
-                if let Err(error) = recover_stream(
+            if error.is_recoverable() {
+                match recover_stream(
                     pcm,
                     StreamDirection::Playback,
                     &error,
-                    control.timeline,
+                    control,
                     Some((
                         config.silence,
                         config.channels,
@@ -1715,16 +2430,51 @@ fn playback_worker_loop(
                         config.start_frames,
                     )),
                 ) {
-                    control.done.store(true, Ordering::Release);
-                    return Err(error);
+                    Ok(()) => continue,
+                    Err(error) if error.is_stopped() => {
+                        control.done.store(true, Ordering::Release);
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        control.done.store(true, Ordering::Release);
+                        return Err(error);
+                    }
                 }
-                continue;
             }
             control.done.store(true, Ordering::Release);
             return Err(error);
         }
         if control.stop.load(Ordering::Relaxed) || control.done.load(Ordering::Acquire) {
             continue;
+        }
+        if prepared_sequence != Some(sequence) {
+            if let (Some(source), Some(scratch)) = (
+                playback_source.as_deref_mut(),
+                output_scratch.as_deref_mut(),
+            ) {
+                control.timeline.record_pro_wait_budget(0);
+                scratch[..config.period_samples].fill(0);
+                if catch_unwind(AssertUnwindSafe(|| {
+                    source.process_playback(sequence, &mut scratch[..config.period_samples]);
+                }))
+                .is_err()
+                {
+                    control.done.store(true, Ordering::Release);
+                    return Err(EngineError::WorkerPanic);
+                }
+            }
+            if let (Some(source), Some(scratch)) = (
+                playback_source.as_deref_mut(),
+                output_scratch.as_deref_mut(),
+            ) && catch_unwind(AssertUnwindSafe(|| {
+                source.commit_playback(sequence, &mut scratch[..config.period_samples]);
+            }))
+            .is_err()
+            {
+                control.done.store(true, Ordering::Release);
+                return Err(EngineError::WorkerPanic);
+            }
+            prepared_sequence = Some(sequence);
         }
         if let Ok(status) = pcm.status() {
             let delay = status.get_delay();
@@ -1743,6 +2493,9 @@ fn playback_worker_loop(
         control
             .timeline
             .record_pro_playback_write(sequence, monotonic_nanos());
+        let samples = output_scratch
+            .as_deref()
+            .map_or(config.silence, |scratch| &scratch[..config.period_samples]);
         let write_started = Instant::now();
         let write_result = write_playback_samples(
             pcm,
@@ -1758,6 +2511,8 @@ fn playback_worker_loop(
             Ok(written) if written == config.period => {
                 position = position.wrapping_add(config.period as u64);
                 sequence = sequence.wrapping_add(1);
+                successful_periods = successful_periods.saturating_add(1);
+                announced_sequence = None;
                 prepared_sequence = None;
                 if let Some(clock) = pro_clock {
                     clock.publish(pro_target_sequence(sequence, config.sequence_lead));
@@ -1775,12 +2530,12 @@ fn playback_worker_loop(
                 control.done.store(true, Ordering::Release);
                 return Err(error);
             }
-            Err(error) if error.is_xrun() => {
-                if let Err(error) = recover_stream(
+            Err(error) if error.is_recoverable() => {
+                match recover_stream(
                     pcm,
                     StreamDirection::Playback,
                     &error,
-                    control.timeline,
+                    control,
                     Some((
                         config.silence,
                         config.channels,
@@ -1788,8 +2543,15 @@ fn playback_worker_loop(
                         config.start_frames,
                     )),
                 ) {
-                    control.done.store(true, Ordering::Release);
-                    return Err(error);
+                    Ok(()) => {}
+                    Err(error) if error.is_stopped() => {
+                        control.done.store(true, Ordering::Release);
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        control.done.store(true, Ordering::Release);
+                        return Err(error);
+                    }
                 }
             }
             Err(error) if error.is_stopped() => {
@@ -1804,6 +2566,10 @@ fn playback_worker_loop(
     }
 }
 
+fn period_limit_reached(successful_periods: u64, max_periods: Option<u64>) -> bool {
+    max_periods.is_some_and(|limit| successful_periods >= limit)
+}
+
 fn capture_worker(
     pcm: PCM,
     scratch: &mut [i32],
@@ -1812,12 +2578,16 @@ fn capture_worker(
     pro_clock: Option<&ProClock>,
     capture_sink: Option<&mut dyn ProCaptureSink>,
 ) -> (PCM, Result<(), EngineError>) {
-    if let Some(priority) = config.realtime_priority
-        && let Err(error) = set_current_realtime(priority)
-    {
-        control.done.store(true, Ordering::Release);
-        return (pcm, Err(error));
-    }
+    let _scheduling = match config.realtime_priority {
+        Some(priority) => match RealtimeGuard::enter(priority, "set worker SCHED_FIFO") {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                control.done.store(true, Ordering::Release);
+                return (pcm, Err(error));
+            }
+        },
+        None => None,
+    };
     if let Some(gate) = control.start_gate {
         gate.capture_ready.store(true, Ordering::Release);
         while !gate.playback_ready.load(Ordering::Acquire) {
@@ -1863,6 +2633,7 @@ fn capture_worker_loop(
     mut capture_sink: Option<&mut dyn ProCaptureSink>,
 ) -> Result<(), EngineError> {
     let mut position = 0_u64;
+    let mut hardware_sequence = 0_u64;
     let mut next_pro_sequence = config.initial_pro_sequence;
     let mut pro_generation = control.timeline.generation();
     loop {
@@ -1887,27 +2658,13 @@ fn capture_worker_loop(
                         config.period as u64,
                     );
                 }
+                if control.should_stop() {
+                    control.done.store(true, Ordering::Release);
+                    return Ok(());
+                }
                 if let (Some(clock), Some(sink)) = (pro_clock, capture_sink.as_deref_mut()) {
-                    let clock_wait_started = Instant::now();
-                    let (current_generation, rebase_target) = match wait_for_pro_capture_target(
-                        next_pro_sequence,
-                        control.timeline,
-                        clock,
-                        control,
-                    ) {
-                        Ok(Some(target)) => target,
-                        Ok(None) => {
-                            control.done.store(true, Ordering::Release);
-                            return Ok(());
-                        }
-                        Err(error) => {
-                            control.done.store(true, Ordering::Release);
-                            return Err(error);
-                        }
-                    };
-                    control
-                        .timeline
-                        .record_capture_clock_wait(duration_nanos(clock_wait_started.elapsed()));
+                    let (current_generation, rebase_target) =
+                        observe_pro_capture_target(control.timeline, clock);
                     let sequence = take_pro_capture_sequence(
                         &mut next_pro_sequence,
                         &mut pro_generation,
@@ -1918,7 +2675,8 @@ fn capture_worker_loop(
                         .timeline
                         .record_pro_capture_read(sequence, capture_read_nanos);
                     if catch_unwind(AssertUnwindSafe(|| {
-                        sink.process_capture(sequence, scratch);
+                        sink.process_capture_for_playback(hardware_sequence, sequence, scratch);
+                        sink.process_deferred_capture(hardware_sequence, scratch);
                     }))
                     .is_err()
                     {
@@ -1926,6 +2684,7 @@ fn capture_worker_loop(
                         return Err(EngineError::WorkerPanic);
                     }
                 }
+                hardware_sequence = hardware_sequence.wrapping_add(1);
                 position = position.wrapping_add(config.period as u64);
                 control.timeline.update_capture_position(position);
                 control.mark_capture_cycle_ready();
@@ -1939,16 +2698,17 @@ fn capture_worker_loop(
                 control.done.store(true, Ordering::Release);
                 return Err(error);
             }
-            Err(error) if error.is_xrun() => {
-                if let Err(error) = recover_stream(
-                    pcm,
-                    StreamDirection::Capture,
-                    &error,
-                    control.timeline,
-                    None,
-                ) {
-                    control.done.store(true, Ordering::Release);
-                    return Err(error);
+            Err(error) if error.is_recoverable() => {
+                match recover_stream(pcm, StreamDirection::Capture, &error, control, None) {
+                    Ok(()) => {}
+                    Err(error) if error.is_stopped() => {
+                        control.done.store(true, Ordering::Release);
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        control.done.store(true, Ordering::Release);
+                        return Err(error);
+                    }
                 }
             }
             Err(error) if error.is_stopped() => {
@@ -1988,39 +2748,8 @@ fn align_sequence_forward(next: &mut u64, target: u64) {
     }
 }
 
-fn stable_rebase_target(timeline: &HardwareTimeline, clock: &ProClock) -> (u64, u64) {
-    loop {
-        let generation = timeline.generation();
-        let target = clock.load();
-        if generation == timeline.generation() {
-            return (generation, target);
-        }
-    }
-}
-
-fn wait_for_pro_capture_target(
-    next: u64,
-    timeline: &HardwareTimeline,
-    clock: &ProClock,
-    control: WorkerControl<'_>,
-) -> Result<Option<(u64, u64)>, EngineError> {
-    loop {
-        let epoch = clock.epoch.load(Ordering::Acquire);
-        let target = stable_rebase_target(timeline, clock);
-        if pro_capture_target_ready(next, target.1) {
-            return Ok(Some(target));
-        }
-        if control.stop.load(Ordering::Relaxed) || control.done.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        clock
-            .wait_for_publish(epoch)
-            .map_err(EngineError::ClockWait)?;
-    }
-}
-
-fn pro_capture_target_ready(next: u64, target: u64) -> bool {
-    next == target || sequence_before(next, target)
+fn observe_pro_capture_target(timeline: &HardwareTimeline, clock: &ProClock) -> (u64, u64) {
+    (timeline.generation(), clock.load())
 }
 
 fn sequence_before(sequence: u64, target: u64) -> bool {
@@ -2164,11 +2893,23 @@ fn wait_for_playback_target(
         }
         let remaining = target_avail - available;
         let sleep = playback_target_sleep(remaining, rate, prewake_nanos);
-        if sleep.is_zero() {
-            hint::spin_loop();
-        } else {
-            std::thread::sleep(sleep);
+        std::thread::sleep(sleep);
+    }
+}
+
+fn wait_for_handoff_target(
+    target_nanos: u64,
+    control: WorkerControl<'_>,
+) -> Result<(), EngineError> {
+    loop {
+        if control.stop.load(Ordering::Relaxed) || control.done.load(Ordering::Acquire) {
+            return Err(EngineError::Stopped);
         }
+        let remaining = target_nanos.saturating_sub(monotonic_nanos());
+        if remaining == 0 {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_nanos(remaining));
     }
 }
 
@@ -2193,70 +2934,57 @@ fn monotonic_nanos() -> u64 {
 fn playback_target_sleep(remaining: alsa::pcm::Frames, rate: u32, prewake_nanos: u64) -> Duration {
     let frames = u64::try_from(remaining).unwrap_or(0);
     let nanos = frames.saturating_mul(1_000_000_000) / u64::from(rate);
-    Duration::from_nanos(nanos.saturating_sub(prewake_nanos))
-}
-
-fn linked_pro_wait_budget(deadline: Instant, now: Instant) -> Duration {
-    deadline.saturating_duration_since(now)
-}
-
-fn playback_preparation_budget(
-    pcm: &PCM,
-    buffer: alsa::pcm::Frames,
-    guard_frames: alsa::pcm::Frames,
-    period: alsa::pcm::Frames,
-    rate: u32,
-) -> Result<Duration, EngineError> {
-    let target_avail = buffer - guard_frames;
-    let available = alsa_call(
-        pcm.avail_update(),
-        "update playback preparation availability",
-        StreamDirection::Playback,
-    )?;
-    let budget_frames = preparation_budget_frames(available, target_avail, period);
-    Ok(Duration::from_nanos(
-        budget_frames.saturating_mul(1_000_000_000) / u64::from(rate),
-    ))
-}
-
-fn preparation_budget_frames(
-    available: alsa::pcm::Frames,
-    target_avail: alsa::pcm::Frames,
-    period: alsa::pcm::Frames,
-) -> u64 {
-    let remaining = target_avail.saturating_sub(available);
-    let reserve = (period / 4).max(1);
-    u64::try_from(remaining.saturating_sub(reserve)).unwrap_or(0)
+    Duration::from_nanos(nanos.saturating_sub(prewake_nanos).max(1_000))
 }
 
 fn linked_start_frames(
     period: alsa::pcm::Frames,
-    hardware_period: alsa::pcm::Frames,
+    guard_frames: alsa::pcm::Frames,
     buffer: alsa::pcm::Frames,
     rate: u32,
+    handoff_nanos: u64,
 ) -> alsa::pcm::Frames {
-    let handoff_frames = LINKED_PRO_HANDOFF_NANOS
+    let handoff_frames = handoff_nanos
         .saturating_mul(u64::from(rate))
         .div_ceil(1_000_000_000);
-    let headroom = alsa::pcm::Frames::try_from(handoff_frames).unwrap_or(alsa::pcm::Frames::MAX);
+    let handoff_reserve =
+        alsa::pcm::Frames::try_from(handoff_frames).unwrap_or(alsa::pcm::Frames::MAX);
     buffer.min(
         period
-            .saturating_add(hardware_period)
-            .saturating_add(headroom),
+            .saturating_add(guard_frames)
+            .saturating_add(handoff_reserve),
     )
 }
 
-fn linked_playback_floor(hardware_period: alsa::pcm::Frames) -> alsa::pcm::Frames {
-    hardware_period.max(1)
+fn linked_zero_lead_playback_floor(
+    guard_frames: alsa::pcm::Frames,
+    hardware_period: alsa::pcm::Frames,
+    buffer: alsa::pcm::Frames,
+    write_frames: alsa::pcm::Frames,
+) -> alsa::pcm::Frames {
+    // Reserve one period for ALSA availability granularity and one while the
+    // USB driver advances its next playback transfer.
+    buffer
+        .saturating_sub(write_frames)
+        .min(guard_frames.saturating_add(hardware_period.saturating_mul(2)))
+}
+
+fn linked_ahead_start_frames(
+    period: alsa::pcm::Frames,
+    hardware_period: alsa::pcm::Frames,
+    buffer: alsa::pcm::Frames,
+) -> alsa::pcm::Frames {
+    buffer.min(period.saturating_add(hardware_period))
 }
 
 fn rebase_linked_streams(
     playback_pcm: &PCM,
     capture_pcm: &PCM,
-    timeline: &HardwareTimeline,
+    control: WorkerControl<'_>,
     config: LinkedProConfig<'_>,
     dither_frames: alsa::pcm::Frames,
 ) -> Result<(), EngineError> {
+    control.ensure_running()?;
     alsa_call(
         playback_pcm.unlink(),
         "unlink duplex streams for phase rebase",
@@ -2283,12 +3011,13 @@ fn rebase_linked_streams(
         StreamDirection::Playback,
     )?;
 
+    control.ensure_running()?;
     let written = write_playback_samples(
         playback_pcm,
         config.playback_silence,
         config.playback_channels,
         config.start_samples,
-        None,
+        Some(control),
     )?;
     if written != config.start_frames {
         return Err(EngineError::ShortCommit {
@@ -2297,18 +3026,20 @@ fn rebase_linked_streams(
             required: config.start_frames,
         });
     }
+    control.ensure_running()?;
     alsa_call(
         playback_pcm.link(capture_pcm),
         "relink duplex streams for phase rebase",
         StreamDirection::Playback,
     )?;
     sleep_for_frames(dither_frames, config.rate);
+    control.ensure_running()?;
     alsa_call(
         playback_pcm.start(),
         "restart linked duplex streams after phase rebase",
         StreamDirection::Playback,
     )?;
-    timeline.reset_after_hardware_rebase();
+    control.timeline.reset_after_hardware_rebase();
     Ok(())
 }
 
@@ -2325,44 +3056,51 @@ fn sleep_for_frames(frames: alsa::pcm::Frames, rate: u32) {
 fn recover_linked_streams(
     playback_pcm: &PCM,
     capture_pcm: &PCM,
-    direction: StreamDirection,
-    timeline: &HardwareTimeline,
+    error: &EngineError,
+    control: WorkerControl<'_>,
     config: LinkedProConfig<'_>,
     dither_frames: alsa::pcm::Frames,
 ) -> Result<(), EngineError> {
-    timeline.record_hardware_xrun(direction);
+    let direction = error
+        .recovery_direction()
+        .unwrap_or(StreamDirection::Playback);
+    if error.is_xrun() {
+        control.timeline.record_hardware_xrun(direction);
+    }
+    control.ensure_running()?;
     alsa_call(
         playback_pcm.unlink(),
-        "unlink duplex streams after XRUN",
+        "unlink duplex streams after stream failure",
         StreamDirection::Playback,
     )?;
     alsa_call(
         capture_pcm.drop(),
-        "stop capture stream after XRUN",
+        "stop capture stream after stream failure",
         StreamDirection::Capture,
     )?;
     alsa_call(
         playback_pcm.drop(),
-        "stop playback stream after XRUN",
+        "stop playback stream after stream failure",
         StreamDirection::Playback,
     )?;
     alsa_call(
         capture_pcm.prepare(),
-        "prepare capture stream after XRUN",
+        "prepare capture stream after stream failure",
         StreamDirection::Capture,
     )?;
     alsa_call(
         playback_pcm.prepare(),
-        "prepare playback stream after XRUN",
+        "prepare playback stream after stream failure",
         StreamDirection::Playback,
     )?;
 
+    control.ensure_running()?;
     let written = write_playback_samples(
         playback_pcm,
         config.playback_silence,
         config.playback_channels,
         config.start_samples,
-        None,
+        Some(control),
     )?;
     if written != config.start_frames {
         return Err(EngineError::ShortCommit {
@@ -2371,37 +3109,36 @@ fn recover_linked_streams(
             required: config.start_frames,
         });
     }
+    control.ensure_running()?;
     alsa_call(
         playback_pcm.link(capture_pcm),
-        "relink duplex streams after XRUN",
+        "relink duplex streams after stream failure",
         StreamDirection::Playback,
     )?;
     sleep_for_frames(dither_frames, config.rate);
+    control.ensure_running()?;
     alsa_call(
         playback_pcm.start(),
-        "restart linked duplex streams after XRUN",
+        "restart linked duplex streams after stream failure",
         StreamDirection::Playback,
     )?;
-    timeline.reset_after_hardware_xrun();
+    if error.is_xrun() {
+        control.timeline.reset_after_hardware_xrun();
+    } else {
+        control.timeline.reset_after_hardware_restart();
+    }
     Ok(())
 }
 
 fn recover_and_calibrate_linked_streams(
     playback_pcm: &PCM,
     capture_pcm: &PCM,
-    direction: StreamDirection,
+    error: &EngineError,
     capture_scratch: &mut [i32],
     config: LinkedProConfig<'_>,
     control: WorkerControl<'_>,
 ) -> Result<(), EngineError> {
-    recover_linked_streams(
-        playback_pcm,
-        capture_pcm,
-        direction,
-        control.timeline,
-        config,
-        0,
-    )?;
+    recover_linked_streams(playback_pcm, capture_pcm, error, control, config, 0)?;
     calibrate_linked_phase(playback_pcm, capture_pcm, capture_scratch, config, control)
 }
 
@@ -2409,16 +3146,22 @@ fn recover_stream(
     pcm: &PCM,
     direction: StreamDirection,
     error: &EngineError,
-    timeline: &HardwareTimeline,
+    control: WorkerControl<'_>,
     playback: Option<(&[i32], usize, usize, alsa::pcm::Frames)>,
 ) -> Result<(), EngineError> {
     let errno = error.errno().unwrap_or(libc::EPIPE);
-    timeline.record_hardware_xrun(direction);
-    alsa_call(pcm.recover(errno, true), "recover stream XRUN", direction)?;
+    if error.is_xrun() {
+        control.timeline.record_hardware_xrun(direction);
+    }
+    control.ensure_running()?;
+    alsa_call(pcm.recover(errno, true), "recover failed stream", direction)?;
+    control.ensure_running()?;
 
-    if pcm.state() != State::Running {
+    let restarted = if pcm.state() != State::Running {
         if let Some((silence, channels, buffer_samples, buffer)) = playback {
-            let written = write_playback_samples(pcm, silence, channels, buffer_samples, None)?;
+            control.ensure_running()?;
+            let written =
+                write_playback_samples(pcm, silence, channels, buffer_samples, Some(control))?;
             if written != buffer {
                 return Err(EngineError::ShortCommit {
                     direction: StreamDirection::Playback,
@@ -2427,9 +3170,17 @@ fn recover_stream(
                 });
             }
         }
-        alsa_call(pcm.start(), "restart stream after XRUN", direction)?;
+        control.ensure_running()?;
+        alsa_call(pcm.start(), "restart recovered stream", direction)?;
+        true
+    } else {
+        false
+    };
+    if error.is_xrun() {
+        control.timeline.reset_after_hardware_xrun();
+    } else if restarted {
+        control.timeline.reset_after_hardware_restart();
     }
-    timeline.reset_after_hardware_xrun();
     Ok(())
 }
 
@@ -2638,20 +3389,22 @@ fn alsa_call<T>(
     operation: &'static str,
     direction: StreamDirection,
 ) -> Result<T, EngineError> {
-    result.map_err(|source| {
-        if source.errno() == libc::EPIPE || source.errno() == libc::ESTRPIPE {
-            EngineError::Xrun {
-                operation,
-                direction,
-                source,
-            }
-        } else {
-            EngineError::Alsa {
-                operation,
-                direction,
-                source,
-            }
-        }
+    result.map_err(|source| match source.errno() {
+        libc::EPIPE => EngineError::Xrun {
+            operation,
+            direction,
+            source,
+        },
+        libc::ESTRPIPE => EngineError::Suspended {
+            operation,
+            direction,
+            source,
+        },
+        _ => EngineError::Alsa {
+            operation,
+            direction,
+            source,
+        },
     })
 }
 
@@ -2660,20 +3413,24 @@ impl EngineError {
         matches!(self, Self::Xrun { .. })
     }
 
+    fn is_recoverable(&self) -> bool {
+        matches!(self, Self::Xrun { .. } | Self::Suspended { .. })
+    }
+
     fn is_stopped(&self) -> bool {
         matches!(self, Self::Stopped)
     }
 
     fn errno(&self) -> Option<i32> {
         match self {
-            Self::Xrun { source, .. } => Some(source.errno()),
+            Self::Xrun { source, .. } | Self::Suspended { source, .. } => Some(source.errno()),
             _ => None,
         }
     }
 
-    fn xrun_direction(&self) -> Option<StreamDirection> {
+    fn recovery_direction(&self) -> Option<StreamDirection> {
         match self {
-            Self::Xrun { direction, .. } => Some(*direction),
+            Self::Xrun { direction, .. } | Self::Suspended { direction, .. } => Some(*direction),
             _ => None,
         }
     }
@@ -2682,16 +3439,18 @@ impl EngineError {
 #[cfg(test)]
 mod tests {
     use super::{
-        WorkerControl, align_sequence_forward, linked_phase_dither_frames, linked_phase_prediction,
-        linked_phase_score, linked_phase_target_nanos, linked_playback_floor,
-        linked_pro_wait_budget, linked_start_frames, playback_startup_priority,
-        playback_target_sleep, preparation_budget_frames, pro_capture_target_ready,
-        pro_target_sequence, take_pro_capture_sequence,
+        EngineError, PendingProCapture, ProClock, StreamDirection, WorkerControl,
+        align_sequence_forward, alsa_call, linked_ahead_start_frames, linked_phase_dither_frames,
+        linked_phase_prediction, linked_phase_score, linked_phase_target_nanos,
+        linked_start_frames, linked_zero_lead_playback_floor, observe_pro_capture_target,
+        period_limit_reached, playback_startup_priority, playback_target_sleep,
+        pro_target_sequence, staged_playback_chunk_before_capture, take_pending_pro_capture,
+        take_pro_capture_sequence, uses_staged_packet_cycle,
     };
     use crate::HardwareTimeline;
     use std::{
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
-        time::{Duration, Instant},
+        time::Duration,
     };
 
     #[test]
@@ -2700,6 +3459,21 @@ mod tests {
         assert_eq!(pro_target_sequence(4, 1), 5);
         assert_eq!(pro_target_sequence(9, 1), 10);
         assert_eq!(pro_target_sequence(u64::MAX, 1), 0);
+    }
+
+    #[test]
+    fn handoff_target_is_consumed_only_by_its_exact_playback_sequence() {
+        let target = PendingProCapture {
+            hardware_sequence: u64::MAX,
+            playback_sequence: 0,
+            target_nanos: 250,
+        };
+        let mut pending = Some(target);
+
+        assert_eq!(take_pending_pro_capture(&mut pending, u64::MAX), None);
+        assert_eq!(pending, Some(target));
+        assert_eq!(take_pending_pro_capture(&mut pending, 0), Some(target));
+        assert_eq!(pending, None);
     }
 
     #[test]
@@ -2752,19 +3526,83 @@ mod tests {
     }
 
     #[test]
-    fn capture_waits_for_a_unique_playback_target() {
-        assert!(!pro_capture_target_ready(2, 1));
-        assert!(pro_capture_target_ready(2, 2));
-        assert!(pro_capture_target_ready(2, 3));
-        assert!(pro_capture_target_ready(u64::MAX, 0));
+    fn capture_advances_locally_when_playback_clock_lags() {
+        let mut next = 2;
+        let mut generation = 0;
+
+        assert_eq!(
+            take_pro_capture_sequence(&mut next, &mut generation, 0, 1),
+            2
+        );
+        assert_eq!(
+            take_pro_capture_sequence(&mut next, &mut generation, 0, 1),
+            3
+        );
+        assert_eq!(
+            take_pro_capture_sequence(&mut next, &mut generation, 0, 6),
+            6
+        );
     }
 
     #[test]
-    fn preparation_budget_never_consumes_hardware_reserve() {
-        assert_eq!(preparation_budget_frames(64, 128, 64), 48);
-        assert_eq!(preparation_budget_frames(112, 128, 64), 0);
-        assert_eq!(preparation_budget_frames(128, 128, 64), 0);
-        assert_eq!(preparation_budget_frames(160, 128, 64), 0);
+    fn capture_observes_playback_clock_without_waiting_for_publish() {
+        let timeline = HardwareTimeline::default();
+        let clock = ProClock::new(4);
+
+        assert_eq!(observe_pro_capture_target(&timeline, &clock), (0, 4));
+        clock.publish(5);
+        assert_eq!(observe_pro_capture_target(&timeline, &clock), (0, 5));
+    }
+
+    #[test]
+    fn finite_period_limit_uses_local_success_count() {
+        assert!(!period_limit_reached(0, Some(2)));
+        assert!(!period_limit_reached(1, Some(2)));
+        assert!(period_limit_reached(2, Some(2)));
+        assert!(!period_limit_reached(u64::MAX, None));
+    }
+
+    #[test]
+    fn alsa_suspend_is_recoverable_but_not_an_xrun() {
+        let xrun = alsa_call::<()>(
+            Err(alsa::Error::new("test", libc::EPIPE)),
+            "test operation",
+            StreamDirection::Playback,
+        )
+        .unwrap_err();
+        let suspended = alsa_call::<()>(
+            Err(alsa::Error::new("test", libc::ESTRPIPE)),
+            "test operation",
+            StreamDirection::Capture,
+        )
+        .unwrap_err();
+
+        assert!(matches!(xrun, EngineError::Xrun { .. }));
+        assert!(xrun.is_xrun());
+        assert!(xrun.is_recoverable());
+        assert!(matches!(suspended, EngineError::Suspended { .. }));
+        assert!(!suspended.is_xrun());
+        assert!(suspended.is_recoverable());
+    }
+
+    #[test]
+    fn worker_control_reports_shutdown_before_recovery_work() {
+        let timeline = HardwareTimeline::default();
+        let stop = AtomicBool::new(true);
+        let done = AtomicBool::new(false);
+        let control = WorkerControl {
+            timeline: &timeline,
+            stop: &stop,
+            done: &done,
+            start_gate: None,
+            hardware_ready: None,
+            capture_cycle_generation: None,
+        };
+
+        assert!(matches!(
+            control.ensure_running(),
+            Err(EngineError::Stopped)
+        ));
     }
 
     #[test]
@@ -2777,25 +3615,9 @@ mod tests {
             playback_target_sleep(12, 48_000, 0),
             Duration::from_micros(250)
         );
-        assert_eq!(playback_target_sleep(2, 48_000, 50_000), Duration::ZERO);
-    }
-
-    #[test]
-    fn linked_pro_handoff_uses_only_remaining_budget() {
-        let started = Instant::now();
-        let deadline = started + Duration::from_micros(250);
         assert_eq!(
-            linked_pro_wait_budget(deadline, started),
-            Duration::from_micros(250)
-        );
-        assert_eq!(
-            linked_pro_wait_budget(deadline, started + Duration::from_micros(100)),
-            Duration::from_micros(150)
-        );
-        assert_eq!(linked_pro_wait_budget(deadline, deadline), Duration::ZERO);
-        assert_eq!(
-            linked_pro_wait_budget(deadline, deadline + Duration::from_micros(50)),
-            Duration::ZERO
+            playback_target_sleep(2, 48_000, 50_000),
+            Duration::from_micros(1)
         );
     }
 
@@ -2808,16 +3630,39 @@ mod tests {
     }
 
     #[test]
-    fn linked_start_primes_one_period_plus_physical_headroom() {
-        assert_eq!(linked_start_frames(64, 32, 192, 48_000), 108);
-        assert_eq!(linked_start_frames(64, 64, 192, 48_000), 140);
-        assert_eq!(linked_start_frames(64, 32, 128, 48_000), 108);
+    fn linked_start_primes_period_guard_and_handoff() {
+        assert_eq!(linked_start_frames(64, 32, 192, 48_000, 250_000), 108);
+        assert_eq!(linked_start_frames(64, 64, 192, 48_000, 250_000), 140);
+        assert_eq!(linked_start_frames(64, 32, 128, 48_000, 250_000), 108);
+        assert_eq!(linked_start_frames(64, 32, 192, 48_000, 500_000), 120);
     }
 
     #[test]
-    fn linked_playback_keeps_one_physical_period_in_alsa() {
-        assert_eq!(linked_playback_floor(32), 32);
-        assert_eq!(linked_playback_floor(1), 1);
+    fn zero_lead_refill_accounts_for_hardware_availability_granularity() {
+        let playback_floor = linked_zero_lead_playback_floor(32, 32, 192, 64);
+        assert_eq!(playback_floor, 96);
+        assert_eq!(
+            linked_start_frames(64, playback_floor, 192, 48_000, 250_000),
+            172
+        );
+        assert_eq!(linked_zero_lead_playback_floor(32, 32, 128, 64), 64);
+        assert_eq!(linked_zero_lead_playback_floor(64, 32, 192, 64), 128);
+    }
+
+    #[test]
+    fn linked_process_ahead_primes_one_logical_and_one_physical_period() {
+        assert_eq!(linked_ahead_start_frames(64, 32, 192), 96);
+        assert_eq!(linked_ahead_start_frames(64, 32, 80), 80);
+    }
+
+    #[test]
+    fn staged_packet_order_carries_final_chunk_into_next_cycle() {
+        assert!(uses_staged_packet_cycle(1, 64, 32));
+        assert!(!uses_staged_packet_cycle(0, 64, 32));
+        assert!(!uses_staged_packet_cycle(1, 64, 64));
+        assert_eq!(staged_playback_chunk_before_capture(0), None);
+        assert_eq!(staged_playback_chunk_before_capture(1), Some(0));
+        assert_eq!(staged_playback_chunk_before_capture(2), Some(1));
     }
 
     #[test]
@@ -2832,10 +3677,26 @@ mod tests {
 
     #[test]
     fn linked_phase_predicts_runtime_wait_without_draining_hardware() {
-        assert_eq!(linked_phase_prediction(32, 32, 32, 48_000), (83_333, 0));
-        assert_eq!(linked_phase_prediction(44, 32, 32, 48_000), (333_333, 28));
-        assert_eq!(linked_phase_prediction(45, 32, 32, 48_000), (354_166, 28));
-        assert_eq!(linked_phase_prediction(20, 32, 32, 48_000), (83_333, 0));
+        assert_eq!(
+            linked_phase_prediction(32, 32, 32, 48_000, 250_000),
+            (83_333, 0)
+        );
+        assert_eq!(
+            linked_phase_prediction(44, 32, 32, 48_000, 250_000),
+            (333_333, 28)
+        );
+        assert_eq!(
+            linked_phase_prediction(45, 32, 32, 48_000, 250_000),
+            (354_166, 28)
+        );
+        assert_eq!(
+            linked_phase_prediction(20, 32, 32, 48_000, 250_000),
+            (83_333, 0)
+        );
+        assert_eq!(
+            linked_phase_prediction(56, 32, 32, 48_000, 500_000),
+            (583_333, 28)
+        );
     }
 
     #[test]

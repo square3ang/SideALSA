@@ -58,7 +58,8 @@ Current Topping E1x2 checks passed with raw S32_LE streams:
 Unit tests cover the ioplug buffer minimum and interleaved S32_LE area copies.
 SHARED playback also realigns its sequence after a late callback. If PipeWire
 has no catch-up block, one missing sequence becomes one daemon underrun; the
-next block resumes at the configured lookahead instead of remaining late.
+endpoint then disarms until the next valid block resumes at the configured
+lookahead. A paused endpoint does not increment the counter every period.
 
 ## Limitations
 
@@ -68,6 +69,6 @@ next block resumes at the configured lookahead instead of remaining late.
   arbitrary ALSA transfer sizes are accepted up to the configured client buffer.
 - No resampling, format conversion, mmap access, or PipeWire-specific code.
 - Current ioplug client buffer is at least two periods because ALSA ioplug
-  rejects a one-period client buffer. The E1x2 profile uses three periods
-  (`64/192`) to give PipeWire enough scheduling margin; this client-side
-  constraint matches the configured physical hardware buffer.
+  rejects a one-period client buffer. The E1x2 SHARED profile negotiates four to
+  eight periods (`256` to `512` frames) independently of the physical B192
+  hardware queue.

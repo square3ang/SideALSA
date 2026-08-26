@@ -15,7 +15,7 @@ set(SIDEALSA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 set(CARGO_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/cargo-target")
 set(RUST_PROFILE debug)
 set(CARGO_PROFILE_ARGS)
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
+if(CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$")
     set(RUST_PROFILE release)
     set(CARGO_PROFILE_ARGS --release)
 endif()
@@ -29,6 +29,8 @@ set(RUST_SOURCES
 set(DLL_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/sidealsa-asio64.dll")
 set(UNIX_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/sidealsa-asio64.dll.so")
 set(PROBE_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/sidealsa-asio-probe.exe")
+set(LOOPBACK_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/sidealsa-asio-loopback-test.exe")
+set(LIFECYCLE_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/sidealsa-asio-lifecycle-probe.exe")
 set(WINE_WINDOWS_OUTPUT
     "${CMAKE_CURRENT_BINARY_DIR}/x86_64-windows/sidealsa-asio64.dll")
 set(WINE_UNIX_OUTPUT
@@ -77,7 +79,7 @@ add_custom_command(
 
 add_custom_command(
     OUTPUT "${UNIX_OUTPUT}"
-    COMMAND "${WINEGCC_EXECUTABLE}" -shared
+    COMMAND "${WINEGCC_EXECUTABLE}" -m64 -shared
             "${CMAKE_CURRENT_SOURCE_DIR}/sidealsa-asio64.dll.spec"
             $<TARGET_OBJECTS:sidealsa-asio-shim>
             "${RUST_LIBRARY}"
@@ -109,15 +111,16 @@ add_custom_command(
     COMMAND "${CMAKE_COMMAND}" -E create_symlink
             "../sidealsa-asio64.dll.so" "${WINE_UNIX_OUTPUT}"
     COMMAND "${CMAKE_COMMAND}" -E create_symlink
-            "../sidealsa-asio64.dll" "${WINE_WINDOWS_ALIAS}"
+            "sidealsa-asio64.dll" "${WINE_WINDOWS_ALIAS}"
     COMMAND "${CMAKE_COMMAND}" -E create_symlink
-            "../sidealsa-asio64.dll.so" "${WINE_UNIX_ALIAS}"
+            "sidealsa-asio64.dll.so" "${WINE_UNIX_ALIAS}"
     DEPENDS "${DLL_OUTPUT}" "${UNIX_OUTPUT}"
     VERBATIM
 )
 
 add_custom_target(sidealsa-asio-runtime-layout
-    DEPENDS "${WINE_WINDOWS_OUTPUT}" "${WINE_UNIX_OUTPUT}")
+    DEPENDS "${WINE_WINDOWS_OUTPUT}" "${WINE_UNIX_OUTPUT}"
+            "${WINE_WINDOWS_ALIAS}" "${WINE_UNIX_ALIAS}")
 add_dependencies(sidealsa-asio sidealsa-asio-runtime-layout)
 
 add_custom_command(
@@ -133,5 +136,35 @@ add_custom_command(
 add_custom_target(sidealsa-asio-probe DEPENDS "${PROBE_OUTPUT}")
 add_dependencies(sidealsa-asio-probe sidealsa-asio-runtime-layout)
 
+add_custom_command(
+    OUTPUT "${LOOPBACK_OUTPUT}" "${LOOPBACK_OUTPUT}.so"
+    COMMAND "${WINEGCC_EXECUTABLE}" -m64
+            -DSIDEALSA_ASIO_LOOPBACK_DEFAULT=1
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/asio_probe.c"
+            -lole32 -luuid
+            -o "${LOOPBACK_OUTPUT}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/asio_probe.c"
+    VERBATIM
+)
+
+add_custom_target(sidealsa-asio-loopback-test DEPENDS "${LOOPBACK_OUTPUT}")
+add_dependencies(sidealsa-asio-loopback-test sidealsa-asio-runtime-layout)
+
+add_custom_command(
+    OUTPUT "${LIFECYCLE_OUTPUT}" "${LIFECYCLE_OUTPUT}.so"
+    COMMAND "${WINEGCC_EXECUTABLE}" -m64
+            -DSIDEALSA_ASIO_LIFECYCLE_DEFAULT=1
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/asio_probe.c"
+            -lole32 -luuid
+            -o "${LIFECYCLE_OUTPUT}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/asio_probe.c"
+    VERBATIM
+)
+
+add_custom_target(sidealsa-asio-lifecycle-probe DEPENDS "${LIFECYCLE_OUTPUT}")
+add_dependencies(sidealsa-asio-lifecycle-probe sidealsa-asio-runtime-layout)
+
 install(FILES "${DLL_OUTPUT}" DESTINATION lib/wine/x86_64-windows)
 install(FILES "${UNIX_OUTPUT}" DESTINATION lib/wine/x86_64-unix)
+install(FILES "${WINE_WINDOWS_ALIAS}" DESTINATION lib/wine/x86_64-windows)
+install(FILES "${WINE_UNIX_ALIAS}" DESTINATION lib/wine/x86_64-unix)

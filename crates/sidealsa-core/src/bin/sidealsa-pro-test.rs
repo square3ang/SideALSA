@@ -2,7 +2,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use sidealsa_core::{DuplexEngine, ProCaptureSink, ProPlaybackSource, Profile};
@@ -35,7 +35,7 @@ impl ProCaptureSink for FakeCapture {
 struct FakePlayback;
 
 impl ProPlaybackSource for FakePlayback {
-    fn process_playback(&mut self, _sequence: u64, playback: &mut [i32], _deadline: Instant) {
+    fn process_playback(&mut self, _sequence: u64, playback: &mut [i32]) {
         playback.fill(0);
     }
 }

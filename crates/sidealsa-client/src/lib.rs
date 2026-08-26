@@ -1,19 +1,20 @@
 mod shared;
 
-pub use shared::{SharedError, SharedRegion};
+pub use shared::{PlaybackConsume, SharedError, SharedRegion};
 
 use std::{
-    io,
+    io::{self, Read},
     mem::size_of,
-    os::fd::{AsRawFd, RawFd},
+    net::Shutdown,
+    os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
     os::unix::net::UnixStream,
     path::Path,
     time::{Duration, Instant},
 };
 
 use sidealsa_protocol::{
-    DeviceInfo, ErrorCode, PROTOCOL_VERSION, PortDirection, ProtocolError, Request, Response,
-    SHARED_CLIENT_IDLE, SharedRegionInfo, Stats, write_request,
+    DeviceInfo, ErrorCode, MAX_FRAME_PAYLOAD, PROTOCOL_MAGIC, PROTOCOL_VERSION, PortDirection,
+    ProtocolError, Request, Response, SHARED_CLIENT_IDLE, SharedRegionInfo, Stats, write_request,
 };
 use thiserror::Error;
 
@@ -62,7 +63,20 @@ pub struct SideAlsaClient {
 
 impl SideAlsaClient {
     pub fn connect(path: impl AsRef<Path>) -> Result<Self, ClientError> {
+        Self::connect_inner(path.as_ref(), None)
+    }
+
+    pub fn connect_with_timeout(
+        path: impl AsRef<Path>,
+        timeout: Duration,
+    ) -> Result<Self, ClientError> {
+        Self::connect_inner(path.as_ref(), Some(timeout))
+    }
+
+    fn connect_inner(path: &Path, timeout: Option<Duration>) -> Result<Self, ClientError> {
         let mut control = UnixStream::connect(path)?;
+        control.set_read_timeout(timeout)?;
+        control.set_write_timeout(timeout)?;
         write_request(
             &mut control,
             &Request::Hello {
@@ -82,6 +96,29 @@ impl SideAlsaClient {
 
     pub fn features(&self) -> u32 {
         self.features
+    }
+
+    pub fn peer_pid(&self) -> Result<u32, ClientError> {
+        let mut credentials = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut length = size_of::<libc::ucred>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                self.control.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut credentials as *mut libc::ucred).cast(),
+                &mut length,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        u32::try_from(credentials.pid)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon PID").into())
     }
 
     pub fn get_info(&mut self) -> Result<DeviceInfo, ClientError> {
@@ -104,10 +141,7 @@ impl SideAlsaClient {
         let (response, fds) = receive_with_fds(&control)?;
         let (session_id, shared) = match response {
             Response::OpenPro { session_id, shared } => (session_id, shared),
-            response => {
-                close_fds(fds);
-                return Err(response_error(response));
-            }
+            response => return Err(response_error(response)),
         };
         AudioStream::from_parts(control, session_id, StreamMode::Pro, shared, fds)
     }
@@ -127,10 +161,7 @@ impl SideAlsaClient {
                 direction,
                 shared,
             } => (session_id, direction, shared),
-            response => {
-                close_fds(fds);
-                return Err(response_error(response));
-            }
+            response => return Err(response_error(response)),
         };
         AudioStream::from_parts(
             control,
@@ -155,6 +186,7 @@ pub struct AudioStream {
     playback_index: usize,
     last_sequence: Option<u64>,
     lifecycle_generation: u64,
+    hardware_generation: u64,
     capture_discontinuities: u64,
     started: bool,
     closed: bool,
@@ -166,23 +198,19 @@ impl AudioStream {
         session_id: u64,
         mode: StreamMode,
         info: SharedRegionInfo,
-        fds: Vec<RawFd>,
+        fds: Vec<OwnedFd>,
     ) -> Result<Self, ClientError> {
-        if fds.len() != 4 {
-            let count = fds.len();
-            close_fds(fds);
-            return Err(ClientError::InvalidDescriptorCount(count));
-        }
-        let region = match SharedRegion::map_fd(fds[0], info) {
-            Ok(region) => region,
-            Err(error) => {
-                close_fd(fds[1]);
-                close_fd(fds[2]);
-                close_fd(fds[3]);
-                return Err(error.into());
-            }
-        };
+        let [
+            region_fd,
+            capture_event,
+            playback_event,
+            playback_ready_event,
+        ]: [OwnedFd; 4] = fds
+            .try_into()
+            .map_err(|fds: Vec<OwnedFd>| ClientError::InvalidDescriptorCount(fds.len()))?;
+        let region = SharedRegion::map_fd(region_fd.into_raw_fd(), info)?;
         let lifecycle_generation = region.lifecycle_generation();
+        let hardware_generation = region.hardware_generation();
         let capture_discontinuities = region.capture_discontinuities();
         Ok(Self {
             control,
@@ -190,13 +218,14 @@ impl AudioStream {
             mode,
             info,
             region,
-            capture_event: EventFd::from_raw(fds[1]),
-            playback_event: EventFd::from_raw(fds[2]),
-            playback_ready_event: EventFd::from_raw(fds[3]),
+            capture_event: EventFd::from_owned(capture_event),
+            playback_event: EventFd::from_owned(playback_event),
+            playback_ready_event: EventFd::from_owned(playback_ready_event),
             capture_index: 0,
             playback_index: 0,
             last_sequence: None,
             lifecycle_generation,
+            hardware_generation,
             capture_discontinuities,
             started: false,
             closed: false,
@@ -217,6 +246,10 @@ impl AudioStream {
 
     pub fn playback_sequence(&self) -> u64 {
         self.region.playback_sequence()
+    }
+
+    pub fn hardware_generation(&self) -> u64 {
+        self.region.hardware_generation()
     }
 
     pub fn activation_sequence(&self) -> Option<u64> {
@@ -244,21 +277,19 @@ impl AudioStream {
         self.playback_index = 0;
         self.last_sequence = None;
         self.lifecycle_generation = self.region.lifecycle_generation();
+        self.hardware_generation = self.region.hardware_generation();
         self.capture_discontinuities = self.region.capture_discontinuities();
         self.capture_event.drain();
         self.playback_event.drain();
         self.playback_ready_event.drain();
-        match request(
-            &mut self.control,
-            Request::Start {
-                session_id: self.session_id,
-            },
-        )? {
+        match self.control_request(Request::Start {
+            session_id: self.session_id,
+        })? {
             Response::Ack => {
                 self.started = true;
                 Ok(())
             }
-            response => Err(response_error(response)),
+            response => Err(self.control_response_error(response)),
         }
     }
 
@@ -268,12 +299,9 @@ impl AudioStream {
             return Ok(());
         }
         self.region.set_client_state(SHARED_CLIENT_IDLE);
-        match request(
-            &mut self.control,
-            Request::Stop {
-                session_id: self.session_id,
-            },
-        )? {
+        match self.control_request(Request::Stop {
+            session_id: self.session_id,
+        })? {
             Response::Ack => {
                 self.started = false;
                 self.region.reset_slots();
@@ -286,7 +314,7 @@ impl AudioStream {
                 self.playback_ready_event.drain();
                 Ok(())
             }
-            response => Err(response_error(response)),
+            response => Err(self.control_response_error(response)),
         }
     }
 
@@ -309,47 +337,39 @@ impl AudioStream {
     pub fn close(&mut self) -> Result<(), ClientError> {
         self.ensure_open()?;
         self.region.set_client_state(SHARED_CLIENT_IDLE);
-        match request(
-            &mut self.control,
-            Request::Close {
-                session_id: self.session_id,
-            },
-        )? {
+        match self.control_request(Request::Close {
+            session_id: self.session_id,
+        })? {
             Response::Ack => {
                 self.started = false;
                 self.closed = true;
-                self.region.reset_slots();
-                self.capture_event.drain();
-                self.playback_event.drain();
-                self.playback_ready_event.drain();
                 Ok(())
             }
-            response => Err(response_error(response)),
+            response => Err(self.control_response_error(response)),
         }
     }
 
     pub fn get_stats(&mut self) -> Result<Stats, ClientError> {
         self.ensure_open()?;
-        match request(&mut self.control, Request::GetStats)? {
+        match self.control_request(Request::GetStats)? {
             Response::Stats(stats) => Ok(*stats),
-            response => Err(response_error(response)),
+            response => Err(self.control_response_error(response)),
         }
     }
 
     pub fn notification_fd(&self) -> Result<RawFd, ClientError> {
         let fd = if self.info.capture_channels > 0 {
-            self.capture_event.fd
+            self.capture_event.as_raw_fd()
         } else if self.info.playback_channels > 0 {
-            self.playback_event.fd
+            self.playback_event.as_raw_fd()
         } else {
             return Err(ClientError::MissingDirection("audio"));
         };
-        let duplicate = unsafe { libc::dup(fd) };
-        if duplicate < 0 {
-            Err(io::Error::last_os_error().into())
-        } else {
-            Ok(duplicate)
-        }
+        Ok(duplicate_cloexec(fd)?)
+    }
+
+    pub fn control_fd(&self) -> Result<RawFd, ClientError> {
+        Ok(duplicate_cloexec(self.control.as_raw_fd())?)
     }
 
     pub fn wait_period(&mut self, timeout: Duration) -> Result<u64, ClientError> {
@@ -359,6 +379,7 @@ impl AudioStream {
             .unwrap_or_else(Instant::now);
         loop {
             self.refresh_generation();
+            self.check_hardware_generation()?;
             self.check_capture_discontinuity()?;
             if self.info.capture_channels > 0 {
                 let ready_sequence = match self.mode {
@@ -379,13 +400,30 @@ impl AudioStream {
                     self.last_sequence = Some(sequence);
                     return Ok(sequence);
                 }
-                self.capture_event.wait_until(deadline)?;
+                let wait = self
+                    .capture_event
+                    .wait_until(self.control.as_raw_fd(), deadline);
+                if matches!(&wait, Err(ClientError::Closed)) {
+                    self.poison_control();
+                }
+                if wait? == EventWait::Spurious {
+                    continue;
+                }
             } else if self.info.playback_channels > 0 {
-                self.playback_event.wait_until(deadline)?;
+                let wait = self
+                    .playback_event
+                    .wait_until(self.control.as_raw_fd(), deadline);
+                if matches!(&wait, Err(ClientError::Closed)) {
+                    self.poison_control();
+                }
+                if wait? == EventWait::Spurious {
+                    continue;
+                }
             } else {
                 return Err(ClientError::MissingDirection("audio"));
             }
             self.refresh_generation();
+            self.check_hardware_generation()?;
             self.check_capture_discontinuity()?;
             if self.info.capture_channels > 0 {
                 continue;
@@ -402,6 +440,7 @@ impl AudioStream {
     pub fn capture_buffer(&mut self, samples: &mut [i32]) -> Result<Option<u64>, ClientError> {
         self.ensure_started()?;
         self.refresh_generation();
+        self.check_hardware_generation()?;
         self.check_capture_discontinuity()?;
         if self.info.capture_channels == 0 {
             return Err(ClientError::MissingDirection("capture"));
@@ -489,6 +528,30 @@ impl AudioStream {
         }
     }
 
+    fn control_request(&mut self, control_request: Request) -> Result<Response, ClientError> {
+        match request(&mut self.control, control_request) {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                self.poison_control();
+                Err(error)
+            }
+        }
+    }
+
+    fn control_response_error(&mut self, response: Response) -> ClientError {
+        let error = response_error(response);
+        if matches!(error, ClientError::UnexpectedResponse(_)) {
+            self.poison_control();
+        }
+        error
+    }
+
+    fn poison_control(&mut self) {
+        self.started = false;
+        self.closed = true;
+        let _ = self.control.shutdown(Shutdown::Both);
+    }
+
     fn refresh_generation(&mut self) {
         let generation = self.region.lifecycle_generation();
         if generation != self.lifecycle_generation {
@@ -513,6 +576,21 @@ impl AudioStream {
         self.capture_event.drain();
         Err(ClientError::CaptureDiscontinuity)
     }
+
+    fn check_hardware_generation(&mut self) -> Result<(), ClientError> {
+        let current = self.region.hardware_generation();
+        if current == self.hardware_generation {
+            return Ok(());
+        }
+        self.hardware_generation = current;
+        self.capture_index = 0;
+        self.playback_index = 0;
+        self.last_sequence = None;
+        self.capture_event.drain();
+        self.playback_event.drain();
+        self.playback_ready_event.drain();
+        Err(ClientError::CaptureDiscontinuity)
+    }
 }
 
 impl Drop for AudioStream {
@@ -530,20 +608,37 @@ impl Drop for AudioStream {
 }
 
 struct EventFd {
-    fd: RawFd,
+    fd: OwnedFd,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventWait {
+    Notified,
+    Spurious,
 }
 
 impl EventFd {
-    fn from_raw(fd: RawFd) -> Self {
+    fn from_owned(fd: OwnedFd) -> Self {
         Self { fd }
     }
 
-    fn wait_until(&self, deadline: Instant) -> Result<(), ClientError> {
-        let mut pollfd = libc::pollfd {
-            fd: self.fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    fn wait_until(&self, control_fd: RawFd, deadline: Instant) -> Result<EventWait, ClientError> {
+        let mut pollfds = [
+            libc::pollfd {
+                fd: self.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: control_fd,
+                events: libc::POLLIN | libc::POLLRDHUP,
+                revents: 0,
+            },
+        ];
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let timeout = if remaining.is_zero() {
@@ -556,34 +651,23 @@ impl EventFd {
                     ))
                     .min(i32::MAX as u128) as i32
             };
-            pollfd.revents = 0;
-            let result = unsafe { libc::poll(&mut pollfd, 1, timeout) };
+            pollfds[0].revents = 0;
+            pollfds[1].revents = 0;
+            let result =
+                unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout) };
             if result > 0 {
-                if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-                    return Err(io::Error::from_raw_os_error(libc::EIO).into());
+                if control_is_closed(control_fd, pollfds[1].revents)? {
+                    return Err(ClientError::Closed);
                 }
-                let mut value = 0_u64;
-                loop {
-                    let bytes = unsafe {
-                        libc::read(self.fd, (&mut value as *mut u64).cast(), size_of::<u64>())
-                    };
-                    if bytes == size_of::<u64>() as isize {
-                        return Ok(());
-                    }
-                    if bytes < 0 {
-                        let error = io::Error::last_os_error();
-                        if error.kind() == io::ErrorKind::Interrupted {
-                            continue;
-                        }
-                        if error.raw_os_error() == Some(libc::EAGAIN) {
-                            break;
-                        }
-                        return Err(error.into());
-                    }
-                    return Err(
-                        io::Error::new(io::ErrorKind::UnexpectedEof, "short eventfd read").into(),
-                    );
+                if pollfds[0].revents != 0 {
+                    return self.consume_ready(pollfds[0].revents);
                 }
+                if pollfds[1].revents & libc::POLLIN != 0 {
+                    // No control response is expected while waiting for audio. Keep watching
+                    // hangup/error without spinning on unexpected readable data.
+                    pollfds[1].events = libc::POLLRDHUP;
+                }
+                continue;
             }
             if result == 0 {
                 return Err(ClientError::Timeout);
@@ -595,11 +679,49 @@ impl EventFd {
         }
     }
 
+    fn consume_ready(&self, revents: libc::c_short) -> Result<EventWait, ClientError> {
+        if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(io::Error::from_raw_os_error(libc::EIO).into());
+        }
+        if revents & libc::POLLIN == 0 {
+            return Ok(EventWait::Spurious);
+        }
+        let mut value = 0_u64;
+        loop {
+            let bytes = unsafe {
+                libc::read(
+                    self.as_raw_fd(),
+                    (&mut value as *mut u64).cast(),
+                    size_of::<u64>(),
+                )
+            };
+            if bytes == size_of::<u64>() as isize {
+                return Ok(EventWait::Notified);
+            }
+            if bytes < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.raw_os_error() == Some(libc::EAGAIN) {
+                    return Ok(EventWait::Spurious);
+                }
+                return Err(error.into());
+            }
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short eventfd read").into());
+        }
+    }
+
     fn notify(&self) -> Result<(), ClientError> {
         let value = 1_u64;
         loop {
-            let bytes =
-                unsafe { libc::write(self.fd, (&value as *const u64).cast(), size_of::<u64>()) };
+            let bytes = unsafe {
+                libc::write(
+                    self.as_raw_fd(),
+                    (&value as *const u64).cast(),
+                    size_of::<u64>(),
+                )
+            };
             if bytes == size_of::<u64>() as isize {
                 return Ok(());
             }
@@ -614,8 +736,13 @@ impl EventFd {
     fn drain(&self) {
         loop {
             let mut value = 0_u64;
-            let bytes =
-                unsafe { libc::read(self.fd, (&mut value as *mut u64).cast(), size_of::<u64>()) };
+            let bytes = unsafe {
+                libc::read(
+                    self.as_raw_fd(),
+                    (&mut value as *mut u64).cast(),
+                    size_of::<u64>(),
+                )
+            };
             if bytes == size_of::<u64>() as isize {
                 continue;
             }
@@ -627,9 +754,43 @@ impl EventFd {
     }
 }
 
-impl Drop for EventFd {
-    fn drop(&mut self) {
-        close_fd(self.fd);
+fn control_is_closed(fd: RawFd, revents: libc::c_short) -> Result<bool, ClientError> {
+    if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL | libc::POLLRDHUP) != 0 {
+        return Ok(true);
+    }
+    if revents & libc::POLLIN == 0 {
+        return Ok(false);
+    }
+    let mut byte = 0_u8;
+    loop {
+        let received = unsafe {
+            libc::recv(
+                fd,
+                (&mut byte as *mut u8).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if received == 0 {
+            return Ok(true);
+        }
+        if received > 0 {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.raw_os_error() == Some(libc::EAGAIN) {
+            return Ok(false);
+        }
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ECONNRESET) | Some(libc::ENOTCONN)
+        ) {
+            return Ok(true);
+        }
+        return Err(error.into());
     }
 }
 
@@ -652,51 +813,115 @@ fn sequence_is_before(candidate: u64, reference: u64) -> bool {
     distance != 0 && distance < (1_u64 << 63)
 }
 
-fn receive_with_fds(stream: &UnixStream) -> Result<(Response, Vec<RawFd>), ClientError> {
-    let mut bytes = vec![0_u8; 4096];
-    let mut control =
-        vec![0_u8; unsafe { libc::CMSG_SPACE((4 * size_of::<RawFd>()) as u32) } as usize];
+fn receive_with_fds(stream: &UnixStream) -> Result<(Response, Vec<OwnedFd>), ClientError> {
+    const FRAME_HEADER_SIZE: usize = 12;
+    const MAX_DESCRIPTORS: usize = 4;
+
+    let mut first_byte = [0_u8; 1];
+    let control_len =
+        unsafe { libc::CMSG_SPACE((MAX_DESCRIPTORS * size_of::<RawFd>()) as u32) as usize };
+    let mut control = vec![0_usize; control_len.div_ceil(size_of::<usize>())];
+    let mut fds = Vec::with_capacity(MAX_DESCRIPTORS);
     let mut iov = libc::iovec {
-        iov_base: bytes.as_mut_ptr().cast(),
-        iov_len: bytes.len(),
+        iov_base: first_byte.as_mut_ptr().cast(),
+        iov_len: first_byte.len(),
     };
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = control.len();
-    let received = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, 0) };
-    if received < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
+    let received = loop {
+        message.msg_controllen = control_len;
+        message.msg_flags = 0;
+        let received =
+            unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
+        if received >= 0 {
+            break received;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error.into());
+        }
+    };
 
-    let mut fds = Vec::new();
+    let mut malformed_control = false;
     unsafe {
+        let control_start = message.msg_control as usize;
+        let control_end = control_start.saturating_add(message.msg_controllen);
         let mut cmsg = libc::CMSG_FIRSTHDR(&message);
         while !cmsg.is_null() {
+            let cmsg_start = cmsg as usize;
+            let cmsg_len = (*cmsg).cmsg_len as usize;
+            let header_len = libc::CMSG_LEN(0) as usize;
+            let Some(cmsg_end) = cmsg_start.checked_add(cmsg_len) else {
+                malformed_control = true;
+                break;
+            };
+            if cmsg_len < header_len || cmsg_start < control_start || cmsg_end > control_end {
+                malformed_control = true;
+                break;
+            }
             if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let payload_bytes = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                let payload_bytes = cmsg_len - header_len;
+                malformed_control |= !payload_bytes.is_multiple_of(size_of::<RawFd>());
                 let count = payload_bytes / size_of::<RawFd>();
                 let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
                 for index in 0..count {
-                    fds.push(*data.add(index));
+                    fds.push(OwnedFd::from_raw_fd(*data.add(index)));
                 }
             }
             cmsg = libc::CMSG_NXTHDR(&message, cmsg);
         }
     }
-    Ok((
-        sidealsa_protocol::decode_response(&bytes[..received as usize])?,
-        fds,
-    ))
+
+    if malformed_control
+        || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
+        || received != 1
+    {
+        return Err(ProtocolError::MalformedPayload.into());
+    }
+
+    let mut header = [0_u8; FRAME_HEADER_SIZE];
+    header[0] = first_byte[0];
+    let mut reader = stream;
+    reader
+        .read_exact(&mut header[1..])
+        .map_err(ProtocolError::from)?;
+    if header[..4] != PROTOCOL_MAGIC {
+        return Err(ProtocolError::InvalidMagic.into());
+    }
+    let version = u16::from_le_bytes([header[4], header[5]]);
+    if version != PROTOCOL_VERSION {
+        return Err(ProtocolError::UnsupportedVersion(version).into());
+    }
+    let payload_len = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
+    if payload_len > MAX_FRAME_PAYLOAD {
+        return Err(ProtocolError::FrameTooLarge(payload_len).into());
+    }
+
+    let mut frame = Vec::with_capacity(FRAME_HEADER_SIZE + payload_len);
+    frame.extend_from_slice(&header);
+    frame.resize(FRAME_HEADER_SIZE + payload_len, 0);
+    reader
+        .read_exact(&mut frame[FRAME_HEADER_SIZE..])
+        .map_err(ProtocolError::from)?;
+    Ok((sidealsa_protocol::decode_response(&frame)?, fds))
 }
 
-fn close_fds(fds: Vec<RawFd>) {
-    for fd in fds {
-        close_fd(fd);
+fn duplicate_cloexec(fd: RawFd) -> io::Result<RawFd> {
+    loop {
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicate >= 0 {
+            return Ok(duplicate);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 
+#[cfg(test)]
 fn close_fd(fd: RawFd) {
     unsafe {
         libc::close(fd);
@@ -708,8 +933,9 @@ mod tests {
     use super::*;
     use std::{
         fs,
+        io::Write,
         os::unix::net::UnixStream,
-        sync::mpsc,
+        sync::{Arc, mpsc},
         thread,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -742,6 +968,7 @@ mod tests {
             buffer_size: 64,
             shared_buffer_size: 256,
             pro_latency_periods: 1,
+            pro_output_latency_frames: 48,
             pro_realtime_priority: 15,
             shared_latency_periods: 3,
             playback_channels: 2,
@@ -782,6 +1009,214 @@ mod tests {
     }
 
     #[test]
+    fn fragmented_fd_response_is_read_exactly_and_descriptors_are_cloexec() {
+        let (mut sender, receiver) = UnixStream::pair().expect("socket pair should create");
+        let response = Response::OpenPro {
+            session_id: 41,
+            shared: SharedRegionInfo {
+                size: 4096,
+                period_frames: 64,
+                playback_channels: 2,
+                capture_channels: 1,
+                slot_count: 8,
+                slot_stride: 512,
+                capture_offset: 128,
+                playback_offset: 2048,
+            },
+        };
+        let frame = sidealsa_protocol::encode_response(&response).expect("response should encode");
+        let sent_fds = owned_fds([event_fd(), event_fd(), event_fd(), event_fd()]);
+        let raw_fds: Vec<_> = sent_fds.iter().map(AsRawFd::as_raw_fd).collect();
+
+        send_with_fds(&sender, &frame[..1], &raw_fds);
+        sender
+            .write_all(&frame[1..5])
+            .expect("partial header should write");
+        sender
+            .write_all(&frame[5..12])
+            .expect("remaining header should write");
+        sender
+            .write_all(&frame[12..])
+            .expect("payload should write");
+
+        let (received, received_fds) = receive_with_fds(&receiver).expect("response should arrive");
+        assert_eq!(received, response);
+        assert_eq!(received_fds.len(), 4);
+        for fd in &received_fds {
+            assert_cloexec(fd.as_raw_fd());
+        }
+    }
+
+    #[test]
+    fn malformed_fd_response_closes_received_descriptors() {
+        let (mut sender, receiver) = UnixStream::pair().expect("socket pair should create");
+        let mut pipe_fds = [0; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK,) },
+            0
+        );
+        let read_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let write_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+        let mut frame =
+            sidealsa_protocol::encode_response(&Response::Ack).expect("response should encode");
+        frame[6..8].copy_from_slice(&u16::MAX.to_le_bytes());
+
+        send_with_fds(&sender, &frame[..1], &[write_fd.as_raw_fd()]);
+        sender
+            .write_all(&frame[1..])
+            .expect("malformed response should write");
+        drop(write_fd);
+        assert!(matches!(
+            receive_with_fds(&receiver),
+            Err(ClientError::Protocol(ProtocolError::UnknownResponse(
+                u16::MAX
+            )))
+        ));
+
+        let mut byte = 0_u8;
+        assert_eq!(
+            unsafe { libc::read(read_fd.as_raw_fd(), (&mut byte as *mut u8).cast(), 1,) },
+            0,
+            "the received pipe writer should be closed on decode failure"
+        );
+    }
+
+    #[test]
+    fn oversized_fd_response_is_rejected_before_payload_read() {
+        let (mut sender, receiver) = UnixStream::pair().expect("socket pair should create");
+        let mut header = [0_u8; 12];
+        header[..4].copy_from_slice(&PROTOCOL_MAGIC);
+        header[4..6].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+        header[6..8].copy_from_slice(&4_u16.to_le_bytes());
+        header[8..12].copy_from_slice(&((MAX_FRAME_PAYLOAD + 1) as u32).to_le_bytes());
+        sender
+            .write_all(&header)
+            .expect("oversized header should write");
+
+        assert!(matches!(
+            receive_with_fds(&receiver),
+            Err(ClientError::Protocol(ProtocolError::FrameTooLarge(size)))
+                if size == MAX_FRAME_PAYLOAD + 1
+        ));
+    }
+
+    #[test]
+    fn truncated_descriptor_control_is_rejected() {
+        let (mut sender, receiver) = UnixStream::pair().expect("socket pair should create");
+        let frame =
+            sidealsa_protocol::encode_response(&Response::Ack).expect("response should encode");
+        let sent_fds = [event_fd(), event_fd(), event_fd(), event_fd(), event_fd()]
+            .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+        let raw_fds: [RawFd; 5] = std::array::from_fn(|index| sent_fds[index].as_raw_fd());
+
+        send_with_fds(&sender, &frame[..1], &raw_fds);
+        sender
+            .write_all(&frame[1..])
+            .expect("response should write");
+        assert!(matches!(
+            receive_with_fds(&receiver),
+            Err(ClientError::Protocol(ProtocolError::MalformedPayload))
+        ));
+    }
+
+    #[test]
+    fn duplicated_notification_and_control_descriptors_are_cloexec() {
+        let server_region = SharedRegion::create(1, 1, 0).expect("region should create");
+        let client_fd = unsafe { libc::dup(server_region.fd()) };
+        assert!(client_fd >= 0);
+        let (peer, control) = UnixStream::pair().expect("socket pair should create");
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Shared(PortDirection::Playback),
+            server_region.info(),
+            owned_fds([client_fd, event_fd(), event_fd(), event_fd()]),
+        )
+        .expect("stream should create");
+
+        let notification = unsafe {
+            OwnedFd::from_raw_fd(
+                stream
+                    .notification_fd()
+                    .expect("notification should duplicate"),
+            )
+        };
+        let control =
+            unsafe { OwnedFd::from_raw_fd(stream.control_fd().expect("control should duplicate")) };
+        assert_cloexec(notification.as_raw_fd());
+        assert_cloexec(control.as_raw_fd());
+
+        stream.closed = true;
+        drop(peer);
+    }
+
+    #[test]
+    fn eventfd_drain_after_poll_is_a_spurious_wake() {
+        let event = EventFd::from_owned(unsafe { OwnedFd::from_raw_fd(event_fd()) });
+        signal_event(event.as_raw_fd());
+        let mut descriptor = libc::pollfd {
+            fd: event.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 1);
+        assert_ne!(descriptor.revents & libc::POLLIN, 0);
+
+        let mut value = 0_u64;
+        assert_eq!(
+            unsafe {
+                libc::read(
+                    event.as_raw_fd(),
+                    (&mut value as *mut u64).cast(),
+                    size_of::<u64>(),
+                )
+            },
+            size_of::<u64>() as isize
+        );
+        assert_eq!(
+            event
+                .consume_ready(descriptor.revents)
+                .expect("a raced drain should not fail"),
+            EventWait::Spurious
+        );
+    }
+
+    #[test]
+    fn daemon_disconnect_wakes_wait_period_as_closed() {
+        let server_region = SharedRegion::create(1, 1, 0).expect("region should create");
+        let client_fd = unsafe { libc::dup(server_region.fd()) };
+        assert!(client_fd >= 0);
+        let (peer, control) = UnixStream::pair().expect("socket pair should create");
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Shared(PortDirection::Playback),
+            server_region.info(),
+            owned_fds([client_fd, event_fd(), event_fd(), event_fd()]),
+        )
+        .expect("stream should create");
+        stream.started = true;
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            waiting_tx.send(()).expect("wait should signal entry");
+            let result = stream.wait_period(Duration::from_secs(2));
+            result_tx
+                .send(matches!(result, Err(ClientError::Closed)))
+                .expect("wait result should send");
+        });
+
+        waiting_rx.recv().expect("waiter should start");
+        drop(peer);
+        assert!(
+            result_rx
+                .recv_timeout(Duration::from_millis(500))
+                .expect("disconnect should wake wait_period")
+        );
+        waiter.join().expect("waiter should not panic");
+    }
+
+    #[test]
     fn playback_stream_waits_and_submits_next_sequence() {
         let server_region = SharedRegion::create(4, 2, 0).expect("region should create");
         let client_fd = unsafe { libc::dup(server_region.fd()) };
@@ -809,7 +1244,7 @@ mod tests {
             9,
             StreamMode::Pro,
             info,
-            vec![client_fd, capture_fd, playback_fd, playback_ready_fd],
+            owned_fds([client_fd, capture_fd, playback_fd, playback_ready_fd]),
         )
         .expect("stream should create");
         stream.start().expect("stream should start");
@@ -862,6 +1297,187 @@ mod tests {
     }
 
     #[test]
+    fn close_ack_does_not_touch_resources_reused_by_a_new_owner() {
+        let server_region = Arc::new(SharedRegion::create(1, 0, 1).expect("region should create"));
+        let client_fd = unsafe { libc::dup(server_region.fd()) };
+        assert!(client_fd >= 0);
+        let capture_fd = event_fd();
+        let server_capture_fd = unsafe { libc::dup(capture_fd) };
+        let observed_capture_fd = unsafe { libc::dup(capture_fd) };
+        assert!(server_capture_fd >= 0);
+        assert!(observed_capture_fd >= 0);
+        let (mut peer, control) = UnixStream::pair().expect("socket pair should create");
+        let server_region_for_peer = Arc::clone(&server_region);
+        let server = thread::spawn(move || {
+            assert_eq!(
+                sidealsa_protocol::read_request(&mut peer).expect("close should arrive"),
+                Request::Close { session_id: 9 }
+            );
+
+            // Model a new owner publishing after daemon-side close, but before the old ACK arrives.
+            server_region_for_peer.reset_slots();
+            let mut producer_index = 0;
+            assert!(server_region_for_peer.try_publish_capture(&mut producer_index, 77, &[42]));
+            signal_event(server_capture_fd);
+            close_fd(server_capture_fd);
+            sidealsa_protocol::write_response(&mut peer, &Response::Ack)
+                .expect("close ack should write");
+        });
+
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Shared(PortDirection::Capture),
+            server_region.info(),
+            owned_fds([client_fd, capture_fd, event_fd(), event_fd()]),
+        )
+        .expect("stream should create");
+        stream.close().expect("stream should close");
+        drop(stream);
+        server.join().expect("server should not panic");
+
+        let mut consumer_index = 0;
+        let mut samples = [0];
+        assert_eq!(
+            server_region.try_client_read_capture(&mut consumer_index, &mut samples),
+            Some(77)
+        );
+        assert_eq!(samples, [42]);
+        let mut notification = 0_u64;
+        assert_eq!(
+            unsafe {
+                libc::read(
+                    observed_capture_fd,
+                    (&mut notification as *mut u64).cast(),
+                    size_of::<u64>(),
+                )
+            },
+            size_of::<u64>() as isize
+        );
+        assert_eq!(notification, 1);
+        close_fd(observed_capture_fd);
+    }
+
+    #[test]
+    fn partial_close_ack_poisons_stream_and_drop_sends_nothing() {
+        let server_region = SharedRegion::create(1, 0, 1).expect("region should create");
+        let client_fd = unsafe { libc::dup(server_region.fd()) };
+        assert!(client_fd >= 0);
+        let info = server_region.info();
+        let (mut peer, control) = UnixStream::pair().expect("socket pair should create");
+        control
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("timeout should set");
+        let (partial_tx, partial_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            assert_eq!(
+                sidealsa_protocol::read_request(&mut peer).expect("close should arrive"),
+                Request::Close { session_id: 9 }
+            );
+            let ack =
+                sidealsa_protocol::encode_response(&Response::Ack).expect("ack should encode");
+            peer.write_all(&ack[..6]).expect("partial ack should write");
+            partial_tx.send(()).expect("partial ack should signal");
+            release_rx.recv().expect("test should release server");
+            peer.set_read_timeout(Some(Duration::from_millis(250)))
+                .expect("timeout should set");
+            match sidealsa_protocol::read_request(&mut peer) {
+                Err(ProtocolError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                    ) => {}
+                result => {
+                    panic!("poisoned stream should close without another request: {result:?}")
+                }
+            }
+        });
+
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Shared(PortDirection::Capture),
+            info,
+            owned_fds([client_fd, event_fd(), event_fd(), event_fd()]),
+        )
+        .expect("stream should create");
+        let client = thread::spawn(move || {
+            assert!(matches!(
+                stream.close(),
+                Err(ClientError::Protocol(ProtocolError::Io(_)))
+            ));
+            stream
+        });
+        partial_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("partial ack should arrive");
+        let mut stream = client.join().expect("client should not panic");
+        assert!(matches!(stream.get_stats(), Err(ClientError::Closed)));
+        assert!(matches!(stream.start(), Err(ClientError::Closed)));
+        assert!(matches!(stream.close(), Err(ClientError::Closed)));
+        drop(stream);
+        release_tx.send(()).expect("server should be released");
+        server.join().expect("server should not panic");
+    }
+
+    #[test]
+    fn daemon_error_response_does_not_poison_stream() {
+        let server_region = SharedRegion::create(1, 0, 1).expect("region should create");
+        let client_fd = unsafe { libc::dup(server_region.fd()) };
+        assert!(client_fd >= 0);
+        let (mut peer, control) = UnixStream::pair().expect("socket pair should create");
+        let server = thread::spawn(move || {
+            assert_eq!(
+                sidealsa_protocol::read_request(&mut peer).expect("start should arrive"),
+                Request::Start { session_id: 9 }
+            );
+            sidealsa_protocol::write_response(
+                &mut peer,
+                &Response::Error {
+                    code: ErrorCode::BadState,
+                    message: "not ready".into(),
+                },
+            )
+            .expect("daemon error should write");
+            assert_eq!(
+                sidealsa_protocol::read_request(&mut peer).expect("stats should arrive"),
+                Request::GetStats
+            );
+            sidealsa_protocol::write_response(&mut peer, &Response::Stats(Box::default()))
+                .expect("stats should write");
+            assert_eq!(
+                sidealsa_protocol::read_request(&mut peer).expect("close should arrive"),
+                Request::Close { session_id: 9 }
+            );
+            sidealsa_protocol::write_response(&mut peer, &Response::Ack)
+                .expect("close ack should write");
+        });
+
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Shared(PortDirection::Capture),
+            server_region.info(),
+            owned_fds([client_fd, event_fd(), event_fd(), event_fd()]),
+        )
+        .expect("stream should create");
+        assert!(matches!(
+            stream.start(),
+            Err(ClientError::Daemon {
+                code: ErrorCode::BadState,
+                ..
+            })
+        ));
+        assert_eq!(
+            stream.get_stats().expect("stream should remain usable"),
+            Stats::default()
+        );
+        stream.close().expect("stream should close");
+        server.join().expect("server should not panic");
+    }
+
+    #[test]
     fn pro_keeps_playback_sequence_for_daemon_expiry_check() {
         let server_region = SharedRegion::create(4, 2, 0).expect("region should create");
         let client_fd = unsafe { libc::dup(server_region.fd()) };
@@ -873,7 +1489,7 @@ mod tests {
             9,
             StreamMode::Pro,
             server_region.info(),
-            vec![client_fd, event_fd(), event_fd(), event_fd()],
+            owned_fds([client_fd, event_fd(), event_fd(), event_fd()]),
         )
         .expect("stream should create");
         stream.started = true;
@@ -902,7 +1518,7 @@ mod tests {
             9,
             StreamMode::Pro,
             server_region.info(),
-            vec![client_fd, event_fd(), event_fd(), event_fd()],
+            owned_fds([client_fd, event_fd(), event_fd(), event_fd()]),
         )
         .expect("stream should create");
         stream.started = true;
@@ -968,7 +1584,7 @@ mod tests {
             9,
             StreamMode::Shared(PortDirection::Capture),
             server_region.info(),
-            vec![client_fd, capture_fd, event_fd(), event_fd()],
+            owned_fds([client_fd, capture_fd, event_fd(), event_fd()]),
         )
         .expect("stream should create");
         stream.started = true;
@@ -1017,7 +1633,7 @@ mod tests {
             9,
             StreamMode::Shared(PortDirection::Capture),
             server_region.info(),
-            vec![client_fd, capture_fd, event_fd(), event_fd()],
+            owned_fds([client_fd, capture_fd, event_fd(), event_fd()]),
         )
         .expect("stream should create");
         stream.started = true;
@@ -1071,11 +1687,36 @@ mod tests {
             9,
             StreamMode::Shared(PortDirection::Capture),
             server_region.info(),
-            vec![client_fd, event_fd(), event_fd(), event_fd()],
+            owned_fds([client_fd, event_fd(), event_fd(), event_fd()]),
         )
         .expect("stream should create");
         stream.started = true;
         server_region.record_capture_discontinuity();
+
+        assert!(matches!(
+            stream.wait_period(Duration::ZERO),
+            Err(ClientError::CaptureDiscontinuity)
+        ));
+        stream.closed = true;
+    }
+
+    #[test]
+    fn hardware_generation_change_requests_stream_recovery() {
+        let server_region = SharedRegion::create(1, 0, 1).expect("region should create");
+        server_region.set_hardware_generation(4);
+        let client_fd = unsafe { libc::dup(server_region.fd()) };
+        assert!(client_fd >= 0);
+        let (_peer, control) = UnixStream::pair().expect("socket pair should create");
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Shared(PortDirection::Capture),
+            server_region.info(),
+            owned_fds([client_fd, event_fd(), event_fd(), event_fd()]),
+        )
+        .expect("stream should create");
+        stream.started = true;
+        server_region.set_hardware_generation(5);
 
         assert!(matches!(
             stream.wait_period(Duration::ZERO),
@@ -1106,7 +1747,7 @@ mod tests {
             9,
             StreamMode::Shared(PortDirection::Capture),
             info,
-            vec![client_fd, event_fd(), event_fd(), event_fd()],
+            owned_fds([client_fd, event_fd(), event_fd(), event_fd()]),
         )
         .expect("stream should create");
 
@@ -1118,6 +1759,51 @@ mod tests {
 
         stream.closed = true;
         server.join().expect("server should not panic");
+    }
+
+    fn owned_fds(fds: [RawFd; 4]) -> Vec<OwnedFd> {
+        fds.into_iter()
+            .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+            .collect()
+    }
+
+    fn assert_cloexec(fd: RawFd) {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0, "descriptor flags should be readable");
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    }
+
+    fn send_with_fds(stream: &UnixStream, bytes: &[u8], fds: &[RawFd]) {
+        assert!(!bytes.is_empty());
+        assert!(!fds.is_empty());
+        let fd_bytes = std::mem::size_of_val(fds);
+        let control_len = unsafe { libc::CMSG_SPACE(fd_bytes as u32) as usize };
+        let mut control = vec![0_usize; control_len.div_ceil(size_of::<usize>())];
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_ptr() as *mut libc::c_void,
+            iov_len: bytes.len(),
+        };
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control_len;
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&message);
+            assert!(!cmsg.is_null());
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(fd_bytes as u32) as usize;
+            std::ptr::copy_nonoverlapping(
+                fds.as_ptr(),
+                libc::CMSG_DATA(cmsg).cast::<RawFd>(),
+                fds.len(),
+            );
+        }
+        assert_eq!(
+            unsafe { libc::sendmsg(stream.as_raw_fd(), &message, 0) },
+            bytes.len() as isize
+        );
     }
 
     fn event_fd() -> RawFd {

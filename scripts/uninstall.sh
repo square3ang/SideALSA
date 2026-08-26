@@ -145,6 +145,10 @@ else
     run_privileged install -m 0644 "$temp" "$MANIFEST_ACTUAL"
 fi
 
+if [[ -z "$DESTDIR" ]] && command -v systemctl >/dev/null 2>&1; then
+    run_privileged systemctl daemon-reload
+fi
+
 for directory in \
     "$(destination "$PREFIX/share/doc/sidealsa")" \
     "$(destination "$PREFIX/share/sidealsa")" \

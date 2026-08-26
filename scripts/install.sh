@@ -210,6 +210,16 @@ fi
 [[ -f "$PROFILE_SOURCE" ]] || die "profile not found: $PROFILE_SOURCE"
 PROFILE_NAME="$(basename -- "$PROFILE_SOURCE")"
 [[ "$PROFILE_NAME" != "." && "$PROFILE_NAME" != ".." ]] || die "invalid profile name"
+for service_value in "$PREFIX" "$SOCKET_PATH" "$PROFILE_NAME"; do
+    [[ "$service_value" != *[[:space:]]* ]] || \
+        die "systemd service paths must not contain whitespace: $service_value"
+done
+profile_text="$(<"$PROFILE_SOURCE")"
+for adapter_port in line1 line2 line3 line4 mic1 mic2 input34 input56 input78 input910; do
+    [[ "$profile_text" == *"id = \"$adapter_port\""* ]] || \
+        die "profile lacks port '$adapter_port' required by the installed ALSA/PipeWire adapters"
+done
+unset profile_text
 
 USE_SUDO=0
 if [[ -z "$DESTDIR" && "$EUID" -ne 0 ]]; then
@@ -289,6 +299,7 @@ BINARIES=(
     sidealsad
     sidealsa-hw-test
     sidealsa-pro-test
+    sidealsa-loopback-test
     sidealsa-stats
     sidealsa-pro-client-test
     sidealsa-shared-test
@@ -310,6 +321,20 @@ MANIFEST_PATH="$PREFIX/share/sidealsa/install-manifest"
 RETIRED_MANAGED_PATHS=(
     /etc/wireplumber/wireplumber.conf.d/99-sidealsa.conf
 )
+if ((INSTALL_PIPEWIRE == 0)); then
+    RETIRED_MANAGED_PATHS+=(
+        "$PIPEWIRE_CONFIG_PATH"
+        "$PIPEWIRE_PULSE_CONFIG_PATH"
+    )
+fi
+if ((WITH_ASIO == 0)); then
+    RETIRED_MANAGED_PATHS+=(
+        "$PREFIX/lib/wine/x86_64-windows/sidealsa-asio64.dll"
+        "$PREFIX/lib/wine/x86_64-unix/sidealsa-asio64.dll.so"
+        "$PREFIX/lib/wine/x86_64-windows/sidealsa-asio.dll"
+        "$PREFIX/lib/wine/x86_64-unix/sidealsa-asio.dll.so"
+    )
+fi
 
 MANAGED_PATHS=()
 for binary in "${BINARIES[@]}"; do
@@ -383,7 +408,7 @@ install_managed_copy() {
 }
 
 run_privileged install -D -m 0755 "$ROOT/target/release/sidealsad" "$(destination "$PREFIX/bin/sidealsad")"
-for binary in sidealsa-hw-test sidealsa-pro-test sidealsa-stats sidealsa-pro-client-test sidealsa-shared-test; do
+for binary in sidealsa-hw-test sidealsa-pro-test sidealsa-loopback-test sidealsa-stats sidealsa-pro-client-test sidealsa-shared-test; do
     run_privileged install -D -m 0755 "$ROOT/target/release/$binary" "$(destination "$PREFIX/bin/$binary")"
 done
 run_privileged install -D -m 0755 "$PLUGIN_SOURCE" "$(destination "$ALSA_PLUGIN_DIR/libasound_module_pcm_sidealsa.so")"

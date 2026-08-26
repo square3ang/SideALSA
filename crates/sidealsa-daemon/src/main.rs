@@ -59,13 +59,6 @@ fn main() {
         eprintln!("could not register SIGTERM handler: {error}");
         std::process::exit(1);
     }
-    if args.socket.exists()
-        && let Err(error) = std::fs::remove_file(&args.socket)
-    {
-        eprintln!("could not remove stale control socket: {error}");
-        std::process::exit(1);
-    }
-
     let hardware_stop = Arc::clone(&stop);
     let hardware_ready = state.hardware_ready_handle();
     let (capture_bridge, playback_bridge) = state.bridges();

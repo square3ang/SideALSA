@@ -6,17 +6,19 @@ use std::{
 
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"SALS";
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 pub const FEATURE_PRO: u32 = 1 << 0;
 pub const FEATURE_SHARED: u32 = 1 << 1;
 
 pub const SHARED_MAGIC: u32 = u32::from_le_bytes(*b"SASH");
-pub const SHARED_VERSION: u16 = 7;
+pub const SHARED_VERSION: u16 = 8;
 pub const SHARED_SLOT_COUNT: u32 = 8;
 pub const SHARED_SLOT_FREE: u32 = 0;
 pub const SHARED_SLOT_READY: u32 = 1;
+pub const SHARED_SLOT_WRITING: u32 = 2;
+pub const SHARED_SLOT_READING: u32 = 3;
 pub const SHARED_CLIENT_IDLE: u32 = 0;
 pub const SHARED_CLIENT_STARTING: u32 = 1;
 pub const SHARED_CLIENT_RUNNING: u32 = 2;
@@ -72,6 +74,7 @@ pub struct DeviceInfo {
     pub buffer_size: u32,
     pub shared_buffer_size: u32,
     pub pro_latency_periods: u32,
+    pub pro_output_latency_frames: u32,
     pub pro_realtime_priority: u32,
     pub shared_latency_periods: u32,
     pub playback_channels: u32,
@@ -515,6 +518,7 @@ fn encode_info(payload: &mut Vec<u8>, info: &DeviceInfo) -> Result<(), ProtocolE
     put_u32(payload, info.buffer_size);
     put_u32(payload, info.shared_buffer_size);
     put_u32(payload, info.pro_latency_periods);
+    put_u32(payload, info.pro_output_latency_frames);
     put_u32(payload, info.pro_realtime_priority);
     put_u32(payload, info.shared_latency_periods);
     put_u32(payload, info.playback_channels);
@@ -532,6 +536,7 @@ fn decode_info(decoder: &mut Decoder<'_>) -> Result<DeviceInfo, ProtocolError> {
         buffer_size: decoder.u32()?,
         shared_buffer_size: decoder.u32()?,
         pro_latency_periods: decoder.u32()?,
+        pro_output_latency_frames: decoder.u32()?,
         pro_realtime_priority: decoder.u32()?,
         shared_latency_periods: decoder.u32()?,
         playback_channels: decoder.u32()?,
@@ -809,6 +814,7 @@ pub struct SharedRegionHeader {
     pub cycle_sequence: AtomicU64,
     pub playback_sequence: AtomicU64,
     pub lifecycle_generation: AtomicU64,
+    pub hardware_generation: AtomicU64,
     pub client_state: AtomicU32,
     pub activation_state: AtomicU64,
     pub start_sequence: AtomicU64,
@@ -838,6 +844,7 @@ impl SharedRegionHeader {
             cycle_sequence: AtomicU64::new(0),
             playback_sequence: AtomicU64::new(0),
             lifecycle_generation: AtomicU64::new(0),
+            hardware_generation: AtomicU64::new(0),
             client_state: AtomicU32::new(SHARED_CLIENT_IDLE),
             activation_state: AtomicU64::new(SHARED_ACTIVATION_PENDING),
             start_sequence: AtomicU64::new(0),
@@ -856,6 +863,7 @@ pub struct SharedSlotHeader {
     pub state: AtomicU32,
     pub _reserved: u32,
     pub sequence: AtomicU64,
+    pub published_nanos: AtomicU64,
 }
 
 impl SharedSlotHeader {
@@ -864,6 +872,7 @@ impl SharedSlotHeader {
             state: AtomicU32::new(SHARED_SLOT_FREE),
             _reserved: 0,
             sequence: AtomicU64::new(0),
+            published_nanos: AtomicU64::new(0),
         }
     }
 }

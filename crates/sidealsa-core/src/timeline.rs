@@ -105,7 +105,7 @@ pub struct HardwareStats {
 }
 
 impl HardwareTimeline {
-    pub(crate) fn generation(&self) -> u64 {
+    pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
 
@@ -247,10 +247,6 @@ impl HardwareTimeline {
         update_maximum(&self.playback_driver_delay_max_frames, driver_delay);
     }
 
-    pub(crate) fn record_capture_clock_wait(&self, nanos: u64) {
-        update_maximum(&self.capture_clock_wait_max_nanos, nanos);
-    }
-
     pub(crate) fn record_pro_wait_budget(&self, nanos: u64) {
         update_minimum(&self.pro_wait_budget_min_nanos, nanos);
         update_maximum(&self.pro_wait_budget_max_nanos, nanos);
@@ -364,6 +360,10 @@ impl HardwareTimeline {
     }
 
     pub(crate) fn reset_after_hardware_xrun(&self) {
+        self.reset_after_hardware_restart();
+    }
+
+    pub(crate) fn reset_after_hardware_restart(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.timeline_resets.fetch_add(1, Ordering::Relaxed);
         self.record_linked_phase_calibration(0, 0, false);
@@ -435,6 +435,19 @@ mod tests {
         assert_eq!(stats.hw_playback_xruns, 1);
         assert_eq!(stats.generation, 0);
         assert_eq!(stats.timeline_resets, 0);
+    }
+
+    #[test]
+    fn non_xrun_hardware_restart_resets_timeline_without_counting_xrun() {
+        let timeline = HardwareTimeline::default();
+
+        timeline.reset_after_hardware_restart();
+
+        let stats = timeline.snapshot();
+        assert_eq!(stats.generation, 1);
+        assert_eq!(stats.timeline_resets, 1);
+        assert_eq!(stats.hw_playback_xruns, 0);
+        assert_eq!(stats.hw_capture_xruns, 0);
     }
 
     #[test]
@@ -549,8 +562,6 @@ mod tests {
 
         timeline.record_playback_target_overshoot(4);
         timeline.record_playback_target_overshoot(2);
-        timeline.record_capture_clock_wait(20);
-        timeline.record_capture_clock_wait(10);
         timeline.record_pro_wait_budget(0);
         timeline.record_pro_wait_budget(50);
         timeline.record_pro_ready_wait(30);
@@ -558,7 +569,7 @@ mod tests {
 
         let stats = timeline.snapshot();
         assert_eq!(stats.playback_target_overshoot_max_frames, 4);
-        assert_eq!(stats.capture_clock_wait_max_nanos, 20);
+        assert_eq!(stats.capture_clock_wait_max_nanos, 0);
         assert_eq!(stats.pro_wait_budget_min_nanos, 0);
         assert_eq!(stats.pro_wait_budget_max_nanos, 50);
         assert_eq!(stats.pro_ready_wait_max_nanos, 30);

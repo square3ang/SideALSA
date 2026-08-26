@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 #include <windows.h>
 
@@ -10,7 +11,7 @@ typedef struct SideAlsaAsioDriver SideAlsaAsioDriver;
 typedef struct
 {
     int32_t (*create)(void *context, void **handle, uint32_t *thread_id);
-    int32_t (*join)(void *handle);
+    int32_t (*join)(void *handle, uint32_t timeout_ms);
     uint32_t (*current_thread_id)(void);
 } SideAlsaAsioThreadOps;
 
@@ -50,6 +51,8 @@ int32_t sidealsa_asio_new(const SideAlsaAsioThreadOps *thread_ops,
                           SideAlsaAsioDriver **out);
 void sidealsa_asio_worker_entry(void *context);
 int32_t sidealsa_asio_init(SideAlsaAsioDriver *driver, const char *socket);
+int32_t sidealsa_asio_get_error_message(SideAlsaAsioDriver *driver, char *output,
+                                         size_t capacity);
 int32_t sidealsa_asio_get_channels(SideAlsaAsioDriver *driver, int32_t *inputs, int32_t *outputs);
 int32_t sidealsa_asio_get_buffer_size(SideAlsaAsioDriver *driver, int32_t *min_size,
                                       int32_t *max_size, int32_t *preferred_size,

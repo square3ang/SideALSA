@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     ffi::{CStr, c_char, c_int, c_uint, c_void},
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
@@ -66,6 +67,8 @@ pub struct SideAlsaStream {
     playback_latency_periods: u64,
     next_playback_sequence: Option<u64>,
     playback_cycle_sequence: Option<u64>,
+    last_observed_playback_sequence: Option<u64>,
+    last_playback_sequence: Option<u64>,
     start_sequence: Option<u64>,
     position: u64,
     running: bool,
@@ -85,8 +88,10 @@ pub unsafe extern "C" fn sidealsa_stream_open(
     rate_out: *mut c_uint,
     channels_out: *mut c_uint,
     period_out: *mut c_uint,
+    minimum_buffer_out: *mut c_uint,
     buffer_out: *mut c_uint,
     poll_fd_out: *mut c_int,
+    control_fd_out: *mut c_int,
 ) -> c_int {
     ffi_status(|| unsafe {
         if socket.is_null()
@@ -94,8 +99,10 @@ pub unsafe extern "C" fn sidealsa_stream_open(
             || rate_out.is_null()
             || channels_out.is_null()
             || period_out.is_null()
+            || minimum_buffer_out.is_null()
             || buffer_out.is_null()
             || poll_fd_out.is_null()
+            || control_fd_out.is_null()
         {
             return Err(libc::EINVAL);
         }
@@ -149,13 +156,19 @@ pub unsafe extern "C" fn sidealsa_stream_open(
         } else {
             0
         };
-        let poll_fd = stream.notification_fd().map_err(client_error_code)?;
         let requested_buffer_size = requested_buffer_size(
             mode,
             device_info.buffer_size,
             device_info.shared_buffer_size,
         );
         let buffer_size = plugin_buffer_size(device_info.period_size, requested_buffer_size);
+        let minimum_buffer_size = minimum_plugin_buffer_size(
+            mode,
+            direction,
+            device_info.period_size,
+            device_info.shared_latency_periods,
+            buffer_size,
+        );
         let buffer_frames = usize::try_from(buffer_size).map_err(|_| libc::EINVAL)?;
         let fifo_len = buffer_frames.checked_mul(channels).ok_or(libc::EINVAL)?;
         let playback_latency_periods = if playback && mode == MODE_SHARED {
@@ -163,6 +176,12 @@ pub unsafe extern "C" fn sidealsa_stream_open(
         } else {
             0
         };
+        let channels_out_value = u32::try_from(channels).map_err(|_| libc::EINVAL)?;
+        let poll_fd = stream.notification_fd().map_err(client_error_code)?;
+        let control_fd = stream.control_fd().map_err(|error| {
+            libc::close(poll_fd);
+            client_error_code(error)
+        })?;
         let stream = Box::new(SideAlsaStream {
             stream,
             pro: mode == MODE_PRO,
@@ -180,16 +199,20 @@ pub unsafe extern "C" fn sidealsa_stream_open(
             playback_latency_periods,
             next_playback_sequence: None,
             playback_cycle_sequence: None,
+            last_observed_playback_sequence: None,
+            last_playback_sequence: None,
             start_sequence: None,
             position: 0,
             running: false,
         });
         *stream_out = Box::into_raw(stream);
         *rate_out = device_info.rate;
-        *channels_out = u32::try_from(channels).map_err(|_| libc::EINVAL)?;
+        *channels_out = channels_out_value;
         *period_out = device_info.period_size;
+        *minimum_buffer_out = minimum_buffer_size;
         *buffer_out = buffer_size;
         *poll_fd_out = poll_fd;
+        *control_fd_out = control_fd;
         Ok(())
     })
 }
@@ -201,18 +224,7 @@ pub unsafe extern "C" fn sidealsa_stream_open(
 pub unsafe extern "C" fn sidealsa_stream_start(stream: *mut SideAlsaStream) -> c_int {
     ffi_status(|| unsafe {
         let stream = stream.as_mut().ok_or(libc::EINVAL)?;
-        stream.stream.start().map_err(client_error_code)?;
-        if !stream.running {
-            stream.start_sequence = stream.stream.activation_sequence();
-            stream.position = 0;
-            if let Err(error) = stream.flush_partial_playback() {
-                let _ = stream.stream.stop();
-                stream.reset_transfer_state();
-                return Err(error);
-            }
-            stream.running = true;
-        }
-        Ok(())
+        stream.start()
     })
 }
 
@@ -243,6 +255,32 @@ pub unsafe extern "C" fn sidealsa_stream_prepare(stream: *mut SideAlsaStream) ->
         stream.reset_transfer_state();
         stream.running = false;
         Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `stream` must be a live handle returned by `sidealsa_stream_open`.
+pub unsafe extern "C" fn sidealsa_stream_set_nonblock(
+    stream: *mut SideAlsaStream,
+    nonblock: c_int,
+) -> c_int {
+    ffi_status(|| unsafe {
+        let stream = stream.as_mut().ok_or(libc::EINVAL)?;
+        stream.nonblock = nonblock != 0;
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `stream` must be a live handle returned by `sidealsa_stream_open`.
+pub unsafe extern "C" fn sidealsa_stream_drain(stream: *mut SideAlsaStream) -> c_int {
+    ffi_status(|| unsafe {
+        let stream = stream.as_mut().ok_or(libc::EINVAL)?;
+        stream.drain()
     })
 }
 
@@ -289,6 +327,22 @@ pub unsafe extern "C" fn sidealsa_stream_close(stream: *mut SideAlsaStream) -> c
 }
 
 impl SideAlsaStream {
+    fn start(&mut self) -> Result<(), c_int> {
+        self.stream.start().map_err(client_error_code)?;
+        if self.running {
+            return Ok(());
+        }
+        self.start_sequence = self.stream.activation_sequence();
+        self.position = 0;
+        if let Err(error) = self.flush_partial_playback() {
+            let _ = self.stream.stop();
+            self.reset_transfer_state();
+            return Err(error);
+        }
+        self.running = true;
+        Ok(())
+    }
+
     fn position(&self) -> u64 {
         if !self.running {
             return self.position;
@@ -297,10 +351,8 @@ impl SideAlsaStream {
             .start_sequence
             .or_else(|| self.stream.activation_sequence())
         {
-            self.stream
-                .cycle_sequence()
-                .saturating_sub(origin)
-                .checked_mul(self.period_frames as u64)
+            sequence_forward_distance(origin, self.stream.cycle_sequence())
+                .and_then(|elapsed| elapsed.checked_mul(self.period_frames as u64))
                 .unwrap_or(self.position)
         } else {
             self.position
@@ -313,6 +365,8 @@ impl SideAlsaStream {
         self.capture_offset = 0;
         self.next_playback_sequence = None;
         self.playback_cycle_sequence = None;
+        self.last_observed_playback_sequence = None;
+        self.last_playback_sequence = None;
         self.start_sequence = None;
         self.position = 0;
         self.scratch.fill(0);
@@ -396,55 +450,127 @@ impl SideAlsaStream {
 
     fn flush_partial_playback(&mut self) -> Result<(), c_int> {
         if self.playback_fifo_frames > 0 && self.playback_fifo_frames < self.period_frames {
-            let start = self
-                .playback_fifo_frames
-                .checked_mul(self.channels)
-                .ok_or(libc::EOVERFLOW)?;
-            let end = self
-                .period_frames
-                .checked_mul(self.channels)
-                .ok_or(libc::EOVERFLOW)?;
-            self.playback_fifo[start..end].fill(0);
-            self.playback_fifo_frames = self.period_frames;
+            pad_final_playback_period(
+                &mut self.playback_fifo,
+                &mut self.playback_fifo_frames,
+                self.period_frames,
+                self.channels,
+            )?;
         }
         let _ = self.flush_playback_blocks()?;
         Ok(())
     }
 
+    fn drain(&mut self) -> Result<(), c_int> {
+        if !self.playback {
+            return Ok(());
+        }
+        if !self.running {
+            self.start()?;
+        }
+        pad_final_playback_period(
+            &mut self.playback_fifo,
+            &mut self.playback_fifo_frames,
+            self.period_frames,
+            self.channels,
+        )?;
+
+        while self.playback_fifo_frames >= self.period_frames {
+            let progressed = self.flush_playback_blocks()?;
+            if self.playback_fifo_frames < self.period_frames {
+                break;
+            }
+            if self.nonblock && !progressed {
+                return Err(libc::EAGAIN);
+            }
+        }
+
+        let Some(last_sequence) = self.last_playback_sequence else {
+            return Ok(());
+        };
+        loop {
+            if let Some(observed) = self.playback_cycle_sequence
+                && playback_sequence_consumed(
+                    last_sequence,
+                    observed,
+                    self.playback_latency_periods,
+                    self.pro,
+                )?
+            {
+                self.last_playback_sequence = None;
+                return Ok(());
+            }
+            let observed = self.wait_period()?;
+            self.observe_playback_cycle(observed)?;
+        }
+    }
+
     fn flush_playback_blocks(&mut self) -> Result<bool, c_int> {
         let mut progressed = false;
         while self.playback_fifo_frames >= self.period_frames {
-            let observed = match (self.playback_cycle_sequence, self.next_playback_sequence) {
-                (Some(observed), Some(next)) if next <= observed.saturating_add(1) => observed,
-                _ => match self.wait_period() {
-                    Ok(sequence) => {
-                        if self
-                            .playback_cycle_sequence
-                            .is_some_and(|previous| sequence < previous)
-                        {
-                            self.next_playback_sequence = None;
-                            self.playback_fifo_frames = 0;
-                            return Ok(progressed);
+            let reuse_observed = match (self.playback_cycle_sequence, self.next_playback_sequence) {
+                (Some(observed), Some(next)) => {
+                    match sequence_order(self.stream.cycle_sequence(), observed) {
+                        Some(Ordering::Equal) => {
+                            match sequence_order(
+                                next,
+                                latest_publishable_playback_sequence(observed),
+                            ) {
+                                Some(Ordering::Less | Ordering::Equal) => true,
+                                Some(Ordering::Greater) => false,
+                                None => {
+                                    self.clear_playback_fifo();
+                                    return Err(libc::EPIPE);
+                                }
+                            }
                         }
-                        self.playback_cycle_sequence = Some(sequence);
+                        Some(Ordering::Greater) => false,
+                        Some(Ordering::Less) | None => {
+                            self.clear_playback_fifo();
+                            return Err(libc::EPIPE);
+                        }
+                    }
+                }
+                _ => false,
+            };
+            let observed = if reuse_observed {
+                self.playback_cycle_sequence
+                    .expect("an observed cycle is available")
+            } else {
+                match self.wait_period() {
+                    Ok(sequence) => {
+                        self.observe_playback_cycle(sequence)?;
                         sequence
                     }
                     Err(libc::EAGAIN) if self.nonblock => return Ok(progressed),
                     Err(error) => return Err(error),
-                },
+                }
             };
             let queued_periods = self.playback_fifo_frames / self.period_frames;
-            let sequence = plan_playback_sequence_with_queue(
+            let plan = plan_playback_sequence_with_queue(
                 self.next_playback_sequence,
                 observed,
                 self.playback_latency_periods,
                 self.pro,
                 queued_periods,
-            );
+            )?;
+            if plan.expired_periods > 0 {
+                self.discard_playback_periods(plan.expired_periods)?;
+                self.next_playback_sequence = Some(plan.sequence);
+                return Err(libc::EPIPE);
+            }
+            let sequence = plan.sequence;
             self.next_playback_sequence = Some(sequence);
-            if sequence > observed.saturating_add(1) {
-                self.playback_cycle_sequence = None;
-                continue;
+            match sequence_order(sequence, latest_publishable_playback_sequence(observed)) {
+                Some(Ordering::Greater) => {
+                    self.playback_cycle_sequence = None;
+                    continue;
+                }
+                Some(Ordering::Less | Ordering::Equal) => {}
+                None => {
+                    self.clear_playback_fifo();
+                    return Err(libc::EPIPE);
+                }
             }
             let samples = self
                 .period_frames
@@ -456,29 +582,49 @@ impl SideAlsaStream {
                 .submit_playback(sequence, &self.scratch)
                 .map_err(client_error_code)?
             {
+                self.playback_cycle_sequence = None;
                 return Ok(progressed);
             }
             self.discard_playback_periods(1)?;
-            self.next_playback_sequence = Some(sequence.saturating_add(1));
+            self.next_playback_sequence = Some(sequence.wrapping_add(1));
+            self.last_playback_sequence = Some(sequence);
             self.update_position(sequence)?;
             progressed = true;
         }
         Ok(progressed)
     }
 
-    fn discard_playback_periods(&mut self, periods: usize) -> Result<(), c_int> {
-        let frames = periods
-            .saturating_mul(self.period_frames)
-            .min(self.playback_fifo_frames);
-        let samples = frames.checked_mul(self.channels).ok_or(libc::EOVERFLOW)?;
-        let remaining_frames = self.playback_fifo_frames - frames;
-        let remaining_samples = remaining_frames
-            .checked_mul(self.channels)
-            .ok_or(libc::EOVERFLOW)?;
-        self.playback_fifo
-            .copy_within(samples..samples + remaining_samples, 0);
-        self.playback_fifo_frames = remaining_frames;
+    fn observe_playback_cycle(&mut self, sequence: u64) -> Result<(), c_int> {
+        if let Some(previous) = self.last_observed_playback_sequence
+            && !matches!(
+                sequence_order(sequence, previous),
+                Some(Ordering::Equal | Ordering::Greater)
+            )
+        {
+            self.clear_playback_fifo();
+            return Err(libc::EPIPE);
+        }
+        self.last_observed_playback_sequence = Some(sequence);
+        self.playback_cycle_sequence = Some(sequence);
         Ok(())
+    }
+
+    fn clear_playback_fifo(&mut self) {
+        self.playback_fifo_frames = 0;
+        self.next_playback_sequence = None;
+        self.playback_cycle_sequence = None;
+        self.last_observed_playback_sequence = None;
+        self.last_playback_sequence = None;
+    }
+
+    fn discard_playback_periods(&mut self, periods: usize) -> Result<(), c_int> {
+        discard_playback_fifo_periods(
+            &mut self.playback_fifo,
+            &mut self.playback_fifo_frames,
+            periods,
+            self.period_frames,
+            self.channels,
+        )
     }
 
     fn transfer_capture(
@@ -573,8 +719,12 @@ impl SideAlsaStream {
             .start_sequence
             .or_else(|| self.stream.activation_sequence())
             .ok_or(libc::EIO)?;
-        self.position = sequence
-            .saturating_sub(origin)
+        let elapsed = match sequence_order(sequence, origin) {
+            Some(Ordering::Less | Ordering::Equal) => 0,
+            Some(Ordering::Greater) => sequence.wrapping_sub(origin),
+            None => return Err(libc::EPIPE),
+        };
+        self.position = elapsed
             .checked_mul(self.period_frames as u64)
             .ok_or(libc::EOVERFLOW)?;
         Ok(())
@@ -589,28 +739,141 @@ fn wait_timeout(nonblock: bool) -> Duration {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlaybackSequencePlan {
+    sequence: u64,
+    expired_periods: usize,
+}
+
 fn plan_playback_sequence_with_queue(
     next: Option<u64>,
     observed: u64,
     latency: u64,
     same_cycle: bool,
     queued_periods: usize,
-) -> u64 {
-    let newest = if same_cycle {
-        observed
-    } else {
-        observed.saturating_add(1)
-    };
+) -> Result<PlaybackSequencePlan, c_int> {
+    let newest = newest_playback_sequence(observed, same_cycle);
     let earliest = if same_cycle {
         observed
     } else {
-        observed
-            .checked_sub(latency)
-            .map_or(0, |sequence| sequence.saturating_add(1))
+        observed.wrapping_sub(latency).wrapping_add(1)
     };
-    let queued_behind = u64::try_from(queued_periods.saturating_sub(1)).unwrap_or(u64::MAX);
-    let aligned = newest.saturating_sub(queued_behind).max(earliest);
-    next.unwrap_or(aligned).max(aligned)
+    if let Some(next) = next {
+        return match sequence_order(next, earliest) {
+            Some(Ordering::Less) => Ok(PlaybackSequencePlan {
+                sequence: earliest,
+                expired_periods: usize::try_from(earliest.wrapping_sub(next)).unwrap_or(usize::MAX),
+            }),
+            Some(Ordering::Equal | Ordering::Greater) => Ok(PlaybackSequencePlan {
+                sequence: next,
+                expired_periods: 0,
+            }),
+            None => Err(libc::EPIPE),
+        };
+    }
+
+    let queued_behind =
+        u64::try_from(queued_periods.saturating_sub(1)).map_err(|_| libc::EOVERFLOW)?;
+    let aligned = newest.wrapping_sub(queued_behind);
+    let sequence = match sequence_order(aligned, earliest) {
+        Some(Ordering::Less) => earliest,
+        Some(Ordering::Equal | Ordering::Greater) => aligned,
+        None => return Err(libc::EPIPE),
+    };
+    Ok(PlaybackSequencePlan {
+        sequence,
+        expired_periods: 0,
+    })
+}
+
+fn newest_playback_sequence(observed: u64, same_cycle: bool) -> u64 {
+    if same_cycle {
+        observed
+    } else {
+        observed.wrapping_add(1)
+    }
+}
+
+fn latest_publishable_playback_sequence(observed: u64) -> u64 {
+    observed.wrapping_add(1)
+}
+
+fn playback_sequence_consumed(
+    submitted: u64,
+    observed: u64,
+    latency: u64,
+    same_cycle: bool,
+) -> Result<bool, c_int> {
+    let consumed_at = submitted.wrapping_add(if same_cycle { 1 } else { latency });
+    match sequence_order(observed, consumed_at) {
+        Some(Ordering::Less) => Ok(false),
+        Some(Ordering::Equal | Ordering::Greater) => Ok(true),
+        None => Err(libc::EPIPE),
+    }
+}
+
+fn sequence_order(candidate: u64, reference: u64) -> Option<Ordering> {
+    const HALF_RANGE: u64 = 1_u64 << 63;
+
+    let distance = candidate.wrapping_sub(reference);
+    if distance == 0 {
+        Some(Ordering::Equal)
+    } else if distance < HALF_RANGE {
+        Some(Ordering::Greater)
+    } else if distance == HALF_RANGE {
+        None
+    } else {
+        Some(Ordering::Less)
+    }
+}
+
+fn sequence_forward_distance(origin: u64, current: u64) -> Option<u64> {
+    match sequence_order(current, origin) {
+        Some(Ordering::Equal) => Some(0),
+        Some(Ordering::Greater) => Some(current.wrapping_sub(origin)),
+        Some(Ordering::Less) | None => None,
+    }
+}
+
+fn pad_final_playback_period(
+    fifo: &mut [i32],
+    queued_frames: &mut usize,
+    period_frames: usize,
+    channels: usize,
+) -> Result<(), c_int> {
+    let remainder = *queued_frames % period_frames;
+    if remainder == 0 {
+        return Ok(());
+    }
+    let padded_frames = queued_frames
+        .checked_add(period_frames - remainder)
+        .ok_or(libc::EOVERFLOW)?;
+    let start = queued_frames.checked_mul(channels).ok_or(libc::EOVERFLOW)?;
+    let end = padded_frames.checked_mul(channels).ok_or(libc::EOVERFLOW)?;
+    if end > fifo.len() {
+        return Err(libc::EOVERFLOW);
+    }
+    fifo[start..end].fill(0);
+    *queued_frames = padded_frames;
+    Ok(())
+}
+
+fn discard_playback_fifo_periods(
+    fifo: &mut [i32],
+    queued_frames: &mut usize,
+    periods: usize,
+    period_frames: usize,
+    channels: usize,
+) -> Result<(), c_int> {
+    let frames = periods.saturating_mul(period_frames).min(*queued_frames);
+    let samples = frames.checked_mul(channels).ok_or(libc::EOVERFLOW)?;
+    let remaining_frames = *queued_frames - frames;
+    let remaining_samples = remaining_frames
+        .checked_mul(channels)
+        .ok_or(libc::EOVERFLOW)?;
+    fifo.copy_within(samples..samples + remaining_samples, 0);
+    *queued_frames = remaining_frames;
+    Ok(())
 }
 
 fn copy_into_fifo(
@@ -655,6 +918,24 @@ fn requested_buffer_size(mode: c_int, hardware: u32, shared: u32) -> u32 {
     } else {
         hardware
     }
+}
+
+fn minimum_plugin_buffer_size(
+    mode: c_int,
+    direction: c_int,
+    period_size: u32,
+    shared_latency_periods: u32,
+    maximum_buffer_size: u32,
+) -> u32 {
+    if mode != MODE_SHARED {
+        return maximum_buffer_size;
+    }
+    let periods = if direction == STREAM_PLAYBACK {
+        shared_latency_periods.saturating_add(1).max(2)
+    } else {
+        2
+    };
+    period_size.saturating_mul(periods).min(maximum_buffer_size)
 }
 
 unsafe fn copy_from_area(
@@ -740,9 +1021,8 @@ fn client_error_code(error: ClientError) -> c_int {
             sidealsa_protocol::ErrorCode::Internal => libc::EIO,
         },
         ClientError::InvalidDescriptorCount(_) => libc::EPROTO,
-        ClientError::Closed | ClientError::NotStarted | ClientError::CaptureDiscontinuity => {
-            libc::EPIPE
-        }
+        ClientError::Closed => libc::ENODEV,
+        ClientError::NotStarted | ClientError::CaptureDiscontinuity => libc::EPIPE,
         ClientError::MissingDirection(_) | ClientError::BufferNotReady => libc::EINVAL,
         ClientError::Timeout => libc::EAGAIN,
     }
@@ -768,6 +1048,17 @@ where
 mod tests {
     use super::*;
 
+    fn playback_plan(
+        next: Option<u64>,
+        observed: u64,
+        latency: u64,
+        same_cycle: bool,
+        queued_periods: usize,
+    ) -> PlaybackSequencePlan {
+        plan_playback_sequence_with_queue(next, observed, latency, same_cycle, queued_periods)
+            .expect("test sequence should have an unambiguous order")
+    }
+
     #[test]
     fn ioplug_buffer_has_at_least_two_periods() {
         assert_eq!(plugin_buffer_size(32, 64), 64);
@@ -776,6 +1067,18 @@ mod tests {
         assert_eq!(plugin_buffer_size(64, 256), 256);
         assert_eq!(requested_buffer_size(MODE_PRO, 192, 256), 192);
         assert_eq!(requested_buffer_size(MODE_SHARED, 192, 256), 256);
+        assert_eq!(
+            minimum_plugin_buffer_size(MODE_SHARED, STREAM_PLAYBACK, 64, 3, 512),
+            256
+        );
+        assert_eq!(
+            minimum_plugin_buffer_size(MODE_SHARED, STREAM_CAPTURE, 64, 3, 512),
+            128
+        );
+        assert_eq!(
+            minimum_plugin_buffer_size(MODE_PRO, STREAM_PLAYBACK, 64, 3, 192),
+            192
+        );
     }
 
     #[test]
@@ -832,42 +1135,144 @@ mod tests {
     }
 
     #[test]
-    fn late_shared_callback_leaves_one_gap_then_realigns() {
+    fn labeled_shared_fifo_sequence_is_never_moved_forward() {
         assert_eq!(
-            plan_playback_sequence_with_queue(Some(103), 103, 3, false, 1),
-            104
+            playback_plan(Some(103), 103, 3, false, 1),
+            PlaybackSequencePlan {
+                sequence: 103,
+                expired_periods: 0,
+            }
         );
         assert_eq!(
-            plan_playback_sequence_with_queue(Some(105), 104, 3, false, 1),
-            105
-        );
-    }
-
-    #[test]
-    fn coalesced_shared_callback_uses_available_catchup_blocks() {
-        assert_eq!(
-            plan_playback_sequence_with_queue(Some(103), 103, 3, false, 2),
-            103
-        );
-        assert_eq!(
-            plan_playback_sequence_with_queue(Some(104), 103, 3, false, 1),
-            104
+            playback_plan(Some(105), 104, 3, false, 1),
+            PlaybackSequencePlan {
+                sequence: 105,
+                expired_periods: 0,
+            }
         );
     }
 
     #[test]
-    fn pro_submits_the_observed_same_cycle_sequence() {
+    fn unlabeled_shared_fifo_uses_available_catchup_blocks() {
         assert_eq!(
-            plan_playback_sequence_with_queue(None, 100, 0, true, 1),
-            100
+            playback_plan(None, 103, 3, false, 2),
+            PlaybackSequencePlan {
+                sequence: 103,
+                expired_periods: 0,
+            }
         );
         assert_eq!(
-            plan_playback_sequence_with_queue(Some(101), 101, 0, true, 1),
-            101
+            playback_plan(Some(104), 103, 3, false, 1),
+            PlaybackSequencePlan {
+                sequence: 104,
+                expired_periods: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn expired_fifo_periods_are_counted_instead_of_relabelled() {
+        assert_eq!(
+            playback_plan(Some(101), 104, 3, false, 3),
+            PlaybackSequencePlan {
+                sequence: 102,
+                expired_periods: 1,
+            }
         );
         assert_eq!(
-            plan_playback_sequence_with_queue(Some(101), 103, 0, true, 1),
-            103
+            playback_plan(Some(101), 106, 3, false, 1),
+            PlaybackSequencePlan {
+                sequence: 104,
+                expired_periods: 3,
+            }
         );
+        assert_eq!(
+            playback_plan(Some(u64::MAX), 1, 2, false, 1),
+            PlaybackSequencePlan {
+                sequence: 0,
+                expired_periods: 1,
+            }
+        );
+
+        let mut fifo = [10, 11, 20, 21, 30, 31];
+        let mut queued_frames = 6;
+        discard_playback_fifo_periods(&mut fifo, &mut queued_frames, 2, 2, 1)
+            .expect("expired periods should be discarded");
+        assert_eq!(queued_frames, 2);
+        assert_eq!(&fifo[..2], &[30, 31]);
+
+        let mut exhausted_fifo = [10, 11];
+        let mut exhausted_frames = 2;
+        discard_playback_fifo_periods(&mut exhausted_fifo, &mut exhausted_frames, 3, 2, 1)
+            .expect("expiry beyond the queue should discard the whole queue");
+        assert_eq!(exhausted_frames, 0);
+    }
+
+    #[test]
+    fn pro_expiry_uses_same_cycle_deadline_across_wrap() {
+        assert_eq!(
+            playback_plan(None, 100, 0, true, 1),
+            PlaybackSequencePlan {
+                sequence: 100,
+                expired_periods: 0,
+            }
+        );
+        assert_eq!(
+            playback_plan(Some(101), 101, 0, true, 1),
+            PlaybackSequencePlan {
+                sequence: 101,
+                expired_periods: 0,
+            }
+        );
+        assert_eq!(
+            playback_plan(Some(u64::MAX), 1, 0, true, 1),
+            PlaybackSequencePlan {
+                sequence: 1,
+                expired_periods: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn sequence_order_uses_wrapping_half_range() {
+        assert_eq!(sequence_order(0, u64::MAX), Some(Ordering::Greater));
+        assert_eq!(sequence_order(u64::MAX, 0), Some(Ordering::Less));
+        assert_eq!(sequence_order(1_u64 << 63, 0), None);
+        assert_eq!(sequence_forward_distance(u64::MAX - 1, 1), Some(3));
+    }
+
+    #[test]
+    fn drain_padding_preserves_samples_and_silences_final_period() {
+        let mut fifo = [-1_i32; 16];
+        let mut queued_frames = 6;
+
+        pad_final_playback_period(&mut fifo, &mut queued_frames, 4, 2)
+            .expect("final playback period should fit");
+
+        assert_eq!(queued_frames, 8);
+        assert_eq!(&fifo[..12], &[-1; 12]);
+        assert_eq!(&fifo[12..], &[0; 4]);
+    }
+
+    #[test]
+    fn drain_consumption_deadline_wraps_with_sequence() {
+        assert!(
+            !playback_sequence_consumed(u64::MAX, 1, 3, false)
+                .expect("nearby sequences should be ordered")
+        );
+        assert!(
+            playback_sequence_consumed(u64::MAX, 2, 3, false)
+                .expect("nearby sequences should be ordered")
+        );
+        assert!(
+            playback_sequence_consumed(u64::MAX, 0, 0, true)
+                .expect("nearby sequences should be ordered")
+        );
+    }
+
+    #[test]
+    fn daemon_disconnect_is_terminal_for_alsa() {
+        assert_eq!(client_error_code(ClientError::Closed), libc::ENODEV);
+        assert_eq!(client_error_code(ClientError::Timeout), libc::EAGAIN);
     }
 }

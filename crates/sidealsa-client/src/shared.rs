@@ -10,8 +10,9 @@ use std::{
 
 use sidealsa_protocol::{
     SHARED_ACTIVATION_CLAIMED, SHARED_ACTIVATION_PENDING, SHARED_ACTIVATION_READY,
-    SHARED_CLIENT_IDLE, SHARED_MAGIC, SHARED_SLOT_FREE, SHARED_SLOT_READY, SHARED_VERSION,
-    SharedRegionHeader, SharedRegionInfo, SharedRegionLayout, SharedSlotHeader,
+    SHARED_CLIENT_IDLE, SHARED_MAGIC, SHARED_SLOT_FREE, SHARED_SLOT_READING, SHARED_SLOT_READY,
+    SHARED_SLOT_WRITING, SHARED_VERSION, SharedRegionHeader, SharedRegionInfo, SharedRegionLayout,
+    SharedSlotHeader,
 };
 use thiserror::Error;
 
@@ -25,6 +26,13 @@ pub enum SharedError {
     Map,
     #[error("shared memory header is invalid")]
     InvalidHeader,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaybackConsume {
+    Ready,
+    Late,
+    Missing,
 }
 
 pub struct SharedRegion {
@@ -52,7 +60,9 @@ impl SharedRegion {
             sidealsa_protocol::SHARED_SLOT_COUNT,
         )?;
         let name = CString::new("sidealsa-pro").expect("static name has no nul");
-        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        let fd = unsafe {
+            libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+        };
         if fd < 0 {
             return Err(io::Error::last_os_error().into());
         }
@@ -68,6 +78,10 @@ impl SharedRegion {
             }
         };
         region.initialize();
+        let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+        if unsafe { libc::fcntl(region.fd, libc::F_ADD_SEALS, seals) } < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
         Ok(region)
     }
 
@@ -257,6 +271,16 @@ impl SharedRegion {
         self.header().lifecycle_generation.load(Ordering::Acquire)
     }
 
+    pub fn set_hardware_generation(&self, generation: u64) {
+        self.header()
+            .hardware_generation
+            .store(generation, Ordering::Release);
+    }
+
+    pub fn hardware_generation(&self) -> u64 {
+        self.header().hardware_generation.load(Ordering::Acquire)
+    }
+
     pub fn set_client_state(&self, state: u32) {
         self.header().client_state.store(state, Ordering::Release);
     }
@@ -357,6 +381,7 @@ impl SharedRegion {
             producer_index,
             sequence,
             samples,
+            false,
         )
     }
 
@@ -375,6 +400,7 @@ impl SharedRegion {
             producer_index,
             sequence,
             samples,
+            true,
         );
         if published {
             self.set_client_state(sidealsa_protocol::SHARED_CLIENT_RUNNING);
@@ -393,6 +419,7 @@ impl SharedRegion {
         producer_index: &mut usize,
         sequence: u64,
         samples: &[i32],
+        timestamp_publication: bool,
     ) -> bool {
         if sample_count == 0 {
             return false;
@@ -404,7 +431,16 @@ impl SharedRegion {
         for offset in 0..slot_count {
             let index = (*producer_index + offset) % slot_count;
             let slot = unsafe { self.slot(ring_offset, index) };
-            if slot.state.load(Ordering::Acquire) != SHARED_SLOT_FREE {
+            if slot
+                .state
+                .compare_exchange(
+                    SHARED_SLOT_FREE,
+                    SHARED_SLOT_WRITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
                 continue;
             }
             unsafe {
@@ -412,6 +448,17 @@ impl SharedRegion {
                     .copy_from_slice(&samples[..sample_count]);
             }
             slot.sequence.store(sequence, Ordering::Relaxed);
+            let published_nanos = if timestamp_publication {
+                let Some(published_nanos) = monotonic_nanos() else {
+                    slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
+                    return false;
+                };
+                published_nanos
+            } else {
+                0
+            };
+            slot.published_nanos
+                .store(published_nanos, Ordering::Relaxed);
             slot.state.store(SHARED_SLOT_READY, Ordering::Release);
             *producer_index = next_index(index, slot_count);
             return true;
@@ -424,6 +471,22 @@ impl SharedRegion {
             self.layout.playback_offset(),
             self.playback_samples,
             sequence,
+            None,
+            samples,
+        ) == PlaybackConsume::Ready
+    }
+
+    pub fn try_consume_playback_before(
+        &self,
+        sequence: u64,
+        cutoff_nanos: u64,
+        samples: &mut [i32],
+    ) -> PlaybackConsume {
+        self.try_consume_exact(
+            self.layout.playback_offset(),
+            self.playback_samples,
+            sequence,
+            Some(cutoff_nanos),
             samples,
         )
     }
@@ -433,13 +496,14 @@ impl SharedRegion {
         ring_offset: usize,
         sample_count: usize,
         expected_sequence: u64,
+        cutoff_nanos: Option<u64>,
         samples: &mut [i32],
-    ) -> bool {
+    ) -> PlaybackConsume {
         if sample_count == 0 {
-            return false;
+            return PlaybackConsume::Missing;
         }
         if samples.len() < sample_count {
-            return false;
+            return PlaybackConsume::Missing;
         }
         let mut exact_index = None;
         for index in 0..self.layout.slot_count() {
@@ -455,26 +519,44 @@ impl SharedRegion {
                 if exact_index.is_none() {
                     exact_index = Some(index);
                 } else {
-                    slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
+                    reclaim_ready_slot(slot);
                 }
                 continue;
             }
-            slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
+            reclaim_ready_slot(slot);
         }
         let Some(index) = exact_index else {
-            return false;
+            return PlaybackConsume::Missing;
         };
         let slot = unsafe { self.slot(ring_offset, index) };
-        if slot.state.load(Ordering::Acquire) != SHARED_SLOT_READY
-            || slot.sequence.load(Ordering::Relaxed) != expected_sequence
+        if slot
+            .state
+            .compare_exchange(
+                SHARED_SLOT_READY,
+                SHARED_SLOT_READING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
         {
-            return false;
+            return PlaybackConsume::Missing;
+        }
+        if slot.sequence.load(Ordering::Relaxed) != expected_sequence {
+            slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
+            return PlaybackConsume::Missing;
+        }
+        if cutoff_nanos.is_some_and(|cutoff| {
+            let published = slot.published_nanos.load(Ordering::Relaxed);
+            published == 0 || published > cutoff
+        }) {
+            slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
+            return PlaybackConsume::Late;
         }
         unsafe {
             samples[..sample_count].copy_from_slice(self.audio(ring_offset, index, sample_count));
         }
         slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
-        true
+        PlaybackConsume::Ready
     }
 
     pub fn try_client_read_capture(
@@ -490,6 +572,22 @@ impl SharedRegion {
         }
         let (index, sequence) = self.next_ready_capture_slot(*consumer_index)?;
         let slot = unsafe { self.slot(self.layout.capture_offset(), index) };
+        if slot
+            .state
+            .compare_exchange(
+                SHARED_SLOT_READY,
+                SHARED_SLOT_READING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        if slot.sequence.load(Ordering::Relaxed) != sequence {
+            slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
+            return None;
+        }
         unsafe {
             samples[..self.capture_samples].copy_from_slice(self.audio(
                 self.layout.capture_offset(),
@@ -553,7 +651,7 @@ impl SharedRegion {
             }
             let sequence = slot.sequence.load(Ordering::Relaxed);
             if sequence_is_before(sequence, minimum_sequence) {
-                slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
+                reclaim_ready_slot(slot);
                 self.header()
                     .client_expired_capture_blocks
                     .fetch_add(1, Ordering::Relaxed);
@@ -587,7 +685,7 @@ impl SharedRegion {
             }
             let sequence = slot.sequence.load(Ordering::Relaxed);
             if sequence_is_before(sequence, minimum_sequence) {
-                slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
+                reclaim_ready_slot(slot);
                 self.header()
                     .client_expired_capture_blocks
                     .fetch_add(1, Ordering::Relaxed);
@@ -601,6 +699,22 @@ impl SharedRegion {
 
         let (index, sequence, _) = selected?;
         let slot = unsafe { self.slot(self.layout.capture_offset(), index) };
+        if slot
+            .state
+            .compare_exchange(
+                SHARED_SLOT_READY,
+                SHARED_SLOT_READING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        if slot.sequence.load(Ordering::Relaxed) != sequence {
+            slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
+            return None;
+        }
         unsafe {
             samples[..self.capture_samples].copy_from_slice(self.audio(
                 self.layout.capture_offset(),
@@ -674,6 +788,37 @@ fn activation_token(generation: u64, state: u64) -> u64 {
     generation.wrapping_shl(2) | state
 }
 
+fn reclaim_ready_slot(slot: &SharedSlotHeader) {
+    if slot
+        .state
+        .compare_exchange(
+            SHARED_SLOT_READY,
+            SHARED_SLOT_READING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
+    }
+}
+
+fn monotonic_nanos() -> Option<u64> {
+    let mut timestamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } != 0 {
+        return None;
+    }
+    Some(
+        u64::try_from(timestamp.tv_sec)
+            .ok()?
+            .saturating_mul(1_000_000_000)
+            .saturating_add(u64::try_from(timestamp.tv_nsec).ok()?),
+    )
+}
+
 fn sample_count(frames: u32, channels: u32) -> Result<usize, SharedError> {
     usize::try_from(u64::from(frames) * u64::from(channels))
         .map_err(|_| SharedError::Protocol(sidealsa_protocol::ProtocolError::LayoutOverflow))
@@ -738,6 +883,51 @@ mod tests {
         let mut received_playback = [0; 8];
         assert!(server.try_consume_playback(13, &mut received_playback));
         assert_eq!(received_playback, playback);
+    }
+
+    #[test]
+    fn playback_cutoff_rejects_blocks_published_after_deadline() {
+        let region = SharedRegion::create(1, 1, 0).expect("region should create");
+        let mut producer_index = 0;
+        let mut samples = [0];
+
+        assert!(region.try_client_publish_playback(&mut producer_index, 7, &[7]));
+        assert_eq!(
+            region.try_consume_playback_before(7, 0, &mut samples),
+            PlaybackConsume::Late
+        );
+        assert!(region.try_client_publish_playback(&mut producer_index, 8, &[8]));
+        assert_eq!(
+            region.try_consume_playback_before(8, u64::MAX, &mut samples),
+            PlaybackConsume::Ready
+        );
+        assert_eq!(samples, [8]);
+    }
+
+    #[test]
+    fn playback_ready_slot_carries_publication_timestamp() {
+        let region = SharedRegion::create(1, 1, 0).expect("region should create");
+        let mut producer_index = 0;
+        let before = monotonic_nanos().expect("monotonic clock should be available");
+
+        assert!(region.try_client_publish_playback(&mut producer_index, 7, &[7]));
+
+        let after = monotonic_nanos().expect("monotonic clock should be available");
+        let slot = unsafe { region.slot(region.layout.playback_offset(), 0) };
+        assert_eq!(slot.state.load(Ordering::Acquire), SHARED_SLOT_READY);
+        let published = slot.published_nanos.load(Ordering::Relaxed);
+        assert!((before..=after).contains(&published));
+    }
+
+    #[test]
+    fn shared_memfd_cannot_be_resized_by_client() {
+        let region = SharedRegion::create(1, 1, 0).expect("region should create");
+        let size = region.info().size as libc::off_t;
+
+        assert_eq!(unsafe { libc::ftruncate(region.fd(), size - 1) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+        assert_eq!(unsafe { libc::ftruncate(region.fd(), size + 1) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
     }
 
     #[test]

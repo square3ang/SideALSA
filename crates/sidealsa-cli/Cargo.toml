@@ -14,6 +14,10 @@ name = "sidealsa-pro-client-test"
 path = "src/bin/sidealsa-pro-client-test.rs"
 
 [[bin]]
+name = "sidealsa-loopback-test"
+path = "src/bin/sidealsa-loopback-test.rs"
+
+[[bin]]
 name = "sidealsa-stats"
 path = "src/bin/sidealsa-stats.rs"
 

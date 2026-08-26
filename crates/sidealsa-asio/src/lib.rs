@@ -2,16 +2,16 @@
 
 use std::{
     ffi::{CStr, c_char, c_int, c_void},
-    os::fd::RawFd,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
     ptr, slice,
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use sidealsa_client::{AudioStream, ClientError, SideAlsaClient};
@@ -23,10 +23,13 @@ pub const ASIO_INVALID_PARAMETER: c_int = -998;
 pub const ASIO_NO_IO: c_int = -1000;
 pub const ASIO_BUFFER_SIZE_NOT_SUPPORTED: c_int = -997;
 pub const ASIO_HW_MALFUNCTION: c_int = -999;
-pub const ASIO_NO_MEMORY: c_int = -9991;
+pub const ASIO_NO_MEMORY: c_int = -994;
 pub const ASIO_SAMPLE_RATE_NOT_SUPPORTED: c_int = -995;
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub const ASIOST_FLOAT32_LSB: c_int = 19;
+const ASIO_MESSAGE_RESET_REQUEST: c_int = 3;
+const ASIO_MESSAGE_RESYNC_REQUEST: c_int = 5;
 pub const ASIO_MESSAGE_SUPPORTS_TIME_INFO: c_int = 7;
 
 #[repr(C)]
@@ -88,7 +91,7 @@ pub type ThreadCreate = unsafe extern "C" fn(
     handle: *mut *mut c_void,
     thread_id: *mut u32,
 ) -> c_int;
-pub type ThreadJoin = unsafe extern "C" fn(handle: *mut c_void) -> c_int;
+pub type ThreadJoin = unsafe extern "C" fn(handle: *mut c_void, timeout_ms: u32) -> c_int;
 pub type CurrentThreadId = unsafe extern "C" fn() -> u32;
 
 #[repr(C)]
@@ -127,6 +130,97 @@ enum DriverState {
     Destroying,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+enum WorkerFailure {
+    DaemonDisconnected = 1,
+    CaptureDiscontinuity = 2,
+    Callback = 3,
+    Stream = 4,
+}
+
+impl WorkerFailure {
+    fn from_error(error: &AsioError) -> Self {
+        match error {
+            AsioError::DaemonDisconnected | AsioError::Client(ClientError::Closed) => {
+                Self::DaemonDisconnected
+            }
+            AsioError::CaptureSequenceBackward
+            | AsioError::Client(ClientError::CaptureDiscontinuity) => Self::CaptureDiscontinuity,
+            AsioError::CallbackPanic => Self::Callback,
+            _ => Self::Stream,
+        }
+    }
+
+    fn from_raw(value: u64) -> Option<Self> {
+        match value {
+            1 => Some(Self::DaemonDisconnected),
+            2 => Some(Self::CaptureDiscontinuity),
+            3 => Some(Self::Callback),
+            4 => Some(Self::Stream),
+            _ => None,
+        }
+    }
+
+    fn error(self) -> AsioError {
+        match self {
+            Self::DaemonDisconnected => AsioError::DaemonDisconnected,
+            Self::CaptureDiscontinuity => {
+                AsioError::WorkerStopped("audio capture must be resynchronized")
+            }
+            Self::Callback => AsioError::WorkerStopped("host audio callback failed"),
+            Self::Stream => AsioError::WorkerStopped("audio stream failed"),
+        }
+    }
+
+    fn notification(self) -> Option<c_int> {
+        match self {
+            Self::CaptureDiscontinuity => Some(ASIO_MESSAGE_RESYNC_REQUEST),
+            Self::DaemonDisconnected | Self::Stream => Some(ASIO_MESSAGE_RESET_REQUEST),
+            Self::Callback => None,
+        }
+    }
+}
+
+struct PositionSnapshot {
+    sequence: AtomicU64,
+    samples: AtomicU64,
+    stamp: AtomicU64,
+}
+
+impl PositionSnapshot {
+    const fn new() -> Self {
+        Self {
+            sequence: AtomicU64::new(0),
+            samples: AtomicU64::new(0),
+            stamp: AtomicU64::new(0),
+        }
+    }
+
+    fn publish(&self, samples: u64, stamp: u64) {
+        self.sequence.fetch_add(1, Ordering::SeqCst);
+        self.samples.store(samples, Ordering::SeqCst);
+        self.stamp.store(stamp, Ordering::SeqCst);
+        self.sequence.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn load(&self) -> (u64, u64) {
+        loop {
+            let before = self.sequence.load(Ordering::SeqCst);
+            if before & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let samples = self.samples.load(Ordering::SeqCst);
+            let stamp = self.stamp.load(Ordering::SeqCst);
+            let after = self.sequence.load(Ordering::SeqCst);
+            if before == after {
+                return (samples, stamp);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AsioError {
     #[error("driver is in an invalid state")]
@@ -145,14 +239,20 @@ pub enum AsioError {
     Client(#[from] ClientError),
     #[error("worker thread failed")]
     Worker,
+    #[error("timed out waiting for the audio worker")]
+    WorkerTimeout,
     #[error("realtime scheduling failed: {0}")]
     RealtimeScheduling(#[source] std::io::Error),
     #[error("worker callback panicked")]
     CallbackPanic,
     #[error("driver method called from audio callback")]
     Reentrant,
+    #[error("capture sequence moved backward")]
+    CaptureSequenceBackward,
+    #[error("SideALSA daemon disconnected")]
+    DaemonDisconnected,
     #[error("audio worker stopped: {0}")]
-    WorkerStopped(String),
+    WorkerStopped(&'static str),
 }
 
 impl AsioError {
@@ -165,7 +265,10 @@ impl AsioError {
             Self::NoMemory => ASIO_NO_MEMORY,
             Self::Client(_)
             | Self::Worker
+            | Self::WorkerTimeout
             | Self::RealtimeScheduling(_)
+            | Self::CaptureSequenceBackward
+            | Self::DaemonDisconnected
             | Self::WorkerStopped(_) => ASIO_HW_MALFUNCTION,
             Self::CallbackPanic | Self::Reentrant => ASIO_NO_IO,
         }
@@ -183,15 +286,17 @@ struct DriverInner {
     time_info: bool,
     worker: Option<WorkerHandle>,
     worker_thread: Option<u32>,
-    sample_position: Arc<AtomicU64>,
-    time_stamp: Arc<AtomicU64>,
+    quiesce_generation: Option<u64>,
+    position: Arc<PositionSnapshot>,
+    worker_failure: Option<WorkerFailure>,
     last_error: Option<String>,
 }
 
 pub struct AsioDriver {
     inner: Mutex<DriverInner>,
-    worker_done: Condvar,
+    lifecycle: Mutex<()>,
     thread_ops: Option<ThreadOps>,
+    control_timeout: Duration,
 }
 
 impl AsioDriver {
@@ -200,6 +305,13 @@ impl AsioDriver {
     }
 
     fn new_with_thread_ops(thread_ops: Option<ThreadOps>) -> Self {
+        Self::new_with_thread_ops_and_timeout(thread_ops, CONTROL_TIMEOUT)
+    }
+
+    fn new_with_thread_ops_and_timeout(
+        thread_ops: Option<ThreadOps>,
+        control_timeout: Duration,
+    ) -> Self {
         Self {
             inner: Mutex::new(DriverInner {
                 state: DriverState::Loaded,
@@ -212,44 +324,59 @@ impl AsioDriver {
                 time_info: false,
                 worker: None,
                 worker_thread: None,
-                sample_position: Arc::new(AtomicU64::new(0)),
-                time_stamp: Arc::new(AtomicU64::new(0)),
+                quiesce_generation: None,
+                position: Arc::new(PositionSnapshot::new()),
+                worker_failure: None,
                 last_error: None,
             }),
-            worker_done: Condvar::new(),
+            lifecycle: Mutex::new(()),
             thread_ops,
+            control_timeout,
         }
     }
 
     pub fn init(&self, socket: impl AsRef<Path>) -> Result<(), AsioError> {
-        let mut client = SideAlsaClient::connect(socket)?;
-        let device = client.get_info()?;
-        let stream = client.open_pro()?;
-        let shared = stream.info();
+        let result = (|| {
+            let mut client = SideAlsaClient::connect_with_timeout(socket, self.control_timeout)?;
+            let device = client.get_info()?;
+            let stream = client.open_pro()?;
+            let shared = stream.info();
 
-        let mut inner = self.lock()?;
-        if inner.state != DriverState::Loaded {
-            return Err(AsioError::InvalidState);
-        }
-        if shared.period_frames != device.period_size
-            || shared.playback_channels != device.playback_channels
-            || shared.capture_channels != device.capture_channels
+            let mut inner = self.lock()?;
+            if inner.state != DriverState::Loaded {
+                return Err(AsioError::InvalidState);
+            }
+            if shared.period_frames != device.period_size
+                || shared.playback_channels != device.playback_channels
+                || shared.capture_channels != device.capture_channels
+            {
+                return Err(AsioError::NoIo);
+            }
+            inner.device = Some(device);
+            inner.shared = Some(shared);
+            inner.stream = Some(stream);
+            inner.worker_failure = None;
+            inner.last_error = None;
+            inner.state = DriverState::Initialized;
+            Ok(())
+        })();
+        if let Err(error) = &result
+            && let Ok(mut inner) = self.inner.lock()
         {
-            return Err(AsioError::NoIo);
+            inner.last_error = Some(error.to_string());
         }
-        inner.device = Some(device);
-        inner.shared = Some(shared);
-        inner.stream = Some(stream);
-        inner.state = DriverState::Initialized;
-        Ok(())
+        result
     }
 
     pub fn device(&self) -> Result<DeviceInfo, AsioError> {
-        self.lock()?.device.clone().ok_or(AsioError::InvalidState)
+        let mut inner = self.lock()?;
+        ensure_worker_healthy(&mut inner)?;
+        inner.device.clone().ok_or(AsioError::InvalidState)
     }
 
     pub fn get_channels(&self) -> Result<(c_int, c_int), AsioError> {
-        let inner = self.lock()?;
+        let mut inner = self.lock()?;
+        ensure_worker_healthy(&mut inner)?;
         ensure_initialized(inner.state)?;
         let device = inner.device.as_ref().ok_or(AsioError::InvalidState)?;
         Ok((
@@ -259,7 +386,8 @@ impl AsioDriver {
     }
 
     pub fn get_buffer_size(&self) -> Result<(c_int, c_int, c_int, c_int), AsioError> {
-        let inner = self.lock()?;
+        let mut inner = self.lock()?;
+        ensure_worker_healthy(&mut inner)?;
         ensure_initialized(inner.state)?;
         let device = inner.device.as_ref().ok_or(AsioError::InvalidState)?;
         let period = checked_c_int(device.period_size)?;
@@ -267,7 +395,8 @@ impl AsioDriver {
     }
 
     pub fn get_sample_rate(&self) -> Result<f64, AsioError> {
-        let inner = self.lock()?;
+        let mut inner = self.lock()?;
+        ensure_worker_healthy(&mut inner)?;
         ensure_initialized(inner.state)?;
         Ok(f64::from(
             inner.device.as_ref().ok_or(AsioError::InvalidState)?.rate,
@@ -283,14 +412,12 @@ impl AsioDriver {
     }
 
     pub fn get_latencies(&self) -> Result<(c_int, c_int), AsioError> {
-        let inner = self.lock()?;
+        let mut inner = self.lock()?;
+        ensure_worker_healthy(&mut inner)?;
         ensure_initialized(inner.state)?;
         let device = inner.device.as_ref().ok_or(AsioError::InvalidState)?;
         let period = checked_c_int(device.period_size)?;
-        let output_periods = checked_c_int(device.pro_latency_periods.max(1))?;
-        let output = period
-            .checked_mul(output_periods)
-            .ok_or(AsioError::InvalidParameter)?;
+        let output = checked_c_int(device.pro_output_latency_frames)?;
         Ok((period, output))
     }
 
@@ -299,7 +426,8 @@ impl AsioDriver {
         channel: c_int,
         is_input: c_int,
     ) -> Result<AsioChannelInfo, AsioError> {
-        let inner = self.lock()?;
+        let mut inner = self.lock()?;
+        ensure_worker_healthy(&mut inner)?;
         ensure_initialized(inner.state)?;
         let device = inner.device.as_ref().ok_or(AsioError::InvalidState)?;
         let count = if is_input != 0 {
@@ -310,16 +438,21 @@ impl AsioDriver {
         if channel < 0 || u32::try_from(channel).map_or(true, |value| value >= count) {
             return Err(AsioError::InvalidParameter);
         }
+        let channel_index = usize::try_from(channel).map_err(|_| AsioError::InvalidParameter)?;
         let mut name = [0; 32];
         let prefix = if is_input != 0 { "Input " } else { "Output " };
-        let text = format!("{prefix}{}", channel + 1);
-        for (destination, source) in name.iter_mut().zip(text.bytes()) {
-            *destination = source as c_char;
-        }
+        write_channel_name(&mut name, prefix.as_bytes(), channel_index + 1);
+        let is_active = inner.active.as_ref().is_some_and(|active| {
+            if is_input != 0 {
+                active.input.get(channel_index).copied().unwrap_or(false)
+            } else {
+                active.output.get(channel_index).copied().unwrap_or(false)
+            }
+        });
         Ok(AsioChannelInfo {
             channel,
             is_input: if is_input != 0 { 1 } else { 0 },
-            is_active: 0,
+            is_active: c_int::from(is_active),
             channel_group: 0,
             sample_type: ASIOST_FLOAT32_LSB,
             name,
@@ -332,11 +465,12 @@ impl AsioDriver {
         buffer_size: c_int,
         callbacks: AsioCallbacks,
     ) -> Result<(), AsioError> {
-        let inner = self.lock()?;
+        let mut inner = self.lock()?;
+        ensure_worker_healthy(&mut inner)?;
         if inner.state != DriverState::Initialized {
             return Err(AsioError::InvalidState);
         }
-        if callbacks.buffer_switch.is_none() && callbacks.buffer_switch_time_info.is_none() {
+        if callbacks.buffer_switch.is_none() {
             return Err(AsioError::InvalidParameter);
         }
 
@@ -348,8 +482,8 @@ impl AsioDriver {
             usize::try_from(device.capture_channels).map_err(|_| AsioError::NoMemory)?;
         let output_count =
             usize::try_from(device.playback_channels).map_err(|_| AsioError::NoMemory)?;
-        let mut input_active = vec![false; input_count].into_boxed_slice();
-        let mut output_active = vec![false; output_count].into_boxed_slice();
+        let mut input_active = checked_bool_buffer(input_count)?;
+        let mut output_active = checked_bool_buffer(output_count)?;
 
         for info in infos.iter() {
             if info.channel_number < 0 {
@@ -398,6 +532,7 @@ impl AsioDriver {
             ) != 0
         });
         let mut inner = self.lock()?;
+        ensure_worker_healthy(&mut inner)?;
         if inner.state != DriverState::Initialized {
             return Err(AsioError::InvalidState);
         }
@@ -413,10 +548,41 @@ impl AsioDriver {
     }
 
     pub fn start(&self) -> Result<(), AsioError> {
-        self.reap_worker()?;
+        let current = self.current_thread_id();
+        if self.lock()?.worker_thread == Some(current) {
+            return Err(AsioError::Reentrant);
+        }
+        let _lifecycle = self.lifecycle.lock().map_err(|_| AsioError::Worker)?;
+        if self.lock()?.state == DriverState::Stopping {
+            self.stop_if_running_locked()?;
+        }
+        if let Some(error) = self.reap_finished_worker()? {
+            return Err(error);
+        }
+        let terminating = self
+            .lock()?
+            .worker
+            .as_ref()
+            .is_some_and(|handle| handle.stop.is_requested());
+        if terminating && let Some(error) = self.terminate_worker()? {
+            return Err(error);
+        }
         let mut inner = self.lock()?;
+        ensure_worker_healthy(&mut inner)?;
         if inner.state != DriverState::Prepared {
             return Err(AsioError::InvalidState);
+        }
+        if let Some(handle) = inner.worker.as_ref() {
+            let gate = Arc::clone(&handle.gate);
+            inner.position.publish(0, 0);
+            let generation = gate.set_running(true);
+            inner.state = DriverState::Running;
+            drop(inner);
+            if let Err(error) = wait_for_acknowledgement(&gate, generation, self.control_timeout) {
+                self.cancel_failed_start(&gate);
+                return self.complete_worker_wait(error);
+            }
+            return Ok(());
         }
         let thread_ops = self.thread_ops.ok_or(AsioError::Worker)?;
         let device = inner.device.as_ref().ok_or(AsioError::InvalidState)?;
@@ -429,8 +595,9 @@ impl AsioDriver {
         let callbacks = inner.callbacks.ok_or(AsioError::InvalidState)?;
         let time_info = inner.time_info;
         let stop = Arc::new(StopSignal::new()?);
-        let sample_position = Arc::clone(&inner.sample_position);
-        let time_stamp = Arc::clone(&inner.time_stamp);
+        let gate = Arc::new(WorkerGate::new(true)?);
+        let start_gate = Arc::clone(&gate);
+        let position = Arc::clone(&inner.position);
         let period_frames =
             usize::try_from(shared.period_frames).map_err(|_| AsioError::NoMemory)?;
         let capture_samples = period_frames
@@ -447,6 +614,7 @@ impl AsioDriver {
             stream: Mutex::new(Some(stream)),
             input: WorkerInput {
                 stop: Arc::clone(&stop),
+                gate: Arc::clone(&gate),
                 buffers,
                 active,
                 callbacks,
@@ -456,8 +624,7 @@ impl AsioDriver {
                 period_frames,
                 capture_samples,
                 playback_samples,
-                sample_position,
-                time_stamp,
+                position,
             },
             error: Mutex::new(None),
         });
@@ -473,56 +640,52 @@ impl AsioDriver {
         }
         inner.worker = Some(WorkerHandle {
             stop,
+            gate,
             thread_id,
             handle: thread_handle,
             context,
             thread_ops,
         });
         inner.worker_thread = Some(thread_id);
-        inner.sample_position.store(0, Ordering::Release);
-        inner.time_stamp.store(0, Ordering::Release);
+        inner.quiesce_generation = None;
+        inner.position.publish(0, 0);
         inner.state = DriverState::Running;
         unsafe { &*context }.ready.store(true, Ordering::Release);
+        drop(inner);
+        if let Err(error) = wait_for_acknowledgement(&start_gate, 0, self.control_timeout) {
+            self.cancel_failed_start(&start_gate);
+            return self.complete_worker_wait(error);
+        }
         Ok(())
     }
 
     pub fn stop(&self) -> Result<(), AsioError> {
         let current = self.current_thread_id();
-        let handle = {
+        if self.lock()?.worker_thread == Some(current) {
+            return self.stop_from_callback();
+        }
+        let _lifecycle = self.lifecycle.lock().map_err(|_| AsioError::Worker)?;
+        if let Some(error) = self.reap_finished_worker()? {
+            return Err(error);
+        }
+        {
             let mut inner = self.lock()?;
-            loop {
-                if inner.state == DriverState::Prepared {
-                    return Ok(());
-                }
-                if !matches!(inner.state, DriverState::Running | DriverState::Stopping) {
-                    return Err(AsioError::InvalidState);
-                }
-                let Some(handle) = inner.worker.as_mut() else {
-                    if inner.worker_thread == Some(current) {
-                        inner.state = DriverState::Stopping;
-                        return Ok(());
-                    }
-                    inner = self
-                        .worker_done
-                        .wait(inner)
-                        .map_err(|_| AsioError::Worker)?;
-                    continue;
-                };
-                handle.stop.request();
-                if handle.thread_id == current {
-                    inner.state = DriverState::Stopping;
-                    return Ok(());
-                }
-                inner.state = DriverState::Stopping;
-                break inner.worker.take().ok_or(AsioError::NoIo)?;
-            }
-        };
-        self.finish_worker(handle)
+            ensure_worker_healthy(&mut inner)?;
+        }
+        self.stop_if_running_locked()
     }
 
     pub fn dispose_buffers(&self) -> Result<(), AsioError> {
-        self.stop_if_running()?;
+        if self.lock()?.worker_thread == Some(self.current_thread_id()) {
+            return Err(AsioError::Reentrant);
+        }
+        let _lifecycle = self.lifecycle.lock().map_err(|_| AsioError::Worker)?;
+        self.stop_if_running_locked()?;
+        if let Some(error) = self.terminate_worker()? {
+            return Err(error);
+        }
         let mut inner = self.lock()?;
+        ensure_worker_healthy(&mut inner)?;
         if inner.state != DriverState::Prepared {
             return Err(AsioError::InvalidState);
         }
@@ -542,7 +705,17 @@ impl AsioDriver {
                 return Err(AsioError::Reentrant);
             }
         }
-        self.stop_if_running()?;
+        let _lifecycle = self.lifecycle.lock().map_err(|_| AsioError::Worker)?;
+        let state = self.lock()?.state;
+        if matches!(state, DriverState::Running | DriverState::Stopping)
+            && let Err(error) = self.stop_locked()
+        {
+            self.record_error(&error);
+            if !self.worker_has_exited()? {
+                return Err(error);
+            }
+        }
+        let _ = self.terminate_worker()?;
         let stream = {
             let mut inner = self.lock()?;
             if inner.state == DriverState::Destroying || inner.state == DriverState::Loaded {
@@ -558,74 +731,164 @@ impl AsioDriver {
             inner.stream.take()
         };
         if let Some(mut stream) = stream {
-            stream.close()?;
+            match stream.close() {
+                Ok(()) | Err(ClientError::Closed) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(())
     }
 
     pub fn sample_position(&self) -> Result<(u64, u64), AsioError> {
-        let inner = self.lock()?;
+        let mut inner = self.lock()?;
+        ensure_worker_healthy(&mut inner)?;
         ensure_initialized(inner.state)?;
-        Ok((
-            inner.sample_position.load(Ordering::Acquire),
-            inner.time_stamp.load(Ordering::Acquire),
-        ))
+        Ok(inner.position.load())
     }
 
     pub fn last_error(&self) -> Option<String> {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|inner| inner.last_error.clone())
+        let mut inner = self.inner.lock().ok()?;
+        let _ = observe_worker_failure(&mut inner);
+        inner.last_error.clone()
     }
 
-    fn stop_if_running(&self) -> Result<(), AsioError> {
+    fn stop_if_running_locked(&self) -> Result<(), AsioError> {
         let state = self.lock()?.state;
-        if matches!(state, DriverState::Running | DriverState::Stopping) {
-            self.stop()
-        } else {
-            Ok(())
+        if matches!(state, DriverState::Running | DriverState::Stopping)
+            && let Err(error) = self.stop_locked()
+        {
+            return self.complete_worker_wait(error);
+        }
+        Ok(())
+    }
+
+    fn stop_from_callback(&self) -> Result<(), AsioError> {
+        let mut inner = self.lock()?;
+        if inner.state == DriverState::Stopping {
+            return Ok(());
+        }
+        if inner.state != DriverState::Running {
+            return Err(AsioError::InvalidState);
+        }
+        let gate = Arc::clone(&inner.worker.as_ref().ok_or(AsioError::NoIo)?.gate);
+        let generation = gate.set_running(false);
+        inner.quiesce_generation = Some(generation);
+        inner.state = DriverState::Stopping;
+        Ok(())
+    }
+
+    fn stop_locked(&self) -> Result<(), AsioError> {
+        let (gate, generation) = {
+            let mut inner = self.lock()?;
+            if inner.state == DriverState::Prepared {
+                return Ok(());
+            }
+            if !matches!(inner.state, DriverState::Running | DriverState::Stopping) {
+                return Err(AsioError::InvalidState);
+            }
+            let gate = Arc::clone(&inner.worker.as_ref().ok_or(AsioError::NoIo)?.gate);
+            let generation = if inner.state == DriverState::Running {
+                let generation = gate.set_running(false);
+                inner.quiesce_generation = Some(generation);
+                inner.state = DriverState::Stopping;
+                generation
+            } else {
+                inner.quiesce_generation.ok_or(AsioError::Worker)?
+            };
+            (gate, generation)
+        };
+        wait_for_acknowledgement(&gate, generation, self.control_timeout)?;
+        let mut inner = self.lock()?;
+        if inner.state == DriverState::Stopping && inner.quiesce_generation == Some(generation) {
+            inner.quiesce_generation = None;
+            inner.state = DriverState::Prepared;
+        }
+        Ok(())
+    }
+
+    fn cancel_failed_start(&self, gate: &WorkerGate) {
+        let generation = gate.set_running(false);
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.quiesce_generation = Some(generation);
+            inner.state = DriverState::Stopping;
         }
     }
 
-    fn reap_worker(&self) -> Result<(), AsioError> {
+    fn complete_worker_wait(&self, error: AsioError) -> Result<(), AsioError> {
+        self.record_error(&error);
+        if self.worker_has_exited()?
+            && let Some(worker_error) = self.terminate_worker()?
+        {
+            return Err(worker_error);
+        }
+        Err(error)
+    }
+
+    fn worker_has_exited(&self) -> Result<bool, AsioError> {
+        Ok(self
+            .lock()?
+            .worker
+            .as_ref()
+            .is_some_and(|handle| !handle.gate.is_alive()))
+    }
+
+    fn reap_finished_worker(&self) -> Result<Option<AsioError>, AsioError> {
+        if self.worker_has_exited()? {
+            self.terminate_worker()
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn terminate_worker(&self) -> Result<Option<AsioError>, AsioError> {
         let current = self.current_thread_id();
         let handle = {
             let mut inner = self.lock()?;
             if inner.worker_thread == Some(current) {
                 return Err(AsioError::Reentrant);
             }
-            let Some(handle) = inner.worker.as_ref() else {
-                return Ok(());
+            let Some(handle) = inner.worker.take() else {
+                inner.worker_thread = None;
+                inner.quiesce_generation = None;
+                if inner.state == DriverState::Stopping {
+                    inner.state = DriverState::Prepared;
+                }
+                return Ok(None);
             };
-            if handle.thread_id == current {
-                return Err(AsioError::Reentrant);
-            }
-            inner.worker.take().ok_or(AsioError::Worker)?
+            handle
         };
         self.finish_worker(handle)
     }
 
-    fn finish_worker(&self, handle: WorkerHandle) -> Result<(), AsioError> {
+    fn finish_worker(&self, handle: WorkerHandle) -> Result<Option<AsioError>, AsioError> {
         handle.stop.request();
-        if unsafe { (handle.thread_ops.join)(handle.handle) } != 0 {
+        if unsafe { (handle.thread_ops.join)(handle.handle, duration_millis(self.control_timeout)) }
+            != 0
+        {
             let mut inner = self.lock()?;
             inner.worker = Some(handle);
-            self.worker_done.notify_all();
-            return Err(AsioError::Worker);
+            let error = AsioError::WorkerTimeout;
+            inner.last_error = Some(error.to_string());
+            return Err(error);
         }
         let context = unsafe { Box::from_raw(handle.context) };
         let (stream, error) = context.into_exit();
         let mut inner = self.lock()?;
         inner.stream = stream;
         inner.worker_thread = None;
+        inner.quiesce_generation = None;
         inner.state = DriverState::Prepared;
-        self.worker_done.notify_all();
-        if let Some(error) = error {
+        if let Some(error) = error.as_ref() {
+            inner.worker_failure = Some(WorkerFailure::from_error(error));
             inner.last_error = Some(error.to_string());
-            return Err(error);
         }
-        Ok(())
+        Ok(error)
+    }
+
+    fn record_error(&self, error: &AsioError) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.last_error = Some(error.to_string());
+        }
     }
 
     fn current_thread_id(&self) -> u32 {
@@ -655,12 +918,16 @@ impl Drop for AsioDriver {
         if let Some(handle) = handle {
             handle.stop.request();
             if handle.thread_id != current
-                && unsafe { (handle.thread_ops.join)(handle.handle) } == 0
+                && unsafe { (handle.thread_ops.join)(handle.handle, 0) } == 0
             {
                 let context = unsafe { Box::from_raw(handle.context) };
                 if let Some(mut stream) = context.take_stream() {
                     let _ = stream.close();
                 }
+            } else {
+                // A live worker still owns its context and host buffers. Leaking this small
+                // handle is safer than freeing memory that the callback thread can still use.
+                std::mem::forget(handle);
             }
         }
         if let Ok(inner) = self.inner.get_mut()
@@ -673,6 +940,7 @@ impl Drop for AsioDriver {
 
 struct WorkerHandle {
     stop: Arc<StopSignal>,
+    gate: Arc<WorkerGate>,
     thread_id: u32,
     handle: *mut c_void,
     context: *mut WorkerContext,
@@ -683,6 +951,7 @@ unsafe impl Send for WorkerHandle {}
 
 struct WorkerInput {
     stop: Arc<StopSignal>,
+    gate: Arc<WorkerGate>,
     buffers: Arc<HostBuffers>,
     active: Arc<ActiveChannels>,
     callbacks: AsioCallbacks,
@@ -692,8 +961,7 @@ struct WorkerInput {
     period_frames: usize,
     capture_samples: usize,
     playback_samples: usize,
-    sample_position: Arc<AtomicU64>,
-    time_stamp: Arc<AtomicU64>,
+    position: Arc<PositionSnapshot>,
 }
 
 struct RealtimeGuard {
@@ -789,8 +1057,12 @@ unsafe impl Sync for ChannelBuffer {}
 impl ChannelBuffer {
     fn new(period: usize) -> Result<Self, AsioError> {
         let samples = period.checked_mul(2).ok_or(AsioError::NoMemory)?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(samples)
+            .map_err(|_| AsioError::NoMemory)?;
+        data.resize(samples, 0.0);
         Ok(Self {
-            data: std::cell::UnsafeCell::new(vec![0.0; samples].into_boxed_slice()),
+            data: std::cell::UnsafeCell::new(data.into_boxed_slice()),
             period,
         })
     }
@@ -828,16 +1100,153 @@ struct HostBuffers {
 
 impl HostBuffers {
     fn new(input_count: usize, output_count: usize, period: usize) -> Result<Self, AsioError> {
-        let input = (0..input_count)
-            .map(|_| ChannelBuffer::new(period))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_boxed_slice();
-        let output = (0..output_count)
-            .map(|_| ChannelBuffer::new(period))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_boxed_slice();
-        Ok(Self { input, output })
+        let mut input = Vec::new();
+        input
+            .try_reserve_exact(input_count)
+            .map_err(|_| AsioError::NoMemory)?;
+        for _ in 0..input_count {
+            input.push(ChannelBuffer::new(period)?);
+        }
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(output_count)
+            .map_err(|_| AsioError::NoMemory)?;
+        for _ in 0..output_count {
+            output.push(ChannelBuffer::new(period)?);
+        }
+        Ok(Self {
+            input: input.into_boxed_slice(),
+            output: output.into_boxed_slice(),
+        })
     }
+}
+
+struct WorkerGate {
+    fd: RawFd,
+    command: AtomicU64,
+    acknowledged: AtomicU64,
+    failure: AtomicU64,
+    alive: AtomicBool,
+}
+
+impl WorkerGate {
+    fn new(running: bool) -> Result<Self, AsioError> {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(AsioError::Client(ClientError::Io(
+                std::io::Error::last_os_error(),
+            )));
+        }
+        Ok(Self {
+            fd,
+            command: AtomicU64::new(u64::from(running)),
+            acknowledged: AtomicU64::new(u64::MAX),
+            failure: AtomicU64::new(0),
+            alive: AtomicBool::new(true),
+        })
+    }
+
+    fn set_running(&self, running: bool) -> u64 {
+        let mut current = self.command.load(Ordering::Acquire);
+        loop {
+            if current & 1 == u64::from(running) {
+                return current >> 1;
+            }
+            let generation = (current >> 1).wrapping_add(1) & (u64::MAX >> 1);
+            let next = generation << 1 | u64::from(running);
+            match self.command.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.notify();
+                    return generation;
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn command(&self) -> (u64, bool) {
+        let command = self.command.load(Ordering::Acquire);
+        (command >> 1, command & 1 != 0)
+    }
+
+    fn acknowledge(&self, generation: u64) {
+        self.acknowledged.store(generation, Ordering::Release);
+    }
+
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
+    fn failure(&self) -> Option<WorkerFailure> {
+        WorkerFailure::from_raw(self.failure.load(Ordering::Acquire))
+    }
+
+    fn publish_failure(&self, failure: WorkerFailure) {
+        self.failure.store(failure as u64, Ordering::Release);
+        self.notify();
+    }
+
+    fn mark_dead(&self) {
+        self.alive.store(false, Ordering::Release);
+    }
+
+    fn notify(&self) {
+        let value = 1_u64;
+        unsafe {
+            let _ = libc::write(
+                self.fd,
+                (&value as *const u64).cast(),
+                std::mem::size_of::<u64>(),
+            );
+        }
+    }
+
+    fn drain(&self) {
+        let mut value = 0_u64;
+        unsafe {
+            let _ = libc::read(
+                self.fd,
+                (&mut value as *mut u64).cast(),
+                std::mem::size_of::<u64>(),
+            );
+        }
+    }
+}
+
+impl Drop for WorkerGate {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+fn wait_for_acknowledgement(
+    gate: &WorkerGate,
+    generation: u64,
+    timeout: Duration,
+) -> Result<(), AsioError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    while gate.acknowledged.load(Ordering::Acquire) != generation {
+        if let Some(failure) = gate.failure() {
+            return Err(failure.error());
+        }
+        if !gate.is_alive() {
+            return Err(AsioError::Worker);
+        }
+        if Instant::now() >= deadline {
+            return Err(AsioError::WorkerTimeout);
+        }
+        thread::sleep(Duration::from_micros(50));
+    }
+    Ok(())
 }
 
 struct StopSignal {
@@ -889,9 +1298,10 @@ impl Drop for StopSignal {
 }
 
 fn run_worker(stream: &mut AudioStream, input: &WorkerInput) -> Result<(), AsioError> {
-    let mut capture = vec![0_i32; input.capture_samples].into_boxed_slice();
-    let mut playback = vec![0_i32; input.playback_samples].into_boxed_slice();
-    let audio_fd = stream.notification_fd()?;
+    let mut capture = checked_i32_buffer(input.capture_samples)?;
+    let mut playback = checked_i32_buffer(input.playback_samples)?;
+    let audio_fd = unsafe { OwnedFd::from_raw_fd(stream.notification_fd()?) };
+    let control_fd = unsafe { OwnedFd::from_raw_fd(stream.control_fd()?) };
     let realtime = if input.realtime_priority == 0 {
         None
     } else {
@@ -906,8 +1316,10 @@ fn run_worker(stream: &mut AudioStream, input: &WorkerInput) -> Result<(), AsioE
     let result = match stream.start() {
         Ok(()) => worker_loop(
             stream,
-            audio_fd,
+            audio_fd.as_raw_fd(),
+            control_fd.as_raw_fd(),
             &input.stop,
+            &input.gate,
             &input.buffers,
             &input.active,
             input.callbacks,
@@ -916,19 +1328,15 @@ fn run_worker(stream: &mut AudioStream, input: &WorkerInput) -> Result<(), AsioE
             input.period_frames,
             &mut capture,
             &mut playback,
-            &input.sample_position,
-            &input.time_stamp,
+            &input.position,
         ),
         Err(error) => Err(error.into()),
     };
     drop(realtime);
-    let stop_result = stream.stop();
-    unsafe {
-        libc::close(audio_fd);
-    }
-    let error = result
-        .err()
-        .or_else(|| stop_result.err().map(AsioError::from));
+    let error = match result {
+        Ok(()) => stream.stop().err().map(AsioError::from),
+        Err(error) => Some(error),
+    };
     error.map_or(Ok(()), Err)
 }
 
@@ -936,7 +1344,9 @@ fn run_worker(stream: &mut AudioStream, input: &WorkerInput) -> Result<(), AsioE
 fn worker_loop(
     stream: &mut AudioStream,
     audio_fd: RawFd,
+    control_fd: RawFd,
     stop: &StopSignal,
+    gate: &WorkerGate,
     buffers: &HostBuffers,
     active: &ActiveChannels,
     callbacks: AsioCallbacks,
@@ -945,32 +1355,78 @@ fn worker_loop(
     period_frames: usize,
     capture: &mut [i32],
     playback: &mut [i32],
-    sample_position: &AtomicU64,
-    time_stamp: &AtomicU64,
+    position: &PositionSnapshot,
 ) -> Result<(), AsioError> {
     let mut buffer_index = 0_usize;
     let mut previous_sequence = None;
+    let mut run_generation = u64::MAX;
+    let mut last_active_sequence = None;
+    let mut stopping_after = None;
     while !stop.is_requested() {
-        let sequence = wait_cycle(stream, audio_fd, stop)?;
-        let Some(sequence) = sequence else {
-            break;
+        let _ = apply_gate_transition(
+            gate,
+            &mut run_generation,
+            &mut buffer_index,
+            &mut previous_sequence,
+            &mut last_active_sequence,
+            &mut stopping_after,
+        );
+        let acquisition_generation = run_generation;
+        let sequence = match wait_worker_event(stream, audio_fd, control_fd, stop, gate)? {
+            WorkerEvent::Cycle(sequence) => sequence,
+            WorkerEvent::Gate => continue,
+            WorkerEvent::Stop => break,
         };
         let Some(block_sequence) = stream.capture_buffer_for_sequence(sequence, capture)? else {
             continue;
         };
-        let (next_buffer_index, samples) = advance_asio_cycle(
+        check_daemon_control(control_fd)?;
+        let running = apply_gate_transition(
+            gate,
+            &mut run_generation,
+            &mut buffer_index,
+            &mut previous_sequence,
+            &mut last_active_sequence,
+            &mut stopping_after,
+        );
+        if !running {
+            playback.fill(0);
+            let _ = stream.submit_playback(block_sequence, playback)?;
+            if stopping_after
+                .is_some_and(|sequence| sequence_is_after(stream.playback_sequence(), sequence))
+            {
+                gate.acknowledge(run_generation);
+            }
+            continue;
+        }
+        if !acquired_block_is_current(acquisition_generation, run_generation) {
+            playback.fill(0);
+            let _ = stream.submit_playback(block_sequence, playback)?;
+            continue;
+        }
+        let (next_buffer_index, samples) = match advance_asio_cycle(
             previous_sequence,
             block_sequence,
             u64::try_from(period_frames).unwrap_or(0),
             buffer_index,
-            sample_position.load(Ordering::Relaxed),
-        );
+            position.load().0,
+        ) {
+            CycleAdvance::Ready {
+                buffer_index,
+                sample_position,
+            } => (buffer_index, sample_position),
+            CycleAdvance::Duplicate => {
+                playback.fill(0);
+                let _ = stream.submit_playback(block_sequence, playback)?;
+                continue;
+            }
+            CycleAdvance::Backward => return Err(AsioError::CaptureSequenceBackward),
+        };
         buffer_index = next_buffer_index;
-        sample_position.store(samples, Ordering::Release);
         previous_sequence = Some(block_sequence);
         copy_capture_to_host(capture, buffers, active, buffer_index, period_frames);
         let stamp = monotonic_nanos();
-        time_stamp.store(stamp, Ordering::Release);
+        position.publish(samples, stamp);
         let callback_start = stamp;
         invoke_callback(callbacks, time_info, buffer_index, samples, stamp, rate)?;
         let callback_duration = monotonic_nanos().saturating_sub(callback_start);
@@ -983,8 +1439,51 @@ fn worker_loop(
         if !stream.submit_playback(block_sequence, playback)? {
             continue;
         }
+        last_active_sequence = Some(block_sequence);
     }
     Ok(())
+}
+
+fn acquired_block_is_current(acquisition_generation: u64, run_generation: u64) -> bool {
+    acquisition_generation == run_generation
+}
+
+fn apply_gate_transition(
+    gate: &WorkerGate,
+    run_generation: &mut u64,
+    buffer_index: &mut usize,
+    previous_sequence: &mut Option<u64>,
+    last_active_sequence: &mut Option<u64>,
+    stopping_after: &mut Option<u64>,
+) -> bool {
+    let (generation, running) = gate.command();
+    if generation == *run_generation {
+        return running;
+    }
+    *run_generation = generation;
+    if running {
+        *buffer_index = 0;
+        *previous_sequence = None;
+        *last_active_sequence = None;
+        *stopping_after = None;
+        gate.acknowledge(generation);
+    } else {
+        *stopping_after = *last_active_sequence;
+        if stopping_after.is_none() {
+            gate.acknowledge(generation);
+        }
+    }
+    running
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CycleAdvance {
+    Ready {
+        buffer_index: usize,
+        sample_position: u64,
+    },
+    Duplicate,
+    Backward,
 }
 
 fn advance_asio_cycle(
@@ -993,22 +1492,45 @@ fn advance_asio_cycle(
     period_frames: u64,
     buffer_index: usize,
     sample_position: u64,
-) -> (usize, u64) {
+) -> CycleAdvance {
     let Some(previous) = previous_sequence else {
-        return (buffer_index, sample_position);
+        return CycleAdvance::Ready {
+            buffer_index,
+            sample_position,
+        };
     };
-    let elapsed_periods = sequence.wrapping_sub(previous).max(1);
-    (
-        buffer_index ^ (elapsed_periods as usize & 1),
-        sample_position.saturating_add(period_frames.saturating_mul(elapsed_periods)),
-    )
+    let elapsed_periods = sequence.wrapping_sub(previous);
+    if elapsed_periods == 0 {
+        return CycleAdvance::Duplicate;
+    }
+    if elapsed_periods >= (1_u64 << 63) {
+        return CycleAdvance::Backward;
+    }
+    CycleAdvance::Ready {
+        buffer_index: buffer_index ^ (elapsed_periods as usize & 1),
+        sample_position: sample_position
+            .saturating_add(period_frames.saturating_mul(elapsed_periods)),
+    }
 }
 
-fn wait_cycle(
+fn sequence_is_after(candidate: u64, reference: u64) -> bool {
+    let distance = candidate.wrapping_sub(reference);
+    distance != 0 && distance < (1_u64 << 63)
+}
+
+enum WorkerEvent {
+    Cycle(u64),
+    Gate,
+    Stop,
+}
+
+fn wait_worker_event(
     stream: &mut AudioStream,
     audio_fd: RawFd,
+    control_fd: RawFd,
     stop: &StopSignal,
-) -> Result<Option<u64>, AsioError> {
+    gate: &WorkerGate,
+) -> Result<WorkerEvent, AsioError> {
     let mut fds = [
         libc::pollfd {
             fd: audio_fd,
@@ -1020,15 +1542,31 @@ fn wait_cycle(
             events: libc::POLLIN,
             revents: 0,
         },
+        libc::pollfd {
+            fd: gate.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: control_fd,
+            events: libc::POLLIN | libc::POLLRDHUP,
+            revents: 0,
+        },
     ];
     loop {
         if stop.is_requested() {
-            return Ok(None);
+            return Ok(WorkerEvent::Stop);
         }
         match stream.wait_period(Duration::ZERO) {
-            Ok(sequence) => return Ok(Some(sequence)),
+            Ok(sequence) => {
+                check_daemon_control(control_fd)?;
+                return Ok(WorkerEvent::Cycle(sequence));
+            }
             Err(ClientError::Timeout) => {}
             Err(error) => return Err(error.into()),
+        }
+        for fd in &mut fds {
+            fd.revents = 0;
         }
         let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
         if result < 0 {
@@ -1039,11 +1577,95 @@ fn wait_cycle(
             return Err(ClientError::Io(error).into());
         }
         if fds[1].revents & libc::POLLIN != 0 || stop.is_requested() {
-            return Ok(None);
+            return Ok(WorkerEvent::Stop);
+        }
+        if fds[1].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(AsioError::WorkerStopped("worker stop signal failed"));
+        }
+        if fds[2].revents & libc::POLLIN != 0 {
+            gate.drain();
+            return Ok(WorkerEvent::Gate);
+        }
+        if fds[2].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(AsioError::WorkerStopped("worker gate failed"));
+        }
+        if daemon_control_failed(control_fd, fds[3].revents)? {
+            return Err(AsioError::DaemonDisconnected);
         }
         if fds[0].revents & libc::POLLIN != 0 {
             continue;
         }
+        if fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(AsioError::WorkerStopped("audio notification failed"));
+        }
+    }
+}
+
+fn check_daemon_control(fd: RawFd) -> Result<(), AsioError> {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN | libc::POLLRDHUP,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        if result > 0 {
+            return if daemon_control_failed(fd, pollfd.revents)? {
+                Err(AsioError::DaemonDisconnected)
+            } else {
+                Ok(())
+            };
+        }
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(ClientError::Io(error).into());
+        }
+        pollfd.revents = 0;
+    }
+}
+
+fn daemon_control_failed(fd: RawFd, revents: libc::c_short) -> Result<bool, AsioError> {
+    if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL | libc::POLLRDHUP) != 0 {
+        return Ok(true);
+    }
+    if revents & libc::POLLIN == 0 {
+        return Ok(false);
+    }
+    let mut byte = 0_u8;
+    loop {
+        let received = unsafe {
+            libc::recv(
+                fd,
+                (&mut byte as *mut u8).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if received == 0 {
+            return Ok(true);
+        }
+        if received > 0 {
+            return Err(AsioError::WorkerStopped(
+                "unexpected daemon control response",
+            ));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.raw_os_error() == Some(libc::EAGAIN) {
+            return Ok(false);
+        }
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ECONNRESET) | Some(libc::ENOTCONN)
+        ) {
+            return Ok(true);
+        }
+        return Err(ClientError::Io(error).into());
     }
 }
 
@@ -1121,6 +1743,15 @@ fn invoke_callback(
     catch_unwind(AssertUnwindSafe(call)).map_err(|_| AsioError::CallbackPanic)
 }
 
+fn notify_worker_failure(callbacks: AsioCallbacks, failure: WorkerFailure) {
+    let (Some(callback), Some(selector)) = (callbacks.asio_message, failure.notification()) else {
+        return;
+    };
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+        let _ = callback(selector, 0, ptr::null_mut(), ptr::null_mut());
+    }));
+}
+
 fn s32_to_f32(sample: i32) -> f32 {
     sample as f32 / 2_147_483_648.0
 }
@@ -1165,6 +1796,78 @@ fn monotonic_nanos() -> u64 {
                 .and_then(|nanos| seconds.checked_add(nanos))
         })
         .unwrap_or(0)
+}
+
+fn checked_bool_buffer(length: usize) -> Result<Box<[bool]>, AsioError> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(length)
+        .map_err(|_| AsioError::NoMemory)?;
+    buffer.resize(length, false);
+    Ok(buffer.into_boxed_slice())
+}
+
+fn checked_i32_buffer(length: usize) -> Result<Box<[i32]>, AsioError> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(length)
+        .map_err(|_| AsioError::NoMemory)?;
+    buffer.resize(length, 0);
+    Ok(buffer.into_boxed_slice())
+}
+
+fn write_channel_name(destination: &mut [c_char; 32], prefix: &[u8], mut number: usize) {
+    let mut offset = 0;
+    for byte in prefix.iter().copied().take(destination.len() - 1) {
+        destination[offset] = byte as c_char;
+        offset += 1;
+    }
+    let mut digits = [0_u8; 20];
+    let mut digit_count = 0;
+    loop {
+        digits[digit_count] = b'0' + (number % 10) as u8;
+        digit_count += 1;
+        number /= 10;
+        if number == 0 {
+            break;
+        }
+    }
+    for byte in digits[..digit_count].iter().rev().copied() {
+        if offset == destination.len() - 1 {
+            break;
+        }
+        destination[offset] = byte as c_char;
+        offset += 1;
+    }
+}
+
+fn duration_millis(duration: Duration) -> u32 {
+    duration
+        .as_millis()
+        .saturating_add(u128::from(
+            !duration.subsec_nanos().is_multiple_of(1_000_000),
+        ))
+        .min(u128::from(u32::MAX)) as u32
+}
+
+fn observe_worker_failure(inner: &mut DriverInner) -> Option<WorkerFailure> {
+    let failure = inner.worker_failure.or_else(|| {
+        inner
+            .worker
+            .as_ref()
+            .and_then(|handle| handle.gate.failure())
+    });
+    if let Some(failure) = failure
+        && inner.worker_failure.is_none()
+    {
+        inner.worker_failure = Some(failure);
+        inner.last_error = Some(failure.error().to_string());
+    }
+    failure
+}
+
+fn ensure_worker_healthy(inner: &mut DriverInner) -> Result<(), AsioError> {
+    observe_worker_failure(inner).map_or(Ok(()), |failure| Err(failure.error()))
 }
 
 fn ensure_initialized(state: DriverState) -> Result<(), AsioError> {
@@ -1224,10 +1927,19 @@ pub unsafe extern "C" fn sidealsa_asio_worker_entry(context: *mut c_void) {
         Ok(Err(error)) => Some(error),
         Err(_) => Some(AsioError::Worker),
     };
+    let failure = error.as_ref().map(WorkerFailure::from_error);
     *context
         .error
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = error;
+    if let Some(failure) = failure {
+        context.input.gate.publish_failure(failure);
+        let (_, callbacks_running) = context.input.gate.command();
+        if callbacks_running && !context.input.stop.is_requested() {
+            notify_worker_failure(context.input.callbacks, failure);
+        }
+    }
+    context.input.gate.mark_dead();
 }
 
 #[unsafe(no_mangle)]
@@ -1238,7 +1950,13 @@ pub unsafe extern "C" fn sidealsa_asio_new(
     thread_ops: *const AsioThreadOps,
     out: *mut *mut AsioDriver,
 ) -> c_int {
-    if thread_ops.is_null() || out.is_null() {
+    if out.is_null() {
+        return ASIO_INVALID_PARAMETER;
+    }
+    unsafe {
+        *out = ptr::null_mut();
+    }
+    if thread_ops.is_null() {
         return ASIO_INVALID_PARAMETER;
     }
     let thread_ops = unsafe { *thread_ops };
@@ -1276,6 +1994,30 @@ pub unsafe extern "C" fn sidealsa_asio_init(
         Err(_) => return ASIO_INVALID_PARAMETER,
     };
     with_driver(driver, |driver| driver.init(path))
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `driver` must be a live handle and `output` must reference `capacity` writable bytes.
+pub unsafe extern "C" fn sidealsa_asio_get_error_message(
+    driver: *mut AsioDriver,
+    output: *mut c_char,
+    capacity: usize,
+) -> c_int {
+    if driver.is_null() || output.is_null() || capacity == 0 {
+        return ASIO_INVALID_PARAMETER;
+    }
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let message = (&*driver)
+            .last_error()
+            .unwrap_or_else(|| "SideALSA operation failed; check sidealsad".into());
+        let length = message.len().min(capacity - 1);
+        ptr::copy_nonoverlapping(message.as_ptr().cast::<c_char>(), output, length);
+        *output.add(length) = 0;
+        ASIO_SUCCESS
+    }))
+    .unwrap_or(ASIO_HW_MALFUNCTION)
 }
 
 #[unsafe(no_mangle)]
@@ -1403,13 +2145,16 @@ pub unsafe extern "C" fn sidealsa_asio_close(driver: *mut AsioDriver) -> c_int {
     if driver.is_null() {
         return ASIO_INVALID_PARAMETER;
     }
-    let result = unsafe { (&*driver).close() };
-    if result.is_ok() {
-        unsafe {
-            drop(Box::from_raw(driver));
+    catch_unwind(AssertUnwindSafe(|| {
+        let result = unsafe { (&*driver).close() };
+        if result.is_ok() {
+            unsafe {
+                drop(Box::from_raw(driver));
+            }
         }
-    }
-    status(result)
+        status(result)
+    }))
+    .unwrap_or(ASIO_HW_MALFUNCTION)
 }
 
 #[unsafe(no_mangle)]
@@ -1426,8 +2171,7 @@ pub unsafe extern "C" fn sidealsa_asio_get_channel_info(
     let request = unsafe { *info };
     catch_unwind(AssertUnwindSafe(|| unsafe {
         match (&*driver).get_channel_info(request.channel, request.is_input) {
-            Ok(mut result) => {
-                result.is_active = request.is_active;
+            Ok(result) => {
                 *info = result;
                 ASIO_SUCCESS
             }
@@ -1524,27 +2268,120 @@ pub unsafe extern "C" fn sidealsa_asio_get_sample_position(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        cell::Cell,
+        os::unix::net::UnixStream,
+        ptr::NonNull,
+        sync::{Arc, Weak, mpsc},
+    };
 
-    #[test]
-    fn configured_pro_lead_is_reported_as_output_latency() {
-        let driver = AsioDriver::new();
-        let mut inner = driver.inner.lock().expect("lock should work");
-        inner.state = DriverState::Initialized;
-        inner.device = Some(DeviceInfo {
+    thread_local! {
+        static TEST_THREAD_ID: Cell<u32> = const { Cell::new(1) };
+    }
+
+    static FAILURE_NOTIFICATION: std::sync::atomic::AtomicI32 =
+        std::sync::atomic::AtomicI32::new(0);
+
+    unsafe extern "C" fn unused_create(
+        _context: *mut c_void,
+        _handle: *mut *mut c_void,
+        _thread_id: *mut u32,
+    ) -> c_int {
+        ASIO_HW_MALFUNCTION
+    }
+
+    unsafe extern "C" fn unused_join(_handle: *mut c_void, _timeout_ms: u32) -> c_int {
+        ASIO_HW_MALFUNCTION
+    }
+
+    unsafe extern "C" fn test_current_thread_id() -> u32 {
+        TEST_THREAD_ID.get()
+    }
+
+    unsafe extern "win64" fn test_buffer_switch(_index: c_int, _direct: c_int) {}
+
+    unsafe extern "win64" fn test_time_info_callback(
+        _time_info: *mut AsioTimeInfo,
+        _index: c_int,
+        _direct: c_int,
+    ) -> *mut AsioTimeInfo {
+        ptr::null_mut()
+    }
+
+    unsafe extern "win64" fn test_asio_message(
+        selector: c_int,
+        _value: c_int,
+        _message: *mut c_void,
+        _opt: *mut f64,
+    ) -> c_int {
+        FAILURE_NOTIFICATION.store(selector, Ordering::Release);
+        1
+    }
+
+    fn test_device() -> DeviceInfo {
+        DeviceInfo {
             name: "Test".into(),
             rate: 48000,
             period_size: 64,
             hardware_period_size: 32,
             buffer_size: 192,
             shared_buffer_size: 256,
-            pro_latency_periods: 2,
+            pro_latency_periods: 1,
+            pro_output_latency_frames: 96,
             pro_realtime_priority: 86,
             shared_latency_periods: 3,
             playback_channels: 8,
             capture_channels: 10,
             playback_ports: Vec::new(),
             capture_ports: Vec::new(),
+        }
+    }
+
+    fn fake_running_driver(
+        timeout: Duration,
+    ) -> (Arc<AsioDriver>, Arc<WorkerGate>, Weak<HostBuffers>) {
+        let driver = Arc::new(AsioDriver::new_with_thread_ops_and_timeout(
+            Some(ThreadOps {
+                create: unused_create,
+                join: unused_join,
+                current_thread_id: test_current_thread_id,
+            }),
+            timeout,
+        ));
+        let gate = Arc::new(WorkerGate::new(true).expect("gate should open"));
+        gate.acknowledge(0);
+        let buffers = Arc::new(HostBuffers::new(1, 1, 64).expect("buffers should allocate"));
+        let weak_buffers = Arc::downgrade(&buffers);
+        let mut inner = driver.inner.lock().expect("lock should work");
+        inner.state = DriverState::Running;
+        inner.buffers = Some(buffers);
+        inner.worker_thread = Some(7);
+        inner.worker = Some(WorkerHandle {
+            stop: Arc::new(StopSignal::new().expect("stop signal should open")),
+            gate: Arc::clone(&gate),
+            thread_id: 7,
+            handle: NonNull::<u8>::dangling().as_ptr().cast(),
+            context: NonNull::<WorkerContext>::dangling().as_ptr(),
+            thread_ops: driver.thread_ops.expect("thread operations should exist"),
         });
+        drop(inner);
+        (driver, gate, weak_buffers)
+    }
+
+    fn remove_fake_worker(driver: &AsioDriver) {
+        let mut inner = driver.inner.lock().expect("lock should work");
+        inner.worker = None;
+        inner.worker_thread = None;
+        inner.quiesce_generation = None;
+        inner.state = DriverState::Prepared;
+    }
+
+    #[test]
+    fn configured_pro_output_latency_is_reported() {
+        let driver = AsioDriver::new();
+        let mut inner = driver.inner.lock().expect("lock should work");
+        inner.state = DriverState::Initialized;
+        inner.device = Some(test_device());
         drop(inner);
 
         assert_eq!(
@@ -1553,8 +2390,19 @@ mod tests {
         );
         assert_eq!(
             driver.get_latencies().expect("latencies should work"),
-            (64, 128)
+            (64, 96)
         );
+    }
+
+    #[test]
+    fn initialization_error_is_available_to_host() {
+        let driver = AsioDriver::new();
+
+        driver
+            .init("/tmp/sidealsa-asio-test-missing.sock")
+            .expect_err("missing daemon should fail");
+
+        assert!(driver.last_error().is_some());
     }
 
     #[test]
@@ -1582,10 +2430,274 @@ mod tests {
         let mut position = 0;
         let mut observed = Vec::new();
         for sequence in [10, 11, 13, 14] {
-            (index, position) = advance_asio_cycle(previous, sequence, 64, index, position);
+            let CycleAdvance::Ready {
+                buffer_index,
+                sample_position,
+            } = advance_asio_cycle(previous, sequence, 64, index, position)
+            else {
+                panic!("forward sequence should advance");
+            };
+            index = buffer_index;
+            position = sample_position;
             observed.push((index, position));
             previous = Some(sequence);
         }
         assert_eq!(observed, [(0, 0), (1, 64), (1, 192), (0, 256)]);
+    }
+
+    #[test]
+    fn duplicate_and_backward_sequences_do_not_fabricate_progress() {
+        assert_eq!(
+            advance_asio_cycle(Some(20), 20, 64, 1, 512),
+            CycleAdvance::Duplicate
+        );
+        assert_eq!(
+            advance_asio_cycle(Some(20), 19, 64, 1, 512),
+            CycleAdvance::Backward
+        );
+        assert_eq!(
+            advance_asio_cycle(Some(u64::MAX), 0, 64, 0, 512),
+            CycleAdvance::Ready {
+                buffer_index: 1,
+                sample_position: 576,
+            }
+        );
+    }
+
+    #[test]
+    fn worker_gate_quiesces_and_restarts_by_generation() {
+        let gate = WorkerGate::new(true).expect("gate should open");
+        assert_eq!(gate.command(), (0, true));
+        gate.acknowledge(0);
+        wait_for_acknowledgement(&gate, 0, Duration::from_millis(10))
+            .expect("start should be acknowledged");
+
+        let stopped = gate.set_running(false);
+        assert_eq!(gate.command(), (stopped, false));
+        gate.acknowledge(stopped);
+        wait_for_acknowledgement(&gate, stopped, Duration::from_millis(10))
+            .expect("stop should be acknowledged");
+
+        let restarted = gate.set_running(true);
+        assert_eq!(gate.command(), (restarted, true));
+        assert_ne!(stopped, restarted);
+        gate.acknowledge(restarted);
+        wait_for_acknowledgement(&gate, restarted, Duration::from_millis(10))
+            .expect("restart should be acknowledged");
+    }
+
+    #[test]
+    fn gate_transition_discards_block_acquired_before_start() {
+        assert!(acquired_block_is_current(4, 4));
+        assert!(!acquired_block_is_current(4, 5));
+    }
+
+    #[test]
+    fn callback_stop_bypasses_lifecycle_lock_and_external_stop_finalizes() {
+        let (driver, gate, _) = fake_running_driver(Duration::from_millis(50));
+        let lifecycle = driver.lifecycle.lock().expect("lifecycle should lock");
+        let callback_driver = Arc::clone(&driver);
+        let (result_tx, result_rx) = mpsc::channel();
+        let callback = thread::spawn(move || {
+            TEST_THREAD_ID.set(7);
+            result_tx
+                .send(callback_driver.stop())
+                .expect("callback result should send");
+        });
+
+        let result = result_rx.recv_timeout(Duration::from_millis(100));
+        drop(lifecycle);
+        callback.join().expect("callback thread should finish");
+        assert!(result.expect("callback Stop must not wait").is_ok());
+        let (generation, running) = gate.command();
+        assert!(!running);
+
+        gate.acknowledge(generation);
+        TEST_THREAD_ID.set(1);
+        driver.stop().expect("external Stop should finalize");
+        assert_eq!(
+            driver.inner.lock().expect("lock should work").state,
+            DriverState::Prepared
+        );
+        remove_fake_worker(&driver);
+    }
+
+    #[test]
+    fn blocked_callback_stop_timeout_keeps_worker_and_buffers_alive() {
+        let (driver, _gate, buffers) = fake_running_driver(Duration::from_millis(30));
+        TEST_THREAD_ID.set(1);
+        let started = Instant::now();
+        let result = driver.stop();
+        let elapsed = started.elapsed();
+
+        assert!(matches!(result, Err(AsioError::WorkerTimeout)));
+        assert!(elapsed >= Duration::from_millis(20));
+        assert!(elapsed < Duration::from_millis(250));
+        let inner = driver.inner.lock().expect("lock should work");
+        assert_eq!(inner.state, DriverState::Stopping);
+        assert!(inner.worker.is_some());
+        assert!(
+            inner
+                .worker
+                .as_ref()
+                .is_some_and(|handle| !handle.stop.is_requested())
+        );
+        assert!(
+            inner
+                .worker
+                .as_ref()
+                .is_some_and(|handle| !handle.context.is_null())
+        );
+        assert!(buffers.upgrade().is_some());
+        drop(inner);
+        remove_fake_worker(&driver);
+    }
+
+    #[test]
+    fn channel_activity_comes_from_created_channel_map() {
+        let mut driver = AsioDriver::new();
+        let mut inner = driver.inner.lock().expect("lock should work");
+        inner.state = DriverState::Initialized;
+        inner.device = Some(test_device());
+        drop(inner);
+
+        let mut info = AsioChannelInfo {
+            channel: 1,
+            is_input: 1,
+            is_active: 123,
+            channel_group: 0,
+            sample_type: 0,
+            name: [0; 32],
+        };
+        assert_eq!(
+            unsafe { sidealsa_asio_get_channel_info(&mut driver, &mut info) },
+            ASIO_SUCCESS
+        );
+        assert_eq!(info.is_active, 0);
+
+        let mut inner = driver.inner.lock().expect("lock should work");
+        inner.active = Some(Arc::new(ActiveChannels {
+            input: [
+                false, true, false, false, false, false, false, false, false, false,
+            ]
+            .into(),
+            output: [false; 8].into(),
+        }));
+        inner.state = DriverState::Prepared;
+        drop(inner);
+        info.is_active = 0;
+        assert_eq!(
+            unsafe { sidealsa_asio_get_channel_info(&mut driver, &mut info) },
+            ASIO_SUCCESS
+        );
+        assert_eq!(info.is_active, 1);
+    }
+
+    #[test]
+    fn buffer_switch_callback_is_required() {
+        let driver = AsioDriver::new();
+        let mut inner = driver.inner.lock().expect("lock should work");
+        inner.state = DriverState::Initialized;
+        inner.device = Some(test_device());
+        drop(inner);
+        let callbacks = AsioCallbacks {
+            buffer_switch_time_info: Some(test_time_info_callback),
+            ..AsioCallbacks::default()
+        };
+
+        assert!(matches!(
+            driver.create_buffers(&mut [], 64, callbacks),
+            Err(AsioError::InvalidParameter)
+        ));
+        assert_eq!(ASIO_NO_MEMORY, -994);
+    }
+
+    #[test]
+    fn invalid_thread_callback_table_clears_output_handle() {
+        let operations = AsioThreadOps {
+            create: Some(unused_create),
+            join: None,
+            current_thread_id: Some(test_current_thread_id),
+        };
+        let mut driver = NonNull::<AsioDriver>::dangling().as_ptr();
+
+        assert_eq!(
+            unsafe { sidealsa_asio_new(&operations, &mut driver) },
+            ASIO_INVALID_PARAMETER
+        );
+        assert!(driver.is_null());
+    }
+
+    #[test]
+    fn position_snapshot_never_mixes_samples_and_timestamp() {
+        let position = Arc::new(PositionSnapshot::new());
+        let writer_position = Arc::clone(&position);
+        let writer = thread::spawn(move || {
+            for samples in 1..100_000_u64 {
+                writer_position.publish(samples, !samples);
+            }
+        });
+        for _ in 0..100_000 {
+            let (samples, stamp) = position.load();
+            if samples != 0 {
+                assert_eq!(stamp, !samples);
+            }
+        }
+        writer.join().expect("writer should finish");
+        let (samples, stamp) = position.load();
+        assert_eq!(stamp, !samples);
+    }
+
+    #[test]
+    fn daemon_control_disconnect_is_detected_and_health_reaches_getters() {
+        let (control, peer) = UnixStream::pair().expect("socket pair should open");
+        drop(peer);
+        let mut pollfd = libc::pollfd {
+            fd: control.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLRDHUP,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 100) }, 1);
+        assert!(
+            daemon_control_failed(control.as_raw_fd(), pollfd.revents)
+                .expect("disconnect check should work")
+        );
+
+        let (driver, gate, _) = fake_running_driver(Duration::from_millis(20));
+        {
+            let mut inner = driver.inner.lock().expect("lock should work");
+            inner.device = Some(test_device());
+        }
+        gate.publish_failure(WorkerFailure::DaemonDisconnected);
+        assert!(matches!(
+            driver.get_channels(),
+            Err(AsioError::DaemonDisconnected)
+        ));
+        assert!(
+            driver
+                .last_error()
+                .is_some_and(|message| message.contains("daemon disconnected"))
+        );
+        remove_fake_worker(&driver);
+    }
+
+    #[test]
+    fn worker_failure_requests_host_reset_or_resync() {
+        let callbacks = AsioCallbacks {
+            buffer_switch: Some(test_buffer_switch),
+            asio_message: Some(test_asio_message),
+            ..AsioCallbacks::default()
+        };
+        FAILURE_NOTIFICATION.store(0, Ordering::Release);
+        notify_worker_failure(callbacks, WorkerFailure::DaemonDisconnected);
+        assert_eq!(
+            FAILURE_NOTIFICATION.load(Ordering::Acquire),
+            ASIO_MESSAGE_RESET_REQUEST
+        );
+        notify_worker_failure(callbacks, WorkerFailure::CaptureDiscontinuity);
+        assert_eq!(
+            FAILURE_NOTIFICATION.load(Ordering::Acquire),
+            ASIO_MESSAGE_RESYNC_REQUEST
+        );
     }
 }

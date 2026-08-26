@@ -15,7 +15,8 @@ The RT bridge performs fixed channel mapping and saturating `i32` addition:
 - PRO output is the raw physical playback block.
 - Active SHARED playback blocks are added to mapped physical channels.
 - Active SHARED capture ports receive mapped logical blocks.
-- Missing SHARED playback increments `shared_underruns` and contributes silence.
+- The first missing SHARED playback block in an armed episode increments
+  `shared_underruns` and contributes silence. The next valid block rearms it.
 - Full SHARED capture rings increment `shared_overruns`.
 
 SHARED misses never increment PRO misses, hardware XRUN counters, generation,
@@ -23,8 +24,9 @@ or timeline resets.
 
 ## Control
 
-`OPEN_SHARED { port_id }` returns session ID, direction, shared layout, and
-three file descriptors through `SCM_RIGHTS`. One client owns each logical port.
+`OPEN_SHARED { port_id }` returns session ID, direction, shared layout, and four
+file descriptors through `SCM_RIGHTS`: memfd, capture eventfd, playback eventfd,
+and playback-ready eventfd. One client owns each logical port.
 PRO ownership remains independent. Disconnect releases either session.
 
 ## Verification
@@ -60,6 +62,10 @@ target/debug/sidealsa-shared-test --socket /tmp/sidealsad.sock --port mic1 --per
 
 Expected delayed playback result: `shared_underruns` may increase; hardware
 XRUNs, PRO misses, generation, and timeline resets remain zero.
+
+An endpoint arms only after its first exact playback block. A missing block
+disarms it after recording one underrun, so an inactive or paused PipeWire node
+does not repeatedly count the same outage at the hardware period rate.
 
 Observed on Topping E1x2 at Q32 with profile realtime scheduling: 1500 delayed playback
 periods produced 95 shared underruns, zero hardware XRUNs, zero PRO misses, and

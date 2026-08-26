@@ -20,15 +20,16 @@ plugin directory must likewise be installed or exposed through
 `ALSA_PLUGIN_DIR`.
 
 The PipeWire and PipeWire Pulse fragments set realtime priority `10`, below the
-ASIO callback at `15` and SideALSA hardware workers at `87/88`. Heavy desktop
+ASIO callback at `86` and SideALSA linked hardware worker at `88`. Heavy desktop
 audio work can therefore lose SHARED data without preempting PRO or hardware.
 
 The objects disable mmap and resampling because the current ioplug supports RW
 interleaved S32_LE at the profile rate. Playback uses event-driven scheduling;
 capture keeps PipeWire timer scheduling enabled because its graph must pace
 bursty capture notifications. The E1x2 hardware profile keeps physical B192
-while exposing an independent four-period `shared_buffer_size = 256`. The
-ioplug stages arbitrary transfer sizes into this preallocated client buffer.
+while exposing an independent eight-period `shared_buffer_size = 512`. Playback
+advertises a four-period minimum, so PipeWire negotiates Q64/B256. The ioplug
+stages arbitrary transfer sizes into the preallocated B512 client ring.
 The reference shared path consumes playback after three hardware periods
 (`192` frames), absorbing normal PipeWire scheduling jitter without changing
 hardware or PRO timing.
@@ -92,9 +93,54 @@ misses, hardware XRUNs, or timeline resets. A longer probe then completed two
 15-second start legs, reporting 11260 callbacks after its restart, with the same
 zero counter deltas.
 
+Frame-exact native device-loopback testing covered later Discord transitions
+with the E1x2 `250 us` PRO handoff. Activation produced 13 exact-sequence
+silence fallbacks and one lost test pulse, but all 233 detected pulses remained
+at 413 frames. Disconnect produced one fallback and all 156 pulses remained at
+413 frames. Neither transition produced a hardware XRUN, core miss, timeline
+reset, or latency phase change.
+
+Earlier Q32 packet-pipeline revisions were verified separately from those older
+Discord results. The following results predate the current zero-lead profile;
+current zero-lead acceptance is documented in `milestone-asio.md`:
+
+- PipeWire raw playback negotiated `period-size = 64`, `period-num = 4`, ran at
+  Q64/48 kHz, and reported graph `ERR = 0`.
+- A 12000-period PRO run remained exactly 373 frames (`7.771 ms`) across real
+  PipeWire activation with zero PRO miss, hardware XRUN, or timeline reset.
+- A 12000-period delayed SHARED run produced 7291 expected shared underruns while
+  concurrent PRO remained exactly 373 frames with zero PRO or hardware failure.
+- A 12000-period run combining PipeWire playback and a `2 ms` PRO delay every
+  17th sequence produced 705 PRO fallbacks, but every detected pulse remained
+  exactly 373 frames and the hardware timeline did not reset.
+- The accepted three-Q32 startup reserve completed a live 15000-period Discord
+  playback, microphone, and screen-capture run with 234 of 234 pulses at exactly
+  347 frames (`7.229 ms`). PRO misses, SHARED misses, hardware XRUNs, and
+  timeline resets stayed at zero; PipeWire's SideALSA and WebRTC audio nodes
+  reported `ERR = 0`.
+- Under the same live Discord load, a `2 ms` PRO delay every 17th sequence
+  produced 883 exact-sequence fallbacks and 14 lost test pulses. All 220 detected
+  pulses remained exactly 347 frames, with zero core miss, SHARED miss, hardware
+  XRUN, or timeline reset.
+- A post-Q32-wakeup experiment reducing startup reserve from three Q32 packets
+  to two was rejected. Discord activation produced three genuine playback XRUNs
+  and three timeline resets. Restoring the 96-frame reserve removed them.
+- SHARED playback arms on its first valid block and records only the first miss
+  in an outage episode. Inactive quantum-zero nodes therefore no longer add one
+  underrun per hardware period; the next valid block rearms accounting.
+- Pre-refill zero-lead acceptance ran simultaneous PipeWire playback and capture
+  beside an 8000-period RT PRO loopback. All 125 pulses remained exactly 436
+  frames; PRO deadline misses, hardware XRUNs, and timeline resets stayed at
+  zero. A separate 12000-period delayed-SHARED run retained all 188 PRO pulses
+  at the same fixed phase with the same zero failure deltas.
+- With refill scheduled two Q32 periods earlier and SHARED work removed from the
+  critical write interval, a fresh 6000-period RT PRO run remained exactly 362
+  frames before and during simultaneous PipeWire playback and capture. All 94
+  pulses were detected with zero PRO miss, hardware XRUN, or timeline reset.
+
 ## Limitations
 
 - Static PipeWire objects are currently listed per profile port.
 - No automatic profile-to-PipeWire node generation.
 - No WirePlumber policy or session-manager customization.
-- No ASIO frontend.
+- No custom PipeWire client; integration remains through the ALSA ioplug.
