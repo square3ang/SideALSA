@@ -6,7 +6,7 @@ use std::{
 
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 13;
+pub const PROTOCOL_VERSION: u16 = 14;
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"SALS";
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 pub const FEATURE_PRO: u32 = 1 << 0;
@@ -68,6 +68,7 @@ pub enum Response {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub name: String,
+    pub profile_fingerprint: u64,
     pub rate: u32,
     pub period_size: u32,
     pub hardware_period_size: u32,
@@ -512,6 +513,7 @@ fn decode_response_payload(code: ResponseCode, payload: &[u8]) -> Result<Respons
 
 fn encode_info(payload: &mut Vec<u8>, info: &DeviceInfo) -> Result<(), ProtocolError> {
     put_string(payload, &info.name)?;
+    put_u64(payload, info.profile_fingerprint);
     put_u32(payload, info.rate);
     put_u32(payload, info.period_size);
     put_u32(payload, info.hardware_period_size);
@@ -530,6 +532,7 @@ fn encode_info(payload: &mut Vec<u8>, info: &DeviceInfo) -> Result<(), ProtocolE
 fn decode_info(decoder: &mut Decoder<'_>) -> Result<DeviceInfo, ProtocolError> {
     Ok(DeviceInfo {
         name: decoder.string()?,
+        profile_fingerprint: decoder.u64()?,
         rate: decoder.u32()?,
         period_size: decoder.u32()?,
         hardware_period_size: decoder.u32()?,

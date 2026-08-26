@@ -1,7 +1,7 @@
 # Installation
 
-Install release binaries, the ALSA plugin, `sidealsad`, and PipeWire adapter
-configuration system-wide:
+Install release binaries, the Qt control panel, ALSA plugin, `sidealsad`, and
+PipeWire adapter configuration system-wide:
 
 ```text
 scripts/install.sh
@@ -14,12 +14,15 @@ PipeWire, and build paths retain that user's environment.
 Installer defaults:
 
 - binaries: `/usr/local/bin`
-- user-owned profile: `/etc/sidealsa/profiles/topping-e1x2.toml`
+- root-owned profile: `/etc/sidealsa/profiles/topping-e1x2.toml`
 - ALSA definitions: `/etc/alsa/conf.d/99-sidealsa.conf`
 - PipeWire objects: `/etc/pipewire/pipewire.conf.d/99-sidealsa.conf`
 - PipeWire Pulse scheduling: `/etc/pipewire/pipewire-pulse.conf.d/99-sidealsa.conf`
 - daemon service: `sidealsad.service`
 - socket: `/tmp/sidealsad.sock`
+- control panel: `/usr/local/bin/sidealsa-control`
+- privileged helper: `/usr/libexec/sidealsa-admin`
+- polkit action: `org.sidealsa.configure`
 - socket access: `audio` group when available
 - realtime scheduling: profile-controlled, enabled by default
 
@@ -39,10 +42,12 @@ any of those IDs instead of installing adapters that cannot open their ports.
 Automatic adapter generation for arbitrary validated profiles is not yet
 implemented.
 
-The Q64/Q32 E1x2 packet pipeline uses `pro_latency_periods = 0` and
-`linked_playback_guard_frames = 32`. Capture block N is returned as playback
-block N after the bounded client handoff, so native PRO and ASIO use the same
-callback timeline. The profile reports 64 frames of PRO output latency.
+The Q64/Q32 E1x2 packet pipeline uses `pro_latency_periods = 0`,
+`linked_playback_guard_frames = 32`, and `pro_handoff_us = 500`. Capture block N
+is returned as playback block N after the bounded client handoff, so native PRO
+and ASIO use the same callback timeline. The profile reports 64 frames of PRO
+output latency. The 500-us handoff covers observed Wine callback overhead under
+desktop capture load while retaining the validator's Q32 hardware-write reserve.
 
 PipeWire adapter settings use a `64`-frame period and negotiate at least four
 periods (`256` ALSA frames). SideALSA SHARED playback consumes data after three
@@ -72,6 +77,19 @@ Install without starting the daemon:
 ```text
 scripts/install.sh --no-start
 ```
+
+Skip the Qt control panel and polkit helper:
+
+```text
+scripts/install.sh --no-gui
+```
+
+The control panel edits all timing fields. Applying a change authenticates with
+polkit, validates and atomically replaces the root-owned profile, restarts the
+fixed system service, and verifies the new root-owned socket peer against
+systemd's `MainPID` and the complete loaded profile fingerprint. On failure it
+restores the original profile and verifies the rollback restart. Active clients
+disconnect during either restart and must reconnect.
 
 Install Wine ASIO binaries when CMake, `winegcc`, and `winebuild` are available:
 

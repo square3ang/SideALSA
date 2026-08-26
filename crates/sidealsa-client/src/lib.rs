@@ -56,6 +56,13 @@ pub enum StreamMode {
     Shared(PortDirection),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerCredentials {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
 pub struct SideAlsaClient {
     control: UnixStream,
     features: u32,
@@ -98,7 +105,7 @@ impl SideAlsaClient {
         self.features
     }
 
-    pub fn peer_pid(&self) -> Result<u32, ClientError> {
+    pub fn peer_credentials(&self) -> Result<PeerCredentials, ClientError> {
         let mut credentials = libc::ucred {
             pid: 0,
             uid: 0,
@@ -117,8 +124,16 @@ impl SideAlsaClient {
         {
             return Err(io::Error::last_os_error().into());
         }
-        u32::try_from(credentials.pid)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon PID").into())
+        Ok(PeerCredentials {
+            pid: u32::try_from(credentials.pid)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon PID"))?,
+            uid: credentials.uid,
+            gid: credentials.gid,
+        })
+    }
+
+    pub fn peer_pid(&self) -> Result<u32, ClientError> {
+        Ok(self.peer_credentials()?.pid)
     }
 
     pub fn get_info(&mut self) -> Result<DeviceInfo, ClientError> {
@@ -962,6 +977,7 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("listener should bind");
         let expected = DeviceInfo {
             name: "Test".into(),
+            profile_fingerprint: 0x1234,
             rate: 48000,
             period_size: 32,
             hardware_period_size: 16,

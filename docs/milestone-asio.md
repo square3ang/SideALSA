@@ -7,9 +7,9 @@ registration, DLL ABI, and `CreateThread` bridge required for Wine TEB setup.
 
 The adapter expects the daemon profile to expose a `64`-frame logical period.
 The reference E1x2 profile uses physical ALSA Q32, aggregates transfers into
-Q64 client cycles, and keeps `buffer_size = 192`. Linked startup primes 172
+Q64 client cycles, and keeps `buffer_size = 192`. Linked startup primes 184
 frames: one Q64 capture interval, one Q32 physical write reserve, two Q32
-refill-headroom periods, and the 12 frames consumed by the 250 us client
+refill-headroom periods, and the 24 frames consumed by the 500 us client
 handoff.
 
 ASIO reports 64 input frames and 64 output frames for the reference profile.
@@ -26,9 +26,10 @@ block with a Q32 playback guard. Missing playback gets one zero-filled fallback
 period; stale playback cannot affect later sequences. PRO session starts and
 deadline misses never request a hardware restart.
 
-Protocol v13 carries the playback-ready eventfd, timing diagnostics, physical
+Protocol v14 carries the playback-ready eventfd, timing diagnostics, physical
 hardware period, effective PRO output latency, linked-start phase calibration
-result, and independent SHARED buffer size. Shared-memory v8 carries the
+result, independent SHARED buffer size, and the loaded profile fingerprint.
+Shared-memory v8 carries the
 daemon's authoritative playback and activation watermarks plus the
 shared-capture discontinuity counter, playback publication timestamps, and
 hardware timeline generation.
@@ -141,7 +142,7 @@ reference uses the ASIO worker's default realtime priority of `86`.
 
 ASIO begins with the first playback-clock target and publishes playback under
 that exact sequence. The E1x2 profile keeps zero process-ahead blocks, one Q32
-playback guard, and a real 250 us client handoff. The daemon never waits past
+playback guard, and a real 500 us client handoff. The daemon never waits past
 that bounded cutoff. It samples the exact shared-memory sequence once,
 substitutes silence when absent, and resumes only with the next exact sequence.
 
@@ -197,7 +198,7 @@ cargo run --release -p sidealsa-cli --bin sidealsa-stats -- --socket /tmp/sideal
   unloaded run moved 424 to 394 frames. A 96-frame guard also failed to prevent
   a load-related transition. Those one-period-lead guard experiments did not
   solve the issue. The current zero-lead profile uses a 32-frame guaranteed
-  guard and a 172-frame startup prime; refill is scheduled two Q32 periods early
+  guard and a 184-frame startup prime; refill is scheduled two Q32 periods early
   to cover ALSA availability granularity and USB-driver transfer advancement.
 - USB descriptors put playback and capture on the same internal UAC2 clock
   source, but playback uses an asynchronous explicit-feedback endpoint with
@@ -208,7 +209,7 @@ cargo run --release -p sidealsa-cli --bin sidealsa-stats -- --socket /tmp/sideal
   revision. They established miss isolation but are not latency acceptance data
   for the current revision. The rejected 64-frame/two-Q32 startup prime remains
   rejected because it caused real Discord activation XRUNs; zero-lead startup
-  now primes 172 frames so the Q32 guard remains after refill advancement and
+  now primes 184 frames so the Q32 guard remains after refill advancement and
   the client handoff.
 - Client diagnostics expose expired capture blocks, playback publication
   failures, realtime promotion failures, callback overruns, and maximum callback

@@ -1,4 +1,4 @@
-use std::{error::Error, path::PathBuf, thread, time::Duration};
+use std::{error::Error, io, path::PathBuf, thread, time::Duration};
 
 use sidealsa_client::SideAlsaClient;
 
@@ -6,6 +6,8 @@ struct Args {
     socket: PathBuf,
     samples: u64,
     interval_ms: u64,
+    expect_peer_pid: Option<u32>,
+    expect_peer_uid: Option<u32>,
 }
 
 fn main() {
@@ -24,7 +26,32 @@ fn main() {
 
 fn run(args: Args) -> Result<(), Box<dyn Error>> {
     let mut client = SideAlsaClient::connect(&args.socket)?;
-    let daemon_pid = client.peer_pid()?;
+    let credentials = client.peer_credentials()?;
+    if let Some(expected) = args.expect_peer_pid
+        && expected != credentials.pid
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "daemon peer PID {} does not match expected PID {expected}",
+                credentials.pid
+            ),
+        )
+        .into());
+    }
+    if let Some(expected) = args.expect_peer_uid
+        && expected != credentials.uid
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "daemon peer UID {} does not match expected UID {expected}",
+                credentials.uid
+            ),
+        )
+        .into());
+    }
+    let daemon_pid = credentials.pid;
     for _ in 0..args.samples {
         let stats = client.get_stats()?;
         println!(
@@ -118,14 +145,24 @@ fn parse_args() -> Result<Args, String> {
     let mut socket = PathBuf::from("/tmp/sidealsad.sock");
     let mut samples = 100;
     let mut interval_ms = 10;
+    let mut expect_peer_pid = None;
+    let mut expect_peer_uid = None;
 
     while let Some(argument) = arguments.next() {
         match argument.to_str() {
             Some("--socket") => socket = PathBuf::from(next_value(&mut arguments, "--socket")?),
             Some("--samples") => samples = parse_value(&mut arguments, "--samples")?,
             Some("--interval-ms") => interval_ms = parse_value(&mut arguments, "--interval-ms")?,
+            Some("--expect-peer-pid") => {
+                expect_peer_pid = Some(parse_value(&mut arguments, "--expect-peer-pid")?)
+            }
+            Some("--expect-peer-uid") => {
+                expect_peer_uid = Some(parse_value(&mut arguments, "--expect-peer-uid")?)
+            }
             Some("--help") | Some("-h") => {
-                println!("sidealsa-stats [--socket PATH] [--samples COUNT] [--interval-ms MS]");
+                println!(
+                    "sidealsa-stats [--socket PATH] [--samples COUNT] [--interval-ms MS] [--expect-peer-pid PID] [--expect-peer-uid UID]"
+                );
                 std::process::exit(0);
             }
             Some(value) => return Err(format!("unknown argument: {value}")),
@@ -139,6 +176,8 @@ fn parse_args() -> Result<Args, String> {
         socket,
         samples,
         interval_ms,
+        expect_peer_pid,
+        expect_peer_uid,
     })
 }
 

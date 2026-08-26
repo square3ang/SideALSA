@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=SideALSA Control
+Comment=Configure SideALSA hardware timing
+Exec=@PREFIX@/bin/sidealsa-control --profile @PROFILE@ --socket @SOCKET@
+Icon=audio-card
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=audio;ALSA;ASIO;latency;sample rate;
+StartupNotify=true

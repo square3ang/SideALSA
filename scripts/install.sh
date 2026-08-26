@@ -16,6 +16,7 @@ FORCE=0
 REPLACE_PROFILE=0
 NO_START=0
 INSTALL_PIPEWIRE=1
+INSTALL_GUI=1
 USER_AUDIO_WAS_STOPPED=0
 USER_AUDIO_UNITS=()
 DAEMON_RESTART_PENDING=0
@@ -48,12 +49,16 @@ info() {
 
 wait_for_socket() {
     local deadline=$((SECONDS + 20))
+    local main_pid
     command -v timeout >/dev/null 2>&1 || die "timeout command not found"
     while ((SECONDS < deadline)); do
+        main_pid="$(systemctl show --property=MainPID --value sidealsad.service 2>/dev/null || true)"
         if [[ -S "$SOCKET_PATH" ]] \
+            && [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] \
             && systemctl is-active --quiet sidealsad.service \
             && timeout --signal=KILL 0.5s "$PREFIX/bin/sidealsa-stats" \
                 --socket "$SOCKET_PATH" --samples 1 --interval-ms 0 \
+                --expect-peer-pid "$main_pid" --expect-peer-uid 0 \
                 >/dev/null 2>&1; then
             return 0
         fi
@@ -131,6 +136,7 @@ Options:
   --replace-profile         Replace existing device profile
   --no-start                Enable service without starting it
   --no-pipewire             Skip PipeWire adapter configuration
+  --no-gui                  Skip Qt control panel and privileged helper
   -h, --help                Show this help
 
 DESTDIR may be set for staged package installation. System services are not
@@ -184,6 +190,10 @@ while (($# > 0)); do
             INSTALL_PIPEWIRE=0
             shift
             ;;
+        --no-gui)
+            INSTALL_GUI=0
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -210,6 +220,7 @@ fi
 [[ -f "$PROFILE_SOURCE" ]] || die "profile not found: $PROFILE_SOURCE"
 PROFILE_NAME="$(basename -- "$PROFILE_SOURCE")"
 [[ "$PROFILE_NAME" != "." && "$PROFILE_NAME" != ".." ]] || die "invalid profile name"
+[[ "$PROFILE_NAME" == *.toml ]] || die "profile filename must end in .toml"
 for service_value in "$PREFIX" "$SOCKET_PATH" "$PROFILE_NAME"; do
     [[ "$service_value" != *[[:space:]]* ]] || \
         die "systemd service paths must not contain whitespace: $service_value"
@@ -295,6 +306,19 @@ if ((WITH_ASIO == 1)); then
     fi
 fi
 
+if ((INSTALL_GUI == 1)); then
+    if ((NO_BUILD == 0)); then
+        command -v cmake >/dev/null 2>&1 || die "GUI installation requires cmake"
+        info "building Qt control panel"
+        cmake -S "$ROOT/crates/sidealsa-gui" -B "$ROOT/build-gui" -DCMAKE_BUILD_TYPE=Release
+        cmake --build "$ROOT/build-gui"
+    fi
+    [[ -x "$ROOT/build-gui/sidealsa-control" ]] || \
+        die "missing Qt control panel: $ROOT/build-gui/sidealsa-control"
+    [[ -x "$ROOT/target/release/sidealsa-admin" ]] || \
+        die "missing privileged helper: $ROOT/target/release/sidealsa-admin"
+fi
+
 BINARIES=(
     sidealsad
     sidealsa-hw-test
@@ -318,6 +342,10 @@ PROFILE_PATH=/etc/sidealsa/profiles/$PROFILE_NAME
 LICENSE_PATH="$PREFIX/share/sidealsa/LICENSE"
 DOC_PREFIX="$PREFIX/share/doc/sidealsa"
 MANIFEST_PATH="$PREFIX/share/sidealsa/install-manifest"
+GUI_PATH="$PREFIX/bin/sidealsa-control"
+ADMIN_PATH=/usr/libexec/sidealsa-admin
+DESKTOP_PATH="$PREFIX/share/applications/org.sidealsa.Control.desktop"
+POLKIT_PATH=/usr/share/polkit-1/actions/org.sidealsa.configure.policy
 RETIRED_MANAGED_PATHS=(
     /etc/wireplumber/wireplumber.conf.d/99-sidealsa.conf
 )
@@ -333,6 +361,14 @@ if ((WITH_ASIO == 0)); then
         "$PREFIX/lib/wine/x86_64-unix/sidealsa-asio64.dll.so"
         "$PREFIX/lib/wine/x86_64-windows/sidealsa-asio.dll"
         "$PREFIX/lib/wine/x86_64-unix/sidealsa-asio.dll.so"
+    )
+fi
+if ((INSTALL_GUI == 0)); then
+    RETIRED_MANAGED_PATHS+=(
+        "$GUI_PATH"
+        "$ADMIN_PATH"
+        "$DESKTOP_PATH"
+        "$POLKIT_PATH"
     )
 fi
 
@@ -365,6 +401,14 @@ if ((WITH_ASIO == 1)); then
     [[ -f "$ROOT/build-asio/sidealsa-asio64.dll" ]] || die "missing ASIO PE binary"
     [[ -f "$ROOT/build-asio/sidealsa-asio64.dll.so" ]] || die "missing ASIO Unix binary"
 fi
+if ((INSTALL_GUI == 1)); then
+    MANAGED_PATHS+=(
+        "$GUI_PATH"
+        "$ADMIN_PATH"
+        "$DESKTOP_PATH"
+        "$POLKIT_PATH"
+    )
+fi
 
 MANIFEST_ACTUAL="$(destination "$MANIFEST_PATH")"
 declare -A OLD_HASHES=()
@@ -388,9 +432,14 @@ done
 for path in "${RETIRED_MANAGED_PATHS[@]}"; do
     actual="$(destination "$path")"
     [[ -e "$actual" && -n "${OLD_HASHES[$path]+owned}" ]] || continue
-    if ((FORCE == 1)) || [[ "$(file_hash "$actual")" == "${OLD_HASHES[$path]}" ]]; then
-        run_privileged rm -f -- "$actual"
+    if ((FORCE == 0)) && [[ "$(file_hash "$actual")" != "${OLD_HASHES[$path]}" ]]; then
+        die "retired managed file changed since install: $actual (use --force to remove)"
     fi
+done
+for path in "${RETIRED_MANAGED_PATHS[@]}"; do
+    actual="$(destination "$path")"
+    [[ -e "$actual" && -n "${OLD_HASHES[$path]+owned}" ]] || continue
+    run_privileged rm -f -- "$actual"
 done
 
 TMP_DIR="$(mktemp -d)"
@@ -420,6 +469,26 @@ else
     info "installed profile: $PROFILE_ACTUAL"
 fi
 run_privileged install -D -m 0644 "$ROOT/LICENSE" "$(destination "$LICENSE_PATH")"
+
+if ((INSTALL_GUI == 1)); then
+    run_privileged install -D -m 0755 "$ROOT/build-gui/sidealsa-control" \
+        "$(destination "$GUI_PATH")"
+    run_privileged install -D -m 0755 "$ROOT/target/release/sidealsa-admin" \
+        "$(destination "$ADMIN_PATH")"
+
+    desktop_temp="$TMP_DIR/org.sidealsa.Control.desktop"
+    sed \
+        -e "s|@PREFIX@|$(sed_escape "$PREFIX")|g" \
+        -e "s|@PROFILE@|$(sed_escape "$PROFILE_PATH")|g" \
+        -e "s|@SOCKET@|$(sed_escape "$SOCKET_PATH")|g" \
+        "$ROOT/packaging/sidealsa-control.desktop.in" > "$desktop_temp"
+    run_privileged install -D -m 0644 "$desktop_temp" "$(destination "$DESKTOP_PATH")"
+
+    policy_temp="$TMP_DIR/org.sidealsa.configure.policy"
+    sed "s|@HELPER_PATH@|$(sed_escape "$ADMIN_PATH")|g" \
+        "$ROOT/packaging/org.sidealsa.configure.policy.in" > "$policy_temp"
+    run_privileged install -D -m 0644 "$policy_temp" "$(destination "$POLKIT_PATH")"
+fi
 
 for doc in "$ROOT"/docs/*.md; do
     run_privileged install -D -m 0644 "$doc" "$(destination "$DOC_PREFIX/$(basename -- "$doc")")"
@@ -514,3 +583,6 @@ info "SideALSA installed"
 info "profile: $PROFILE_PATH"
 info "socket: $SOCKET_PATH"
 info "ALSA plugin: $ALSA_PLUGIN_DIR/libasound_module_pcm_sidealsa.so"
+if ((INSTALL_GUI == 1)); then
+    info "control panel: $GUI_PATH"
+fi

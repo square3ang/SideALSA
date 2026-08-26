@@ -917,6 +917,7 @@ impl DaemonPlaybackBridge {
 fn device_info(profile: &Profile) -> DeviceInfo {
     DeviceInfo {
         name: profile.device.name.clone(),
+        profile_fingerprint: profile.fingerprint(),
         rate: profile.device.rate,
         period_size: profile.device.period_size,
         hardware_period_size: profile.device.effective_hardware_period_size(),

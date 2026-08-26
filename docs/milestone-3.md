@@ -20,9 +20,9 @@ only older capture blocks and use the oldest target that remains valid. SHARED
 capture clients retain ordered FIFO delivery.
 
 `device.pro_latency_periods` configures PRO output lookahead. The E1x2 reference
-profile uses zero lead and a 172-frame startup reserve: one Q64 capture interval,
-the Q32 playback guard, two Q32 refill-headroom periods, and the 12 frames
-consumed by the 250 us handoff. Its effective PRO output latency is one Q64 host
+profile uses zero lead and a 184-frame startup reserve: one Q64 capture interval,
+the Q32 playback guard, two Q32 refill-headroom periods, and the 24 frames
+consumed by the 500 us handoff. Its effective PRO output latency is one Q64 host
 buffer. Higher values trade whole periods of latency for more client margin.
 Maximum value is `7`, limited by the fixed shared-memory ring.
 

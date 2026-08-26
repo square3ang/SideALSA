@@ -94,7 +94,7 @@ misses, hardware XRUNs, or timeline resets. A longer probe then completed two
 zero counter deltas.
 
 Frame-exact native device-loopback testing covered later Discord transitions
-with the E1x2 `250 us` PRO handoff. Activation produced 13 exact-sequence
+with the then-current E1x2 `250 us` PRO handoff. Activation produced 13 exact-sequence
 silence fallbacks and one lost test pulse, but all 233 detected pulses remained
 at 413 frames. Disconnect produced one fallback and all 156 pulses remained at
 413 frames. Neither transition produced a hardware XRUN, core miss, timeline

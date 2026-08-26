@@ -2321,6 +2321,7 @@ mod tests {
     fn test_device() -> DeviceInfo {
         DeviceInfo {
             name: "Test".into(),
+            profile_fingerprint: 0,
             rate: 48000,
             period_size: 64,
             hardware_period_size: 32,

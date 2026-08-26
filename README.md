@@ -1,5 +1,7 @@
 # SideALSA
 
+> One hardware clock. Two isolated client domains. No client owns the timeline.
+
 SideALSA is a userspace professional-audio layer built on ALSA. It owns one
 physical USB audio device and exposes two independent client paths:
 
@@ -11,10 +13,17 @@ miss becomes silence and a diagnostic counter, not an ALSA restart.
 
 Initial reference device: **Topping E1x2 OTG**.
 
+| Path | Purpose | Failure behavior |
+| --- | --- | --- |
+| **PRO** | Exclusive DAW, native ALSA, and Wine/Proton ASIO | A missed exact-sequence block becomes silence |
+| **SHARED** | PipeWire and desktop logical ports | Each late client is isolated and buffered |
+| **Hardware** | One continuous duplex ALSA timeline | Only a real ALSA failure triggers XRUN recovery |
+
 Current profile: `48 kHz`, `S32_LE`, `64`-frame client periods, `32`-frame
 physical periods, `192`-frame hardware buffer, 8 playback channels, and 10
 capture channels. The linked zero-lead PRO path reports 64 input frames and 64
-output frames.
+output frames. Its `500 us` bounded handoff accommodates Wine callback overhead
+without adding a whole period of PRO latency.
 
 ## Status
 
@@ -26,6 +35,7 @@ Working paths:
 - ALSA ioplug for raw `sidealsa_pro` and hidden PipeWire backing PCMs.
 - PipeWire adapters backed by the ALSA ioplug.
 - Experimental 64-bit Wine/Proton ASIO frontend.
+- Qt 6 timing control panel with authenticated apply and automatic rollback.
 
 Not implemented:
 
@@ -33,7 +43,6 @@ Not implemented:
 - Resampling or format conversion.
 - Advanced routing or DSP.
 - 32-bit ASIO/WoW64 frontend.
-- GUI control panel.
 
 ## Architecture
 
@@ -60,7 +69,7 @@ Arch/CachyOS example:
 ```sh
 sudo pacman -S --needed \
   alsa-lib alsa-utils pipewire pipewire-pulse wireplumber \
-  rust cmake gcc pkgconf wine wine-tools
+  rust cmake gcc pkgconf qt6-base polkit wine wine-tools
 ```
 
 Build requirements:
@@ -68,6 +77,7 @@ Build requirements:
 - Rust toolchain with Cargo.
 - ALSA development headers and `pkg-config`.
 - CMake, GCC, and GNU make or Ninja.
+- Qt 6 Widgets and polkit for the control panel.
 - Wine SDK headers, `winegcc`, and `winebuild` for ASIO.
 - A 64-bit Wine executable for prefix registration.
 
@@ -92,8 +102,8 @@ target/release/sidealsa-hw-test \
 
 ## Install Core
 
-Install daemon, ALSA plugin, initial profile, ALSA definitions, PipeWire adapters, and
-systemd service:
+Install the daemon, control panel, ALSA plugin, initial profile, PipeWire
+adapters, and systemd service:
 
 ```sh
 ./scripts/install.sh --no-build
@@ -105,6 +115,11 @@ After reviewing local changes, use `--replace-profile` to adopt a new reference
 profile. The current Q64/Q32 pipeline requires
 `linked_playback_guard_frames = 32` and `pro_latency_periods = 0`.
 
+Use `--no-gui` when Qt or polkit integration is not wanted. The privileged
+helper is always installed at `/usr/libexec/sidealsa-admin`, outside a custom
+binary prefix, and may only update root-owned profiles directly under
+`/etc/sidealsa/profiles`.
+
 Installer defaults:
 
 ```text
@@ -114,6 +129,8 @@ ALSA config:  /etc/alsa/conf.d/99-sidealsa.conf
 PipeWire:     /etc/pipewire/pipewire.conf.d/99-sidealsa.conf
 ALSA plugin:  /usr/lib/alsa-lib/libasound_module_pcm_sidealsa.so
 socket:       /tmp/sidealsad.sock
+control UI:   /usr/local/bin/sidealsa-control
+admin helper: /usr/libexec/sidealsa-admin
 ```
 
 Restart user audio after installation:
@@ -144,6 +161,36 @@ The reference profile exposes a separate `shared_buffer_size = 512` to ALSA and
 PipeWire clients. Playback advertises a four-period minimum, so PipeWire
 negotiates Q64/B256 while the shared-memory ring retains eight periods. Neither
 value changes the physical B192 queue or Q64 PRO block size.
+
+## Control Panel
+
+Launch **SideALSA Control** from the desktop application menu or run:
+
+```sh
+sidealsa-control
+```
+
+The Qt control panel edits the complete hardware timing set: sample rate,
+logical and physical periods, hardware and SHARED buffers, playback queue,
+duplex/link controls, PRO and SHARED lead, handoff budget, and realtime
+priorities.
+
+Apply is transactional:
+
+```text
+validate candidate -> atomically save -> restart sidealsad -> verify new PID
+       failure      -> restore original -> restart -> verify rollback
+```
+
+Authentication is handled by polkit. The helper verifies that the socket peer is
+root-owned and matches the `sidealsad.service` MainPID, then compares the full
+loaded profile fingerprint. Concurrent edits are rejected by revision rather
+than overwritten. Comments and unrelated profile sections are preserved.
+
+Applying timing restarts the physical stream, so active PRO and SHARED clients
+disconnect and must reconnect. Unsupported sample rates or ALSA geometries are
+rolled back automatically. The E1x2 has only been exercised at `48 kHz`; other
+rates remain hardware-dependent.
 
 The card number can differ. Find it with:
 
@@ -433,6 +480,29 @@ ps -ef | grep sidealsad
 ASIO output is raw physical multichannel output. SideALSA ASIO does not pass
 through PipeWire or logical shared ports.
 
+### ASIO glitches while Discord or OBS is active
+
+First distinguish a client miss from a hardware failure:
+
+```sh
+sidealsa-stats --samples 20 --interval-ms 100
+```
+
+- Rising `client` with stable `core`, `hw_playback`, and `hw_capture` means the
+  ASIO callback missed the bounded PRO handoff; the hardware timeline stayed
+  intact.
+- Rising `callback_overruns` means the host callback exceeded the full Q64
+  period.
+- Rising `rt_failures` means Wine could not promote the ASIO worker to the
+  configured `pro_realtime_priority`.
+
+The reference Q64/Q32 profile uses `pro_handoff_us = 500`. This leaves the
+validated physical-write reserve while covering callback durations above the
+old `250 us` budget. Larger values are not automatically safer: the profile
+validator rejects a handoff that would consume the Q32 write deadline. For more
+margin, increase `pro_latency_periods` to `1` in the control panel at the cost of
+one additional client period.
+
 ## Development Checks
 
 ```sh
@@ -440,6 +510,13 @@ cargo fmt --all
 cargo test --release --workspace --all-targets
 cargo clippy --release --workspace --all-targets -- -D warnings
 cargo build --release --workspace
+```
+
+Qt control-panel build check:
+
+```sh
+cmake -S crates/sidealsa-gui -B build-gui -DCMAKE_BUILD_TYPE=Release
+cmake --build build-gui
 ```
 
 ASIO build check:
