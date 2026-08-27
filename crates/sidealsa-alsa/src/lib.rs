@@ -162,10 +162,15 @@ pub unsafe extern "C" fn sidealsa_stream_open(
             device_info.shared_buffer_size,
         );
         let buffer_size = plugin_buffer_size(device_info.period_size, requested_buffer_size);
+        let alsa_period_size = plugin_period_size(mode, device_info.period_size, buffer_size);
+        let buffer_size = plugin_buffer_size(alsa_period_size, buffer_size);
+        let buffer_size =
+            playback_startup_buffer_size(mode, direction, alsa_period_size, buffer_size);
         let minimum_buffer_size = minimum_plugin_buffer_size(
             mode,
             direction,
             device_info.period_size,
+            alsa_period_size,
             device_info.shared_latency_periods,
             buffer_size,
         );
@@ -208,7 +213,7 @@ pub unsafe extern "C" fn sidealsa_stream_open(
         *stream_out = Box::into_raw(stream);
         *rate_out = device_info.rate;
         *channels_out = channels_out_value;
-        *period_out = device_info.period_size;
+        *period_out = alsa_period_size;
         *minimum_buffer_out = minimum_buffer_size;
         *buffer_out = buffer_size;
         *poll_fd_out = poll_fd;
@@ -920,22 +925,56 @@ fn requested_buffer_size(mode: c_int, hardware: u32, shared: u32) -> u32 {
     }
 }
 
-fn minimum_plugin_buffer_size(
+fn plugin_period_size(mode: c_int, internal_period_size: u32, buffer_size: u32) -> u32 {
+    if mode != MODE_SHARED || internal_period_size == 0 {
+        return internal_period_size;
+    }
+    let internal_periods = buffer_size / internal_period_size;
+    let mut aggregated_periods = (internal_periods / 2).max(1);
+    while aggregated_periods > 1 && !internal_periods.is_multiple_of(aggregated_periods) {
+        aggregated_periods -= 1;
+    }
+    // Keep daemon transfers aligned to the internal period while exposing two
+    // buffered ALSA periods whenever the configured geometry permits it.
+    internal_period_size.saturating_mul(aggregated_periods)
+}
+
+fn playback_startup_buffer_size(
     mode: c_int,
     direction: c_int,
     period_size: u32,
+    buffer_size: u32,
+) -> u32 {
+    // PipeWire needs one extra period of capacity while its first graph block
+    // follows the startup silence. The steady-state target remains one period.
+    if mode == MODE_SHARED && direction == STREAM_PLAYBACK {
+        buffer_size.max(period_size.saturating_mul(3))
+    } else {
+        buffer_size
+    }
+}
+
+fn minimum_plugin_buffer_size(
+    mode: c_int,
+    direction: c_int,
+    internal_period_size: u32,
+    plugin_period_size: u32,
     shared_latency_periods: u32,
     maximum_buffer_size: u32,
 ) -> u32 {
     if mode != MODE_SHARED {
         return maximum_buffer_size;
     }
-    let periods = if direction == STREAM_PLAYBACK {
+    let internal_periods = if direction == STREAM_PLAYBACK {
         shared_latency_periods.saturating_add(1).max(2)
     } else {
         2
     };
-    period_size.saturating_mul(periods).min(maximum_buffer_size)
+    let plugin_periods = if direction == STREAM_PLAYBACK { 3 } else { 2 };
+    let required_frames = internal_period_size
+        .saturating_mul(internal_periods)
+        .max(plugin_period_size.saturating_mul(plugin_periods));
+    plugin_buffer_size(plugin_period_size, required_frames).min(maximum_buffer_size)
 }
 
 unsafe fn copy_from_area(
@@ -1065,19 +1104,36 @@ mod tests {
         assert_eq!(plugin_buffer_size(64, 64), 128);
         assert_eq!(plugin_buffer_size(64, 160), 192);
         assert_eq!(plugin_buffer_size(64, 256), 256);
-        assert_eq!(requested_buffer_size(MODE_PRO, 192, 256), 192);
-        assert_eq!(requested_buffer_size(MODE_SHARED, 192, 256), 256);
+        assert_eq!(requested_buffer_size(MODE_PRO, 256, 512), 256);
+        assert_eq!(requested_buffer_size(MODE_SHARED, 256, 512), 512);
+        assert_eq!(plugin_period_size(MODE_PRO, 64, 256), 64);
+        assert_eq!(plugin_period_size(MODE_SHARED, 64, 512), 256);
+        assert_eq!(plugin_period_size(MODE_SHARED, 64, 1024), 512);
+        assert_eq!(plugin_period_size(MODE_SHARED, 64, 384), 192);
+        assert_eq!(plugin_period_size(MODE_SHARED, 64, 448), 64);
         assert_eq!(
-            minimum_plugin_buffer_size(MODE_SHARED, STREAM_PLAYBACK, 64, 3, 512),
+            playback_startup_buffer_size(MODE_SHARED, STREAM_PLAYBACK, 256, 512),
+            768
+        );
+        assert_eq!(
+            playback_startup_buffer_size(MODE_SHARED, STREAM_CAPTURE, 256, 512),
+            512
+        );
+        assert_eq!(
+            playback_startup_buffer_size(MODE_PRO, STREAM_PLAYBACK, 64, 256),
             256
         );
         assert_eq!(
-            minimum_plugin_buffer_size(MODE_SHARED, STREAM_CAPTURE, 64, 3, 512),
-            128
+            minimum_plugin_buffer_size(MODE_SHARED, STREAM_PLAYBACK, 64, 256, 7, 768),
+            768
         );
         assert_eq!(
-            minimum_plugin_buffer_size(MODE_PRO, STREAM_PLAYBACK, 64, 3, 192),
-            192
+            minimum_plugin_buffer_size(MODE_SHARED, STREAM_CAPTURE, 64, 256, 7, 512),
+            512
+        );
+        assert_eq!(
+            minimum_plugin_buffer_size(MODE_PRO, STREAM_PLAYBACK, 64, 64, 7, 256),
+            256
         );
     }
 

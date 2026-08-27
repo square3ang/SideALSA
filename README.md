@@ -20,7 +20,7 @@ Initial reference device: **Topping E1x2 OTG**.
 | **Hardware** | One continuous duplex ALSA timeline | Only a real ALSA failure triggers XRUN recovery |
 
 Current profile: `48 kHz`, `S32_LE`, `64`-frame client periods, `32`-frame
-physical periods, `192`-frame hardware buffer, 8 playback channels, and 10
+physical periods, `256`-frame hardware buffer, 8 playback channels, and 10
 capture channels. The linked zero-lead PRO path reports 64 input frames and 64
 output frames. Its `500 us` bounded handoff accommodates Wine callback overhead
 without adding a whole period of PRO latency.
@@ -112,8 +112,8 @@ adapters, and systemd service:
 The installer creates the selected profile only when it does not exist. Later
 installs preserve `/etc/sidealsa/profiles/*.toml`, including with `--force`.
 After reviewing local changes, use `--replace-profile` to adopt a new reference
-profile. The current Q64/Q32 pipeline requires
-`linked_playback_guard_frames = 32` and `pro_latency_periods = 0`.
+profile. The current Q64/Q32 reference uses
+`linked_playback_guard_frames = 48` and `pro_latency_periods = 0`.
 
 Use `--no-gui` when Qt or polkit integration is not wanted. The privileged
 helper is always installed at `/usr/libexec/sidealsa-admin`, outside a custom
@@ -154,13 +154,15 @@ format: S32_LE
 channels: 8
 rate: 48000
 period_size: 32
-buffer_size: 192
+buffer_size: 256
 ```
 
-The reference profile exposes a separate `shared_buffer_size = 512` to ALSA and
-PipeWire clients. Playback advertises a four-period minimum, so PipeWire
-negotiates Q64/B256 while the shared-memory ring retains eight periods. Neither
-value changes the physical B192 queue or Q64 PRO block size.
+The reference profile exposes a separate `shared_buffer_size = 512`. The ioplug
+keeps daemon transfers and that ring at Q64/B512, while PipeWire playback
+negotiates Q256/B768. The third external period provides startup capacity for a
+Q256 PipeWire start delay; the steady buffer target remains Q256. Playback uses
+seven internal periods (`448` frames) of SHARED lookahead. This does not change
+the physical B256 queue or Q64 PRO block size.
 
 ## Control Panel
 
@@ -187,10 +189,19 @@ root-owned and matches the `sidealsad.service` MainPID, then compares the full
 loaded profile fingerprint. Concurrent edits are rejected by revision rather
 than overwritten. Comments and unrelated profile sections are preserved.
 
-Applying timing restarts the physical stream, so active PRO and SHARED clients
-disconnect and must reconnect. Unsupported sample rates or ALSA geometries are
-rolled back automatically. The E1x2 has only been exercised at `48 kHz`; other
-rates remain hardware-dependent.
+Applying timing restarts the physical stream. After a successful restart or a
+reported failure that may have restarted the daemon, including a verified
+rollback, the control panel restarts active user PipeWire services so their
+static SideALSA adapters are recreated; desktop audio pauses briefly. Direct PRO
+and SHARED clients must reconnect. If `systemctl --user` cannot restart
+PipeWire, the control panel reports the manual recovery command without treating
+an otherwise successful daemon configuration as failed. Unsupported sample
+rates or ALSA geometries are rolled back automatically. The E1x2 has only been
+exercised at `48 kHz`; other rates remain hardware-dependent.
+
+An unexpected `sidealsad` restart disconnects existing ioplug handles. Restart
+the user PipeWire services with the command above to recreate static adapters;
+automatic ioplug reconnection is not implemented yet.
 
 The card number can differ. Find it with:
 
@@ -491,6 +502,9 @@ sidealsa-stats --samples 20 --interval-ms 100
 - Rising `client` with stable `core`, `hw_playback`, and `hw_capture` means the
   ASIO callback missed the bounded PRO handoff; the hardware timeline stayed
   intact.
+- Rising `core` with stable hardware counters means a delayed hardware wake
+  shortened the client handoff to preserve one playback period. The current
+  sequence may fall back to silence, but ALSA continues.
 - Rising `callback_overruns` means the host callback exceeded the full Q64
   period.
 - Rising `rt_failures` means Wine could not promote the ASIO worker to the
@@ -498,10 +512,12 @@ sidealsa-stats --samples 20 --interval-ms 100
 
 The reference Q64/Q32 profile uses `pro_handoff_us = 500`. This leaves the
 validated physical-write reserve while covering callback durations above the
-old `250 us` budget. Larger values are not automatically safer: the profile
-validator rejects a handoff that would consume the Q32 write deadline. For more
-margin, increase `pro_latency_periods` to `1` in the control panel at the cost of
-one additional client period.
+old `250 us` budget. The hardware loop clamps that budget against current ALSA
+delay and keeps one Q64 period reserved for an emergency write. Larger values
+are not automatically safer: the profile validator rejects a handoff that would
+consume the Q32 write deadline. For more margin, increase
+`pro_latency_periods` to `1` in the control panel at the cost of one additional
+client period.
 
 ## Development Checks
 

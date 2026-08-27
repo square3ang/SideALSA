@@ -295,12 +295,14 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o
  /usr/include/qt6/QtCore/QHash
  /usr/include/qt6/QtCore/QList
  /usr/include/qt6/QtCore/QObject
+ /usr/include/qt6/QtCore/QPointer
  /usr/include/qt6/QtCore/QProcess
  /usr/include/qt6/QtCore/QRect
  /usr/include/qt6/QtCore/QRegularExpression
  /usr/include/qt6/QtCore/QSize
  /usr/include/qt6/QtCore/QSizeF
  /usr/include/qt6/QtCore/QStringList
+ /usr/include/qt6/QtCore/QTimer
  /usr/include/qt6/QtCore/q17memory.h
  /usr/include/qt6/QtCore/q20bit.h
  /usr/include/qt6/QtCore/q20functional.h
@@ -388,6 +390,7 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o
  /usr/include/qt6/QtCore/qoverload.h
  /usr/include/qt6/QtCore/qpair.h
  /usr/include/qt6/QtCore/qpoint.h
+ /usr/include/qt6/QtCore/qpointer.h
  /usr/include/qt6/QtCore/qprocess.h
  /usr/include/qt6/QtCore/qprocessordetection.h
  /usr/include/qt6/QtCore/qrect.h
@@ -428,6 +431,7 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o
  /usr/include/qt6/QtCore/qtenvironmentvariables.h
  /usr/include/qt6/QtCore/qtextstream.h
  /usr/include/qt6/QtCore/qtformat_impl.h
+ /usr/include/qt6/QtCore/qtimer.h
  /usr/include/qt6/QtCore/qtmetamacros.h
  /usr/include/qt6/QtCore/qtnoop.h
  /usr/include/qt6/QtCore/qtpreprocessorsupport.h

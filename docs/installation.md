@@ -43,23 +43,35 @@ Automatic adapter generation for arbitrary validated profiles is not yet
 implemented.
 
 The Q64/Q32 E1x2 packet pipeline uses `pro_latency_periods = 0`,
-`linked_playback_guard_frames = 32`, and `pro_handoff_us = 500`. Capture block N
+`linked_playback_guard_frames = 48`, and `pro_handoff_us = 500`. Capture block N
 is returned as playback block N after the bounded client handoff, so native PRO
 and ASIO use the same callback timeline. The profile reports 64 frames of PRO
 output latency. The 500-us handoff covers observed Wine callback overhead under
-desktop capture load while retaining the validator's Q32 hardware-write reserve.
+desktop capture load. A delayed hardware wake shortens that handoff when needed
+to retain one Q64 period for the next ALSA write. Linked startup primes 232
+frames, including three Q32 refill-headroom periods.
 
-PipeWire adapter settings use a `64`-frame period and negotiate at least four
-periods (`256` ALSA frames). SideALSA SHARED playback consumes data after three
-logical periods (`192` frames) from an independent eight-period B512 ring, so
-client scheduling has buffering without changing the physical B192 timeline.
+The ALSA ioplug keeps SideALSA SHARED transfers at Q64 and uses the independent
+B512 daemon ring. It aggregates four internal blocks per Q256 external period.
+PipeWire playback negotiates B768 and uses `api.alsa.start-delay = 256`, allowing
+startup silence and the first graph block to coexist without moving the
+steady-state Q256 target. Capture does not add this startup period. SideALSA
+SHARED playback consumes data after seven internal periods (`448` frames), so
+desktop scheduling remains isolated from the physical B256 timeline. Playback
+and capture adapters keep PipeWire timer scheduling enabled.
 PipeWire's global clock quantum stays distribution-managed. The installed
 PipeWire and PipeWire Pulse fragments cap their realtime priority at `10`. The
 reference priority order is linked hardware `88`, ASIO callback `86`,
 WirePlumber `83`, and PipeWire/Pulse `10`.
-The callback keeps normal scheduling and reports `pro_realtime_failures` when
-the Wine process lacks realtime scheduling rights. Existing profiles that omit
+The callback continues with normal scheduling and reports
+`pro_realtime_failures` when the Wine process lacks realtime scheduling rights.
+Existing profiles that omit
 `pro_realtime_priority` derive it as two below `realtime_priority`.
+
+With `device.realtime = true`, `sidealsad` locks current and future mappings with
+`mlockall` and prefaults 64 KiB of the hardware-thread stack before streaming.
+Startup fails instead of running an unprotected RT loop when memory locking is
+unavailable. The installed service supplies `LimitMEMLOCK=infinity`.
 
 Restart user PipeWire and WirePlumber after installation:
 
@@ -88,8 +100,17 @@ The control panel edits all timing fields. Applying a change authenticates with
 polkit, validates and atomically replaces the root-owned profile, restarts the
 fixed system service, and verifies the new root-owned socket peer against
 systemd's `MainPID` and the complete loaded profile fingerprint. On failure it
-restores the original profile and verifies the rollback restart. Active clients
-disconnect during either restart and must reconnect.
+restores the original profile and verifies the rollback restart. After a
+successful restart or a reported failure that may have restarted the daemon,
+including rollback, the control panel restarts active user PipeWire services so
+static adapters reopen against the current daemon. Direct PRO and SHARED clients
+still need to reconnect. A warning with the manual `systemctl --user restart`
+command is shown if the user-service restart fails or times out; an otherwise
+verified daemon change remains applied.
+
+The installer also stops active user audio before restarting `sidealsad` and
+waits for the new socket before restoring those services. This prevents static
+PipeWire adapters from opening before the daemon is ready.
 
 Install Wine ASIO binaries when CMake, `winegcc`, and `winebuild` are available:
 

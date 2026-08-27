@@ -392,6 +392,7 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o: \
  /usr/include/qt6/QtWidgets/qmessagebox.h \
  /usr/include/qt6/QtWidgets/qdialog.h \
  /usr/include/qt6/QtWidgets/qdialogbuttonbox.h \
+ /usr/include/qt6/QtCore/QPointer /usr/include/qt6/QtCore/qpointer.h \
  /usr/include/qt6/QtCore/QProcess /usr/include/qt6/QtCore/qprocess.h \
  /usr/include/qt6/QtWidgets/QPushButton \
  /usr/include/qt6/QtWidgets/qpushbutton.h \
@@ -402,6 +403,6 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o: \
  /usr/include/qt6/QtWidgets/qabstractscrollarea.h \
  /usr/include/qt6/QtWidgets/QSpinBox \
  /usr/include/qt6/QtWidgets/qspinbox.h /usr/include/qt6/QtWidgets/QStyle \
- /usr/include/qt6/QtCore/QStringList \
- /usr/include/qt6/QtWidgets/QVBoxLayout \
+ /usr/include/qt6/QtCore/QStringList /usr/include/qt6/QtCore/QTimer \
+ /usr/include/qt6/QtCore/qtimer.h /usr/include/qt6/QtWidgets/QVBoxLayout \
  /usr/include/qt6/QtWidgets/QWidget

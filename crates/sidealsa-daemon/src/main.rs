@@ -1,4 +1,5 @@
 use std::{
+    io,
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
     thread,
@@ -62,7 +63,14 @@ fn main() {
     let hardware_stop = Arc::clone(&stop);
     let hardware_ready = state.hardware_ready_handle();
     let (capture_bridge, playback_bridge) = state.bridges();
+    if profile.device.realtime
+        && let Err(error) = lock_process_memory()
+    {
+        eprintln!("could not lock realtime memory: {error}");
+        std::process::exit(1);
+    }
     let hardware_handle = thread::spawn(move || {
+        prefault_realtime_stack();
         let mut engine = engine;
         let run_result = engine.run_pro_with_ready(
             &hardware_stop,
@@ -170,6 +178,28 @@ fn main() {
     );
     println!("shared_underruns={}", stats.shared_underruns);
     println!("shared_overruns={}", stats.shared_overruns);
+}
+
+fn lock_process_memory() -> io::Result<()> {
+    if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[inline(never)]
+fn prefault_realtime_stack() {
+    const PREFAULT_BYTES: usize = 64 * 1024;
+    const PAGE_BYTES: usize = 4096;
+
+    let mut stack = [0_u8; PREFAULT_BYTES];
+    for offset in (0..PREFAULT_BYTES).step_by(PAGE_BYTES) {
+        unsafe {
+            std::ptr::write_volatile(stack.as_mut_ptr().add(offset), 0);
+        }
+    }
+    std::hint::black_box(&mut stack);
 }
 
 fn parse_args() -> Result<Args, String> {

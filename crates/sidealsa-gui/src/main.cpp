@@ -13,6 +13,7 @@
 #include <QLineEdit>
 #include <QMainWindow>
 #include <QMessageBox>
+#include <QPointer>
 #include <QProcess>
 #include <QPushButton>
 #include <QRegularExpression>
@@ -21,6 +22,7 @@
 #include <QSpinBox>
 #include <QStyle>
 #include <QStringList>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -30,6 +32,8 @@ namespace {
 
 constexpr auto kDefaultProfile = "/etc/sidealsa/profiles/topping-e1x2.toml";
 constexpr auto kDefaultSocket = "/tmp/sidealsad.sock";
+constexpr int kClientRefreshRequiredErrorExitCode = 2;
+constexpr int kAudioRestartTimeoutMs = 30000;
 
 QString optionalNumber(const QSpinBox *box)
 {
@@ -117,9 +121,9 @@ public:
 protected:
     void closeEvent(QCloseEvent *event) override
     {
-        if (applyProcess_) {
+        if (applyProcess_ || audioRestartProcess_) {
             QMessageBox::information(this, QStringLiteral("Configuration is applying"),
-                                     QStringLiteral("Wait for the daemon restart and verification to finish."));
+                                     QStringLiteral("Wait for the daemon and client service restarts to finish."));
             event->ignore();
             return;
         }
@@ -326,7 +330,7 @@ private:
             setStatus(QStringLiteral("Applying"), "warning");
     }
 
-    void loadProfile()
+    bool loadProfile()
     {
         QProcess process;
         process.start(helperPath_, {QStringLiteral("show"), QStringLiteral("--profile"), profilePath_,
@@ -339,7 +343,7 @@ private:
                                       ? QStringLiteral("Could not run %1").arg(helperPath_)
                                       : error);
             applyButton_->setDisabled(true);
-            return;
+            return false;
         }
 
         const QHash<QString, QString> values = parseSettings(process.readAllStandardOutput());
@@ -347,7 +351,7 @@ private:
         if (revision_.isEmpty()) {
             setStatus(QStringLiteral("Invalid helper output"), "error");
             applyButton_->setDisabled(true);
-            return;
+            return false;
         }
         if (!loadWidgets(values)) {
             setStatus(QStringLiteral("Unsupported profile"), "error");
@@ -355,7 +359,7 @@ private:
                 QStringLiteral("A timing value is missing or exceeds this control panel's integer range.\n%1")
                     .arg(profilePath_));
             applyButton_->setDisabled(true);
-            return;
+            return false;
         }
         applyButton_->setEnabled(true);
 
@@ -374,11 +378,14 @@ private:
             setStatus(QStringLiteral("Restart required"), "warning");
             detailLabel_->setText(QStringLiteral("The saved profile differs from the running daemon.\n%1")
                                       .arg(profilePath_));
+            return false;
         } else {
             setStatus(QStringLiteral("Daemon offline"), "error");
             detailLabel_->setText(QStringLiteral("%1\n%2")
                                       .arg(values.value(QStringLiteral("daemon_error")), profilePath_));
+            return false;
         }
+        return true;
     }
 
     bool loadWidgets(const QHash<QString, QString> &values)
@@ -479,9 +486,9 @@ private:
 
         const auto answer = QMessageBox::warning(
             this, QStringLiteral("Apply hardware timing?"),
-            QStringLiteral("SideALSA will restart the physical stream. Active PRO and SHARED clients "
-                           "will disconnect and must reconnect.\n\nIf the hardware rejects these values, "
-                           "the current profile is restored automatically."),
+            QStringLiteral("SideALSA will restart the physical stream and user PipeWire services. "
+                           "Direct PRO and SHARED clients will disconnect, and desktop audio will pause briefly.\n\n"
+                           "If the hardware rejects these values, the current profile is restored automatically."),
             QMessageBox::Apply | QMessageBox::Cancel, QMessageBox::Cancel);
         if (answer != QMessageBox::Apply)
             return;
@@ -498,7 +505,7 @@ private:
         connect(applyProcess_, &QProcess::errorOccurred, this,
                 [this](QProcess::ProcessError error) {
                     if (error == QProcess::FailedToStart)
-                        finishApply(false, QStringLiteral("Could not start pkexec."));
+                        finishApply(false, false, QStringLiteral("Could not start pkexec."));
                 });
         connect(applyProcess_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
                 [this](int exitCode, QProcess::ExitStatus exitStatus) {
@@ -509,36 +516,151 @@ private:
                     const QString standardError =
                         QString::fromUtf8(applyProcess_->readAllStandardError()).trimmed();
                     const bool success = exitStatus == QProcess::NormalExit && exitCode == 0;
-                    finishApply(success, success ? standardOutput : standardError);
+                    const bool refreshClients = success
+                        || (exitStatus == QProcess::NormalExit
+                            && exitCode == kClientRefreshRequiredErrorExitCode);
+                    QString message = success ? standardOutput : standardError;
+                    if (!success && exitStatus == QProcess::CrashExit) {
+                        const QString recovery = QStringLiteral(
+                            "The apply helper terminated unexpectedly. If sidealsad restarted, run: "
+                            "systemctl --user restart pipewire.service pipewire-pulse.service "
+                            "wireplumber.service");
+                        message = message.isEmpty() ? recovery
+                                                    : QStringLiteral("%1\n%2").arg(message, recovery);
+                    }
+                    finishApply(success, refreshClients, message);
                 });
         applyProcess_->start(QStringLiteral("pkexec"), arguments);
     }
 
-    void finishApply(bool success, const QString &message)
+    void finishApply(bool success, bool refreshClients, const QString &message)
     {
         if (!applyProcess_)
             return;
         applyProcess_->deleteLater();
         applyProcess_ = nullptr;
-        setBusy(false);
-        if (success) {
-            loadProfile();
-            detailLabel_->setText(QStringLiteral("%1\n%2").arg(
-                message.isEmpty() ? QStringLiteral("Configuration applied") : message, profilePath_));
+        const QString detail = message.isEmpty()
+            ? (success ? QStringLiteral("Configuration applied")
+                       : QStringLiteral("Authorization was cancelled or the helper failed."))
+            : message;
+        if (refreshClients) {
+            pendingApplySucceeded_ = success;
+            pendingApplyMessage_ = detail;
+            restartUserAudio();
             return;
         }
-        setStatus(QStringLiteral("Apply failed"), "error");
-        const QString detail = message.isEmpty() ? QStringLiteral("Authorization was cancelled or the helper failed.")
-                                                 : message;
-        detailLabel_->setText(detail);
+        setBusy(false);
+        if (loadProfile()) {
+            setStatus(QStringLiteral("Apply failed"), "error");
+            detailLabel_->setText(detail);
+        } else {
+            detailLabel_->setText(QStringLiteral("%1\n\nApply failed: %2")
+                                      .arg(detailLabel_->text(), detail));
+        }
         QMessageBox::critical(this, QStringLiteral("Could not apply configuration"), detail);
+    }
+
+    void restartUserAudio()
+    {
+        detailLabel_->setText(
+            pendingApplySucceeded_
+                ? QStringLiteral("Configuration applied. Restarting user PipeWire services...")
+                : QStringLiteral("Apply failed. Refreshing user PipeWire connections..."));
+        audioRestartTimedOut_ = false;
+        audioRestartProcess_ = new QProcess(this);
+        connect(audioRestartProcess_, &QProcess::errorOccurred, this,
+                [this](QProcess::ProcessError error) {
+                    if (error == QProcess::FailedToStart)
+                        finishAudioRestart(false, QStringLiteral("Could not start systemctl."));
+                });
+        connect(audioRestartProcess_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+                [this](int exitCode, QProcess::ExitStatus exitStatus) {
+                    if (!audioRestartProcess_)
+                        return;
+                    QString standardError =
+                        QString::fromUtf8(audioRestartProcess_->readAllStandardError()).trimmed();
+                    if (audioRestartTimedOut_) {
+                        const QString timeout = QStringLiteral(
+                            "systemctl did not finish within 30 seconds; user-service state is indeterminate");
+                        standardError = standardError.isEmpty()
+                            ? timeout
+                            : QStringLiteral("%1; %2").arg(standardError, timeout);
+                    }
+                    const bool success = !audioRestartTimedOut_
+                        && exitStatus == QProcess::NormalExit && exitCode == 0;
+                    finishAudioRestart(success, standardError);
+                });
+        const QPointer<QProcess> process(audioRestartProcess_);
+        QTimer::singleShot(kAudioRestartTimeoutMs, this, [this, process] {
+            if (process && audioRestartProcess_ == process) {
+                audioRestartTimedOut_ = true;
+                process->kill();
+            }
+        });
+        audioRestartProcess_->start(
+            QStringLiteral("/usr/bin/systemctl"),
+            {QStringLiteral("--user"), QStringLiteral("try-restart"),
+             QStringLiteral("pipewire.service"), QStringLiteral("pipewire-pulse.service"),
+             QStringLiteral("wireplumber.service")});
+    }
+
+    void finishAudioRestart(bool success, const QString &error)
+    {
+        if (!audioRestartProcess_)
+            return;
+        audioRestartProcess_->deleteLater();
+        audioRestartProcess_ = nullptr;
+        setBusy(false);
+        const bool daemonReady = loadProfile();
+        QString clientRestartFailure;
+        if (!success) {
+            const QString reason = error.isEmpty() ? QStringLiteral("systemctl returned an error") : error;
+            clientRestartFailure =
+                QStringLiteral("PipeWire service refresh did not complete cleanly: %1\n"
+                               "Run: systemctl --user restart pipewire.service pipewire-pulse.service "
+                               "wireplumber.service")
+                    .arg(reason);
+        }
+
+        if (pendingApplySucceeded_) {
+            if (daemonReady && success) {
+                detailLabel_->setText(QStringLiteral("%1\nActive PipeWire services refreshed.\n%2")
+                                          .arg(pendingApplyMessage_, profilePath_));
+            } else if (daemonReady) {
+                setStatus(QStringLiteral("Client restart needed"), "warning");
+                detailLabel_->setText(QStringLiteral("%1\n%2")
+                                          .arg(pendingApplyMessage_, clientRestartFailure));
+            } else if (!success) {
+                detailLabel_->setText(QStringLiteral("%1\n\n%2")
+                                          .arg(detailLabel_->text(), clientRestartFailure));
+            }
+        } else {
+            QString detail = pendingApplyMessage_;
+            if (!success)
+                detail += QStringLiteral("\n") + clientRestartFailure;
+            if (daemonReady) {
+                setStatus(QStringLiteral("Apply failed"), "error");
+                detailLabel_->setText(detail);
+            } else {
+                detailLabel_->setText(QStringLiteral("%1\n\nApply failed: %2")
+                                          .arg(detailLabel_->text(), detail));
+            }
+            QMessageBox::critical(this, QStringLiteral("Could not apply configuration"), detail);
+        }
+        pendingApplyMessage_.clear();
+        pendingApplySucceeded_ = false;
+        audioRestartTimedOut_ = false;
     }
 
     QString profilePath_;
     QString socketPath_;
     QString helperPath_;
     QString revision_;
+    QString pendingApplyMessage_;
+    bool pendingApplySucceeded_ = false;
     QProcess *applyProcess_ = nullptr;
+    QProcess *audioRestartProcess_ = nullptr;
+    bool audioRestartTimedOut_ = false;
 
     QLabel *statusBadge_ = nullptr;
     QLabel *detailLabel_ = nullptr;

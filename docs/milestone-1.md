@@ -6,7 +6,7 @@ The engine opens profile-selected playback and capture PCM streams and
 configures `S32_LE` interleaved ALSA access at `48 kHz`. `period_size` is the
 logical transfer/client block. An optional `hardware_period_size` may divide it
 for ALSA devices that need smaller interrupt periods. The E1x2 uses logical
-Q64 over physical Q32 with a `192`-frame hardware buffer.
+Q64 over physical Q32 with a `256`-frame hardware buffer.
 
 The RT cycle uses preallocated sample buffers and fixed sample counts. It does
 not parse configuration, allocate buffers, use locks, or log.
@@ -58,10 +58,10 @@ prints diagnostics after the RT loop exits.
 - Playback is silence only.
 - Only `S32_LE` is supported.
 - Exact logical `period_size = 64`, physical `hardware_period_size = 32`, and
-  `buffer_size = 192` are required by the E1x2 profile. Devices rejecting that
+  `buffer_size = 256` are required by the E1x2 profile. Devices rejecting that
   setup fail before streaming.
-- The E1x2 hardware buffer holds six physical periods; `64/128` is insufficient
-  for the shared client path.
-- Optimized release `64/192` completed `7500` periods with `generation=0`,
+- The E1x2 hardware buffer holds eight physical periods; B128 is insufficient
+  for the current zero-lead and shared-client paths.
+- An earlier optimized release `64/192` run completed `7500` periods with `generation=0`,
   `timeline_resets=0`, `hw_playback_xruns=0`, and `hw_capture_xruns=0`.
 - Reported playback and capture positions currently count successful transfers; ALSA hardware pointer queries are not implemented yet.

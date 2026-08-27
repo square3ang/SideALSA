@@ -1366,6 +1366,20 @@ fn take_pending_pro_capture(
     }
 }
 
+fn bounded_pro_handoff_target(
+    capture_read_nanos: u64,
+    handoff_started_nanos: u64,
+    handoff_nanos: u64,
+    playback_delay: alsa::pcm::Frames,
+    reserve_frames: alsa::pcm::Frames,
+    rate: u32,
+) -> u64 {
+    let configured_target = handoff_started_nanos.saturating_add(handoff_nanos);
+    let margin_frames = u64::try_from(playback_delay.saturating_sub(reserve_frames)).unwrap_or(0);
+    let hardware_budget_nanos = margin_frames.saturating_mul(1_000_000_000) / u64::from(rate);
+    configured_target.min(capture_read_nanos.saturating_add(hardware_budget_nanos))
+}
+
 fn wait_for_pro_handoff(
     pending: PendingProCapture,
     control: WorkerControl<'_>,
@@ -1512,6 +1526,7 @@ fn linked_pro_cycle_loop(
         }
 
         let capture_read_nanos = monotonic_nanos();
+        let playback_delay_at_capture = playback_pcm.delay().ok();
         if let Ok(delay) = capture_pcm.delay() {
             control.timeline.update_pcm_delay(
                 StreamDirection::Capture,
@@ -1546,10 +1561,26 @@ fn linked_pro_cycle_loop(
             continue;
         }
 
+        // A delayed hardware wake must consume the client handoff, not the
+        // playback period that keeps ALSA running.
+        let handoff_started_nanos = monotonic_nanos();
+        let target_nanos = playback_delay_at_capture.map_or_else(
+            || handoff_started_nanos.saturating_add(config.handoff_nanos),
+            |playback_delay| {
+                bounded_pro_handoff_target(
+                    capture_read_nanos,
+                    handoff_started_nanos,
+                    config.handoff_nanos,
+                    playback_delay,
+                    config.period,
+                    config.rate,
+                )
+            },
+        );
         let pending_capture = PendingProCapture {
             hardware_sequence: sequence,
             playback_sequence: sequence,
-            target_nanos: monotonic_nanos().saturating_add(config.handoff_nanos),
+            target_nanos,
         };
         if catch_unwind(AssertUnwindSafe(|| {
             playback_source.prepare_playback_mix(sequence);
@@ -2962,11 +2993,11 @@ fn linked_zero_lead_playback_floor(
     buffer: alsa::pcm::Frames,
     write_frames: alsa::pcm::Frames,
 ) -> alsa::pcm::Frames {
-    // Reserve one period for ALSA availability granularity and one while the
-    // USB driver advances its next playback transfer.
+    // Reserve one period for ALSA availability granularity, one while the USB
+    // driver advances its next transfer, and one for delayed RT wakeup.
     buffer
         .saturating_sub(write_frames)
-        .min(guard_frames.saturating_add(hardware_period.saturating_mul(2)))
+        .min(guard_frames.saturating_add(hardware_period.saturating_mul(3)))
 }
 
 fn linked_ahead_start_frames(
@@ -3440,12 +3471,12 @@ impl EngineError {
 mod tests {
     use super::{
         EngineError, PendingProCapture, ProClock, StreamDirection, WorkerControl,
-        align_sequence_forward, alsa_call, linked_ahead_start_frames, linked_phase_dither_frames,
-        linked_phase_prediction, linked_phase_score, linked_phase_target_nanos,
-        linked_start_frames, linked_zero_lead_playback_floor, observe_pro_capture_target,
-        period_limit_reached, playback_startup_priority, playback_target_sleep,
-        pro_target_sequence, staged_playback_chunk_before_capture, take_pending_pro_capture,
-        take_pro_capture_sequence, uses_staged_packet_cycle,
+        align_sequence_forward, alsa_call, bounded_pro_handoff_target, linked_ahead_start_frames,
+        linked_phase_dither_frames, linked_phase_prediction, linked_phase_score,
+        linked_phase_target_nanos, linked_start_frames, linked_zero_lead_playback_floor,
+        observe_pro_capture_target, period_limit_reached, playback_startup_priority,
+        playback_target_sleep, pro_target_sequence, staged_playback_chunk_before_capture,
+        take_pending_pro_capture, take_pro_capture_sequence, uses_staged_packet_cycle,
     };
     use crate::HardwareTimeline;
     use std::{
@@ -3640,13 +3671,36 @@ mod tests {
     #[test]
     fn zero_lead_refill_accounts_for_hardware_availability_granularity() {
         let playback_floor = linked_zero_lead_playback_floor(32, 32, 192, 64);
-        assert_eq!(playback_floor, 96);
+        assert_eq!(playback_floor, 128);
         assert_eq!(
             linked_start_frames(64, playback_floor, 192, 48_000, 250_000),
-            172
+            192
         );
         assert_eq!(linked_zero_lead_playback_floor(32, 32, 128, 64), 64);
         assert_eq!(linked_zero_lead_playback_floor(64, 32, 192, 64), 128);
+
+        let reference_floor = linked_zero_lead_playback_floor(48, 32, 256, 64);
+        assert_eq!(reference_floor, 144);
+        assert_eq!(
+            linked_start_frames(64, reference_floor, 256, 48_000, 500_000),
+            232
+        );
+    }
+
+    #[test]
+    fn pro_handoff_is_clamped_before_playback_reserve_is_consumed() {
+        assert_eq!(
+            bounded_pro_handoff_target(1_000_000, 1_050_000, 500_000, 128, 64, 48_000),
+            1_550_000
+        );
+        assert_eq!(
+            bounded_pro_handoff_target(1_000_000, 1_050_000, 500_000, 80, 64, 48_000),
+            1_333_333
+        );
+        assert_eq!(
+            bounded_pro_handoff_target(1_000_000, 1_050_000, 500_000, 32, 64, 48_000),
+            1_000_000
+        );
     }
 
     #[test]

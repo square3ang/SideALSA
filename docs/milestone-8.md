@@ -23,20 +23,23 @@ The PipeWire and PipeWire Pulse fragments set realtime priority `10`, below the
 ASIO callback at `86` and SideALSA linked hardware worker at `88`. Heavy desktop
 audio work can therefore lose SHARED data without preempting PRO or hardware.
 
-The objects disable mmap and resampling because the current ioplug supports RW
-interleaved S32_LE at the profile rate. Playback uses event-driven scheduling;
-capture keeps PipeWire timer scheduling enabled because its graph must pace
-bursty capture notifications. The E1x2 hardware profile keeps physical B192
-while exposing an independent eight-period `shared_buffer_size = 512`. Playback
-advertises a four-period minimum, so PipeWire negotiates Q64/B256. The ioplug
-stages arbitrary transfer sizes into the preallocated B512 client ring.
-The reference shared path consumes playback after three hardware periods
-(`192` frames), absorbing normal PipeWire scheduling jitter without changing
-hardware or PRO timing.
+The objects disable mmap; the current ioplug supports RW interleaved S32_LE at
+the profile rate and SideALSA performs no resampling. Playback and capture keep
+PipeWire timer scheduling enabled, separating desktop graph pacing from the
+daemon's internal Q64 notifications. The E1x2 hardware profile uses physical
+B256 while exposing an independent eight-Q64-period `shared_buffer_size = 512`.
+The ioplug aggregates four internal blocks per Q256 external period. Playback
+offers three periods and PipeWire negotiates B768; `api.alsa.start-delay = 256`
+uses the extra period only to keep startup primed while the first graph block
+arrives. The steady target remains Q256. Transfers remain Q64 at the daemon
+boundary and use the preallocated B512 SHARED ring.
+The reference shared path consumes playback after seven logical periods
+(`448` frames), absorbing desktop scheduling jitter without changing hardware
+or PRO timing.
 
 If a PipeWire callback is late, the ioplug uses all queued catch-up periods. If
 no catch-up block exists, it leaves one explicit sequence gap and immediately
-realigns later blocks to the three-period target. The daemon substitutes silence
+realigns later blocks to the seven-period target. The daemon substitutes silence
 for that one gap; lateness does not permanently reduce SHARED lookahead.
 
 Capture notifications are level-triggered through eventfd. The client drains a
@@ -44,6 +47,13 @@ coalesced notification whenever it accepts a ready slot, scans past free ring
 holes after a delayed callback, and uses an ALSA boundary-scale hardware
 pointer. A full capture ring still advances its timeline and notification, so a
 late PipeWire source can recover instead of remaining permanently stalled.
+
+An ioplug handle that observes a closed daemon control socket enters ALSA's
+`DISCONNECTED` state. Existing PipeWire poll registrations cannot be retargeted
+to a new stream, so the control panel restarts active user PipeWire services
+after profile apply or rollback and lets the static adapters be created again.
+An unexpected daemon restart still requires the same manual user-service
+restart; automatic ioplug reconnection is not implemented yet.
 
 ## Local Test
 
@@ -93,6 +103,18 @@ misses, hardware XRUNs, or timeline resets. A longer probe then completed two
 15-second start legs, reporting 11260 callbacks after its restart, with the same
 zero counter deltas.
 
+Earlier Q256 acceptance used the B256/guard48/500-us/SHARED7 profile. Direct
+`aplay` and `arecord` both negotiated `period_size=256`, `periods=2`, and
+`buffer_size=512`. Under 24 in-process ASIO stress workers, 512 MiB of memory
+traffic, a 350 us callback workload, and simultaneous PipeWire playback and
+capture, two consecutive runs completed 31723 PRO playback blocks. Analog
+loopback remained fixed at 374 frames, all PipeWire adapter and client graph
+errors remained zero, and PRO, SHARED, hardware-XRUN, generation, and reset
+counter deltas remained zero. A simultaneous PipeWire Pulse `pacat` playback and
+record run added 15877 PRO blocks with the same fixed phase and zero error
+deltas. The two absolute SHARED underruns visible afterward came from an earlier
+rejected Q256 IRQ-scheduling trial and did not increase during acceptance.
+
 Frame-exact native device-loopback testing covered later Discord transitions
 with the then-current E1x2 `250 us` PRO handoff. Activation produced 13 exact-sequence
 silence fallbacks and one lost test pulse, but all 233 detected pulses remained
@@ -137,6 +159,17 @@ current zero-lead acceptance is documented in `milestone-asio.md`:
   critical write interval, a fresh 6000-period RT PRO run remained exactly 362
   frames before and during simultaneous PipeWire playback and capture. All 94
   pulses were detected with zero PRO miss, hardware XRUN, or timeline reset.
+- A controlled 15-second 1 kHz PipeWire playback isolated a later startup-clock
+  defect. With Q256/B512, all 2779 ioplug transfers were exact Q256 writes with
+  no short transfer or `EAGAIN`, but 37 discontinuities were already present at
+  the ioplug input. PipeWire reported `delay=128`, `target=256`, and a DLL rate
+  correction that rose past `1.02`; its monitor signal before the ALSA adapter
+  remained sample-perfect. Q256/B768 plus a Q256 start delay retained the same
+  steady target and removed the error: 721152 transferred frames had zero large
+  deltas, the maximum adjacent delta matched the source at `24792408`, and DLL
+  correction remained within `0.999891..1.000133`. The production plugin then
+  repeated playback with PipeWire `ERR=0` and no SHARED, hardware-XRUN,
+  generation, or timeline-reset delta.
 
 ## Limitations
 
@@ -144,3 +177,7 @@ current zero-lead acceptance is documented in `milestone-asio.md`:
 - No automatic profile-to-PipeWire node generation.
 - No WirePlumber policy or session-manager customization.
 - No custom PipeWire client; integration remains through the ALSA ioplug.
+- The Q256 start delay is static reference-profile configuration. A different
+  external period geometry must update the PipeWire adapter fragment.
+- The B768 startup correction has controlled-sine coverage but still needs a
+  longer browser/Discord desktop soak.

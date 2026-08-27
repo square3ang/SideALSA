@@ -4,7 +4,7 @@
 ALSA ownership. The current linked implementation runs Q64 client blocks over a
 Q32 physical packet cadence. Capture sequence N is published as playback target
 N. The daemon provides the bounded PRO handoff, samples that exact sequence
-once, and writes the Q64 block while retaining one Q32 playback guard. Client
+once, and writes the Q64 block while retaining the configured playback guard. Client
 readiness never controls hardware continuity.
 
 Each audio block carries a sequence number. Playback consumes only its exact
@@ -20,15 +20,17 @@ only older capture blocks and use the oldest target that remains valid. SHARED
 capture clients retain ordered FIFO delivery.
 
 `device.pro_latency_periods` configures PRO output lookahead. The E1x2 reference
-profile uses zero lead and a 184-frame startup reserve: one Q64 capture interval,
-the Q32 playback guard, two Q32 refill-headroom periods, and the 24 frames
+profile uses zero lead and a 232-frame startup reserve: one Q64 capture interval,
+the 48-frame playback guard, three Q32 refill-headroom periods, and the 24 frames
 consumed by the 500 us handoff. Its effective PRO output latency is one Q64 host
 buffer. Higher values trade whole periods of latency for more client margin.
 Maximum value is `7`, limited by the fixed shared-memory ring.
 
 `device.realtime = true` is default. The linked hardware worker runs at
 `device.realtime_priority`; the reference profile uses `88`. Setting realtime
-scheduling requires appropriate process privileges.
+scheduling requires appropriate process and memory-locking privileges. The
+daemon locks its mappings and prefaults the hardware-thread stack before the
+stream starts.
 `device.pro_realtime_priority` controls the ASIO callback. When omitted it is
 derived as two below the hardware priority.
 

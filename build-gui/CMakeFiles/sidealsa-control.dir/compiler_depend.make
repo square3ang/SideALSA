@@ -294,12 +294,14 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o: /home/square3ang/SideALSA/crates
   /usr/include/qt6/QtCore/QHash \
   /usr/include/qt6/QtCore/QList \
   /usr/include/qt6/QtCore/QObject \
+  /usr/include/qt6/QtCore/QPointer \
   /usr/include/qt6/QtCore/QProcess \
   /usr/include/qt6/QtCore/QRect \
   /usr/include/qt6/QtCore/QRegularExpression \
   /usr/include/qt6/QtCore/QSize \
   /usr/include/qt6/QtCore/QSizeF \
   /usr/include/qt6/QtCore/QStringList \
+  /usr/include/qt6/QtCore/QTimer \
   /usr/include/qt6/QtCore/q17memory.h \
   /usr/include/qt6/QtCore/q20bit.h \
   /usr/include/qt6/QtCore/q20functional.h \
@@ -387,6 +389,7 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o: /home/square3ang/SideALSA/crates
   /usr/include/qt6/QtCore/qoverload.h \
   /usr/include/qt6/QtCore/qpair.h \
   /usr/include/qt6/QtCore/qpoint.h \
+  /usr/include/qt6/QtCore/qpointer.h \
   /usr/include/qt6/QtCore/qprocess.h \
   /usr/include/qt6/QtCore/qprocessordetection.h \
   /usr/include/qt6/QtCore/qrect.h \
@@ -427,6 +430,7 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o: /home/square3ang/SideALSA/crates
   /usr/include/qt6/QtCore/qtenvironmentvariables.h \
   /usr/include/qt6/QtCore/qtextstream.h \
   /usr/include/qt6/QtCore/qtformat_impl.h \
+  /usr/include/qt6/QtCore/qtimer.h \
   /usr/include/qt6/QtCore/qtmetamacros.h \
   /usr/include/qt6/QtCore/qtnoop.h \
   /usr/include/qt6/QtCore/qtpreprocessorsupport.h \
@@ -754,6 +758,12 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 
 /usr/include/stdc-predef.h:
 
+/usr/include/qt6/QtWidgets/qwidget.h:
+
+/usr/include/qt6/QtWidgets/qtwidgetsglobal.h:
+
+/usr/include/qt6/QtWidgets/qtwidgetsexports.h:
+
 /usr/include/c++/16/unordered_map:
 
 /usr/include/qt6/QtWidgets/qscrollarea.h:
@@ -850,9 +860,11 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 
 /usr/include/pthread.h:
 
-/usr/include/qt6/QtWidgets/qwidget.h:
-
 /usr/include/c++/16/limits:
+
+/usr/include/qt6/QtWidgets/qtwidgets-config.h:
+
+/usr/include/c++/16/cmath:
 
 /usr/include/c++/16/functional:
 
@@ -933,6 +945,8 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 /usr/include/c++/16/tr1/bessel_function.tcc:
 
 /usr/include/c++/16/bits/algorithmfwd.h:
+
+/usr/include/qt6/QtCore/QTimer:
 
 /usr/include/c++/16/bits/shared_ptr_base.h:
 
@@ -1332,10 +1346,6 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 
 /usr/include/c++/16/bits/uses_allocator_args.h:
 
-/usr/include/c++/16/initializer_list:
-
-/usr/include/c++/16/chrono:
-
 /usr/include/qt6/QtCore/qsize.h:
 
 /usr/include/qt6/QtCore/qtnoop.h:
@@ -1416,8 +1426,6 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 
 /usr/include/c++/16/bits/cxxabi_forced.h:
 
-/usr/include/bits/pthreadtypes-arch.h:
-
 /usr/include/c++/16/bits/functexcept.h:
 
 /usr/include/c++/16/bits/utility.h:
@@ -1437,6 +1445,8 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 /usr/include/c++/16/variant:
 
 /usr/include/c++/16/x86_64-pc-linux-gnu/bits/c++allocator.h:
+
+/usr/include/qt6/QtCore/qtimer.h:
 
 /usr/include/qt6/QtGui/qcursor.h:
 
@@ -1470,10 +1480,6 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 
 /usr/include/linux/errno.h:
 
-/usr/include/c++/16/cmath:
-
-/usr/include/qt6/QtWidgets/qtwidgets-config.h:
-
 /usr/lib/crtn.o:
 
 /usr/include/linux/limits.h:
@@ -1497,6 +1503,14 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 /usr/include/qt6/QtCore/QCommandLineOption:
 
 /usr/include/qt6/QtWidgets/QPushButton:
+
+/usr/include/c++/16/initializer_list:
+
+/usr/include/c++/16/chrono:
+
+/usr/include/qt6/QtCore/QPointer:
+
+/usr/include/qt6/QtCore/qstringfwd.h:
 
 /usr/include/qt6/QtCore/QRect:
 
@@ -1662,6 +1676,10 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 
 /usr/include/qt6/QtCore/qpoint.h:
 
+/usr/include/bits/pthreadtypes-arch.h:
+
+/usr/include/qt6/QtCore/qpointer.h:
+
 /usr/include/qt6/QtCore/qprocess.h:
 
 /usr/lib32/libbrotlidec.so.1:
@@ -1689,8 +1707,6 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 /usr/include/qt6/QtCore/qstringconverter.h:
 
 /usr/include/qt6/QtWidgets/qcombobox.h:
-
-/usr/include/qt6/QtCore/qstringfwd.h:
 
 /usr/include/qt6/QtCore/qstringlist.h:
 
@@ -1785,8 +1801,6 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 /usr/include/qt6/QtGui/qevent.h:
 
 /usr/include/qt6/QtGui/qeventpoint.h:
-
-/usr/include/qt6/QtWidgets/qtwidgetsexports.h:
 
 /usr/include/qt6/QtWidgets/QSpinBox:
 
@@ -1891,5 +1905,3 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 /usr/include/qt6/QtWidgets/qpushbutton.h:
 
 /usr/include/qt6/QtWidgets/qstyleoption.h:
-
-/usr/include/qt6/QtWidgets/qtwidgetsglobal.h:

@@ -6,6 +6,8 @@ use sidealsa_admin::{
     read_snapshot, render_snapshot, validate_managed_profile_path,
 };
 
+const CLIENT_REFRESH_REQUIRED_ERROR_EXIT_CODE: u8 = 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Command {
     Show,
@@ -24,9 +26,19 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            let exit_code = error_exit_code(&error);
             eprintln!("{error}");
-            ExitCode::FAILURE
+            ExitCode::from(exit_code)
         }
+    }
+}
+
+fn error_exit_code(error: &AdminError) -> u8 {
+    match error {
+        AdminError::Runtime(_)
+        | AdminError::RolledBack { .. }
+        | AdminError::RollbackFailed { .. } => CLIENT_REFRESH_REQUIRED_ERROR_EXIT_CODE,
+        _ => 1,
     }
 }
 
@@ -145,4 +157,36 @@ fn print_help() {
     println!(
         "sidealsa-admin apply --expected-revision HASH [--profile PATH] [--socket PATH] key=value ..."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_refresh_errors_have_distinct_exit_code() {
+        assert_eq!(error_exit_code(&AdminError::Runtime("failed".into())), 2);
+        assert_eq!(
+            error_exit_code(&AdminError::RolledBack {
+                cause: "failed".into()
+            }),
+            2
+        );
+        assert_eq!(
+            error_exit_code(&AdminError::RollbackFailed {
+                cause: "failed".into(),
+                rollback: "failed".into(),
+            }),
+            2
+        );
+    }
+
+    #[test]
+    fn pre_restart_errors_keep_generic_exit_code() {
+        assert_eq!(error_exit_code(&AdminError::RevisionConflict), 1);
+        assert_eq!(
+            error_exit_code(&AdminError::InvalidArgument("bad value".into())),
+            1
+        );
+    }
 }

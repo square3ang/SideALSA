@@ -6,6 +6,8 @@
 #include <objbase.h>
 #include <windows.h>
 
+#include <errno.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +19,10 @@
 
 #ifndef SIDEALSA_ASIO_LIFECYCLE_DEFAULT
 #define SIDEALSA_ASIO_LIFECYCLE_DEFAULT 0
+#endif
+
+#ifndef SCHED_RESET_ON_FORK
+#define SCHED_RESET_ON_FORK 0x40000000
 #endif
 
 typedef struct
@@ -148,6 +154,388 @@ static LONG callback_wait_errors;
 
 #define LOOPBACK_FIRST_PULSE_FRAME 65
 #define LOOPBACK_INTERVAL_FRAMES 4097
+#define MAX_STRESS_THREADS 64
+#define STRESS_CPU_BATCH 65536
+
+typedef struct
+{
+    HANDLE handle;
+    BYTE *memory;
+    SIZE_T memory_size;
+    uint64_t state;
+} StressWorker;
+
+static StressWorker stress_workers[MAX_STRESS_THREADS];
+static HANDLE stress_start_event;
+static BYTE *stress_memory;
+static DWORD stress_thread_count;
+static DWORD stress_threads_started;
+static SIZE_T stress_memory_bytes;
+static volatile LONG stress_stop_requested;
+static volatile LONG64 stress_passes;
+static volatile LONG64 stress_work_units;
+static volatile LONG64 stress_checksum;
+static volatile uint64_t callback_work_sink;
+static int benchmark_enabled;
+static int benchmark_running;
+static DWORD benchmark_heartbeat_ms = 10;
+static DWORD benchmark_rt_priority;
+static LARGE_INTEGER benchmark_frequency;
+static LARGE_INTEGER benchmark_started;
+static LONG64 callback_work_ticks;
+static LONG64 callback_period_ticks;
+static volatile LONG64 callback_timed_cycles;
+static volatile LONG64 callback_total_ticks;
+static volatile LONG64 callback_max_ticks;
+static volatile LONG callback_period_overruns;
+static volatile LONG64 host_heartbeats;
+static volatile LONG64 host_heartbeat_max_gap_ticks;
+static volatile LONG64 host_heartbeat_max_late_ticks;
+static LONG callback_sched_policy = INT32_MIN;
+static LONG callback_sched_priority = INT32_MIN;
+static LONG callback_sched_reset_on_fork;
+static LONG callback_sched_set_attempted;
+static LONG callback_sched_set_error;
+
+static int
+read_environment_u32(const char *name, DWORD maximum, DWORD *value)
+{
+    char text[32];
+    char *end = NULL;
+    DWORD length = GetEnvironmentVariableA(name, text, sizeof(text));
+    unsigned long parsed;
+
+    if (length == 0)
+        return 1;
+    if (length >= sizeof(text))
+    {
+        fprintf(stderr, "[asio-probe] %s is too long\n", name);
+        return 0;
+    }
+    parsed = strtoul(text, &end, 10);
+    if (!text[0] || !end || *end || parsed > maximum)
+    {
+        fprintf(stderr, "[asio-probe] %s must be between 0 and %lu\n",
+                name, (unsigned long)maximum);
+        return 0;
+    }
+    *value = (DWORD)parsed;
+    return 1;
+}
+
+static void
+update_max_ticks(volatile LONG64 *target, LONG64 value)
+{
+    LONG64 current = InterlockedCompareExchange64(target, 0, 0);
+
+    while (value > current)
+    {
+        LONG64 previous = InterlockedCompareExchange64(target, value, current);
+        if (previous == current)
+            break;
+        current = previous;
+    }
+}
+
+static DWORD WINAPI
+stress_worker_main(void *opaque)
+{
+    StressWorker *worker = opaque;
+    uint64_t state = worker->state;
+
+    if (WaitForSingleObject(stress_start_event, INFINITE) != WAIT_OBJECT_0)
+        return 1;
+    while (!InterlockedCompareExchange(&stress_stop_requested, 0, 0))
+    {
+        LONG64 work_units = 0;
+
+        if (worker->memory_size > 0)
+        {
+            for (SIZE_T offset = 0; offset + sizeof(uint64_t) <= worker->memory_size;
+                 offset += 64)
+            {
+                volatile uint64_t *slot = (volatile uint64_t *)(worker->memory + offset);
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state += *slot + (uint64_t)offset;
+                *slot = state;
+                ++work_units;
+            }
+        }
+        else
+        {
+            for (LONG index = 0; index < STRESS_CPU_BATCH; ++index)
+            {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+            }
+            work_units = STRESS_CPU_BATCH;
+        }
+        InterlockedIncrement64(&stress_passes);
+        InterlockedExchangeAdd64(&stress_work_units, work_units);
+    }
+    worker->state = state;
+    InterlockedExchangeAdd64(&stress_checksum, (LONG64)state);
+    return 0;
+}
+
+static int
+prepare_stress_workers(void)
+{
+    SIZE_T chunk_size = 0;
+
+    if (stress_thread_count == 0)
+        return 1;
+    stress_start_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!stress_start_event)
+        return 0;
+    if (stress_memory_bytes > 0)
+    {
+        stress_memory = VirtualAlloc(NULL, stress_memory_bytes,
+                                     MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!stress_memory)
+            return 0;
+        memset(stress_memory, 0xa5, stress_memory_bytes);
+        chunk_size = stress_memory_bytes / stress_thread_count;
+        chunk_size -= chunk_size % 64;
+    }
+    for (DWORD index = 0; index < stress_thread_count; ++index)
+    {
+        StressWorker *worker = &stress_workers[index];
+        SIZE_T offset = chunk_size * index;
+
+        memset(worker, 0, sizeof(*worker));
+        worker->state = UINT64_C(0x9e3779b97f4a7c15) ^ (uint64_t)(index + 1);
+        if (stress_memory_bytes > 0)
+        {
+            worker->memory = stress_memory + offset;
+            worker->memory_size = index + 1 == stress_thread_count
+                                    ? stress_memory_bytes - offset
+                                    : chunk_size;
+        }
+        worker->handle = CreateThread(NULL, 0, stress_worker_main, worker, 0, NULL);
+        if (!worker->handle)
+            return 0;
+        ++stress_threads_started;
+    }
+    return 1;
+}
+
+static int
+stop_stress_workers(void)
+{
+    int success = 1;
+
+    InterlockedExchange(&stress_stop_requested, 1);
+    if (stress_start_event)
+        SetEvent(stress_start_event);
+    for (DWORD index = 0; index < stress_threads_started; ++index)
+    {
+        DWORD wait = WaitForSingleObject(stress_workers[index].handle, 10000);
+        if (wait != WAIT_OBJECT_0)
+            success = 0;
+        CloseHandle(stress_workers[index].handle);
+        stress_workers[index].handle = NULL;
+    }
+    stress_threads_started = 0;
+    if (success && stress_memory)
+    {
+        VirtualFree(stress_memory, 0, MEM_RELEASE);
+        stress_memory = NULL;
+    }
+    if (stress_start_event)
+    {
+        CloseHandle(stress_start_event);
+        stress_start_event = NULL;
+    }
+    return success;
+}
+
+static void
+run_callback_work(void)
+{
+    LARGE_INTEGER started;
+    LARGE_INTEGER now;
+    uint64_t value = callback_work_sink ^ (uint64_t)InterlockedCompareExchange(&cycles, 0, 0);
+
+    if (callback_work_ticks == 0)
+        return;
+    QueryPerformanceCounter(&started);
+    do
+    {
+        for (LONG index = 0; index < 64; ++index)
+        {
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+        }
+        QueryPerformanceCounter(&now);
+    } while (now.QuadPart - started.QuadPart < callback_work_ticks);
+    callback_work_sink = value;
+}
+
+static void
+observe_callback_scheduler(void)
+{
+    struct sched_param parameters = { 0 };
+    int policy = sched_getscheduler(0);
+
+    if (benchmark_rt_priority > 0 && !callback_sched_set_attempted)
+    {
+        callback_sched_set_attempted = 1;
+        if (policy < 0 || sched_getparam(0, &parameters) != 0)
+            callback_sched_set_error = errno;
+        else if (benchmark_rt_priority > (DWORD)parameters.sched_priority)
+            callback_sched_set_error = ERANGE;
+        else
+        {
+            parameters.sched_priority = (int)benchmark_rt_priority;
+            callback_sched_set_error = sched_setscheduler(
+                                           0, SCHED_FIFO | SCHED_RESET_ON_FORK, &parameters)
+                                           == 0
+                                         ? 0
+                                         : errno;
+        }
+    }
+    if (callback_sched_policy != INT32_MIN)
+        return;
+    policy = sched_getscheduler(0);
+    if (policy >= 0 && sched_getparam(0, &parameters) == 0)
+        callback_sched_priority = parameters.sched_priority;
+    else
+        callback_sched_priority = -1;
+    callback_sched_reset_on_fork = policy >= 0 && (policy & SCHED_RESET_ON_FORK) != 0;
+    callback_sched_policy = policy < 0 ? policy : policy & ~SCHED_RESET_ON_FORK;
+}
+
+static void
+run_probe_interval(DWORD duration_ms)
+{
+    DWORD elapsed = 0;
+
+    if (!benchmark_enabled)
+    {
+        Sleep(duration_ms);
+        return;
+    }
+    while (elapsed < duration_ms)
+    {
+        LARGE_INTEGER before;
+        LARGE_INTEGER after;
+        DWORD slice = duration_ms - elapsed;
+        LONG64 expected_ticks;
+        LONG64 gap_ticks;
+        LONG64 late_ticks;
+
+        if (slice > benchmark_heartbeat_ms)
+            slice = benchmark_heartbeat_ms;
+        QueryPerformanceCounter(&before);
+        Sleep(slice);
+        QueryPerformanceCounter(&after);
+        expected_ticks = benchmark_frequency.QuadPart * slice / 1000;
+        gap_ticks = after.QuadPart - before.QuadPart;
+        late_ticks = gap_ticks > expected_ticks ? gap_ticks - expected_ticks : 0;
+        update_max_ticks(&host_heartbeat_max_gap_ticks, gap_ticks);
+        update_max_ticks(&host_heartbeat_max_late_ticks, late_ticks);
+        InterlockedIncrement64(&host_heartbeats);
+        elapsed += slice;
+    }
+}
+
+static void
+reset_benchmark(void)
+{
+    InterlockedExchange(&stress_stop_requested, 0);
+    stress_passes = 0;
+    stress_work_units = 0;
+    stress_checksum = 0;
+    callback_timed_cycles = 0;
+    callback_total_ticks = 0;
+    callback_max_ticks = 0;
+    InterlockedExchange(&callback_period_overruns, 0);
+    host_heartbeats = 0;
+    host_heartbeat_max_gap_ticks = 0;
+    host_heartbeat_max_late_ticks = 0;
+    callback_sched_policy = INT32_MIN;
+    callback_sched_priority = INT32_MIN;
+    callback_sched_reset_on_fork = 0;
+    callback_sched_set_attempted = 0;
+    callback_sched_set_error = 0;
+}
+
+static int
+start_benchmark(void)
+{
+    reset_benchmark();
+    if (!prepare_stress_workers())
+    {
+        stop_stress_workers();
+        return 0;
+    }
+    QueryPerformanceCounter(&benchmark_started);
+    benchmark_running = 1;
+    if (stress_start_event)
+        SetEvent(stress_start_event);
+    return 1;
+}
+
+static int
+finish_benchmark(void)
+{
+    LARGE_INTEGER finished;
+    LONG64 elapsed_ticks;
+    LONG64 timed_cycles;
+    LONG64 work_units;
+    double elapsed_seconds;
+    double callback_mean_us;
+    int success;
+
+    if (!benchmark_running)
+        return 1;
+    QueryPerformanceCounter(&finished);
+    elapsed_ticks = finished.QuadPart - benchmark_started.QuadPart;
+    benchmark_running = 0;
+    success = stop_stress_workers();
+    timed_cycles = InterlockedCompareExchange64(&callback_timed_cycles, 0, 0);
+    work_units = InterlockedCompareExchange64(&stress_work_units, 0, 0);
+    elapsed_seconds = (double)elapsed_ticks / (double)benchmark_frequency.QuadPart;
+    callback_mean_us = timed_cycles == 0
+                         ? 0.0
+                         : (double)InterlockedCompareExchange64(&callback_total_ticks, 0, 0)
+                               * 1000000.0
+                               / ((double)benchmark_frequency.QuadPart * (double)timed_cycles);
+    fprintf(stderr,
+            "[asio-probe] benchmark callbacks: count=%llu mean_us=%.3f max_us=%.3f period_overruns=%ld sched_policy=%ld sched_priority=%ld sched_reset_on_fork=%ld sched_set_error=%ld\n",
+            (unsigned long long)timed_cycles, callback_mean_us,
+            (double)InterlockedCompareExchange64(&callback_max_ticks, 0, 0) * 1000000.0
+                / (double)benchmark_frequency.QuadPart,
+            (long)InterlockedCompareExchange(&callback_period_overruns, 0, 0),
+            (long)callback_sched_policy, (long)callback_sched_priority,
+            (long)callback_sched_reset_on_fork, (long)callback_sched_set_error);
+    fprintf(stderr,
+            "[asio-probe] benchmark host: heartbeats=%llu max_gap_us=%.3f max_late_us=%.3f elapsed_s=%.3f\n",
+            (unsigned long long)InterlockedCompareExchange64(&host_heartbeats, 0, 0),
+            (double)InterlockedCompareExchange64(&host_heartbeat_max_gap_ticks, 0, 0)
+                * 1000000.0 / (double)benchmark_frequency.QuadPart,
+            (double)InterlockedCompareExchange64(&host_heartbeat_max_late_ticks, 0, 0)
+                * 1000000.0 / (double)benchmark_frequency.QuadPart,
+            elapsed_seconds);
+    fprintf(stderr,
+            "[asio-probe] benchmark workers: threads=%lu memory_mib=%llu passes=%llu work_units=%llu work_units_per_s=%.0f checksum=%llu\n",
+            (unsigned long)stress_thread_count,
+            (unsigned long long)(stress_memory_bytes / (1024 * 1024)),
+            (unsigned long long)InterlockedCompareExchange64(&stress_passes, 0, 0),
+            (unsigned long long)work_units,
+            elapsed_seconds > 0.0 ? (double)work_units / elapsed_seconds : 0.0,
+            (unsigned long long)InterlockedCompareExchange64(&stress_checksum, 0, 0));
+    if (benchmark_rt_priority > 0
+        && (callback_sched_set_error != 0
+            || callback_sched_priority != (LONG)benchmark_rt_priority))
+        success = 0;
+    return success;
+}
 
 static void
 reset_loopback(void)
@@ -243,8 +631,15 @@ buffer_switch(LONG index, LONG direct_process)
     LONG previous;
     LONG previous_index;
     char marker;
+    LARGE_INTEGER callback_started;
+    LARGE_INTEGER callback_finished;
 
     (void)direct_process;
+    if (benchmark_enabled)
+    {
+        QueryPerformanceCounter(&callback_started);
+        observe_callback_scheduler();
+    }
     if ((uintptr_t)&marker < (uintptr_t)tib->StackLimit
         || (uintptr_t)&marker >= (uintptr_t)tib->StackBase)
         InterlockedExchange(&invalid_callback_stack, 1);
@@ -270,6 +665,19 @@ buffer_switch(LONG index, LONG direct_process)
         InterlockedIncrement(&callback_index_errors);
     if (loopback_enabled)
         process_loopback(index);
+    if (benchmark_enabled)
+    {
+        LONG64 duration;
+
+        run_callback_work();
+        QueryPerformanceCounter(&callback_finished);
+        duration = callback_finished.QuadPart - callback_started.QuadPart;
+        InterlockedIncrement64(&callback_timed_cycles);
+        InterlockedExchangeAdd64(&callback_total_ticks, duration);
+        update_max_ticks(&callback_max_ticks, duration);
+        if (duration > callback_period_ticks)
+            InterlockedIncrement(&callback_period_overruns);
+    }
     InterlockedIncrement(&cycles);
 }
 
@@ -355,10 +763,13 @@ main(void)
     char expected_text[16];
     char expected_output_latency_text[16];
     char crash_text[2];
+    char benchmark_text[2];
     LONG expected_loopback = -1;
     LONG expected_output_latency = 64;
     int crash_after_start = 0;
     int lifecycle_enabled = SIDEALSA_ASIO_LIFECYCLE_DEFAULT;
+    DWORD stress_memory_mib = 0;
+    DWORD callback_work_us = 0;
 
     start_thread = (LONG)GetCurrentThreadId();
 
@@ -379,6 +790,44 @@ main(void)
         expected_output_latency = (LONG)strtol(expected_output_latency_text, NULL, 10);
     crash_after_start = GetEnvironmentVariableA("SIDEALSA_ASIO_CRASH_AFTER_START", crash_text,
                                                  sizeof(crash_text)) > 0;
+    if (!read_environment_u32("SIDEALSA_ASIO_PROBE_STRESS_THREADS", MAX_STRESS_THREADS,
+                              &stress_thread_count)
+        || !read_environment_u32("SIDEALSA_ASIO_PROBE_STRESS_MEMORY_MIB", 4096,
+                                 &stress_memory_mib)
+        || !read_environment_u32("SIDEALSA_ASIO_PROBE_CALLBACK_WORK_US", 10000,
+                                 &callback_work_us)
+        || !read_environment_u32("SIDEALSA_ASIO_PROBE_HEARTBEAT_MS", 1000,
+                                 &benchmark_heartbeat_ms)
+        || !read_environment_u32("SIDEALSA_ASIO_PROBE_RT_PRIORITY", 99,
+                                 &benchmark_rt_priority))
+        return 1;
+    benchmark_enabled = stress_thread_count > 0 || callback_work_us > 0
+                        || benchmark_rt_priority > 0
+                        || GetEnvironmentVariableA("SIDEALSA_ASIO_PROBE_BENCHMARK",
+                                                   benchmark_text, sizeof(benchmark_text)) > 0;
+    if (stress_memory_mib > 0 && stress_thread_count == 0)
+        return fail("stress memory requires stress threads", -1);
+    if (benchmark_enabled && benchmark_heartbeat_ms == 0)
+        return fail("benchmark heartbeat must be nonzero", -1);
+    if (benchmark_enabled && lifecycle_enabled)
+        return fail("benchmark and lifecycle modes are incompatible", -1);
+    if (benchmark_enabled && !QueryPerformanceFrequency(&benchmark_frequency))
+        return fail("QueryPerformanceFrequency", (LONG)GetLastError());
+    stress_memory_bytes = (SIZE_T)stress_memory_mib * 1024 * 1024;
+    callback_work_ticks = benchmark_enabled
+                            ? benchmark_frequency.QuadPart * callback_work_us / 1000000
+                            : 0;
+    callback_period_ticks = benchmark_enabled
+                              ? benchmark_frequency.QuadPart * 64 / 48000
+                              : 0;
+    if (benchmark_enabled)
+    {
+        fprintf(stderr,
+                "[asio-probe] benchmark config: stress_threads=%lu memory_mib=%lu callback_work_us=%lu heartbeat_ms=%lu rt_priority=%lu\n",
+                (unsigned long)stress_thread_count, (unsigned long)stress_memory_mib,
+                (unsigned long)callback_work_us, (unsigned long)benchmark_heartbeat_ms,
+                (unsigned long)benchmark_rt_priority);
+    }
 
     hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     if (FAILED(hr))
@@ -547,6 +996,11 @@ main(void)
         InterlockedExchange(&callback_wait_errors, 0);
         InterlockedExchange(&block_callback_once, 1);
     }
+    if (benchmark_enabled && !start_benchmark())
+    {
+        exit_code = fail("start benchmark workers", (LONG)GetLastError());
+        goto dispose;
+    }
     result = asio->lpVtbl->Start(asio);
     if (result != 0)
     {
@@ -595,7 +1049,7 @@ main(void)
     }
     else
     {
-        Sleep(run_ms);
+        run_probe_interval(run_ms);
         if (crash_after_start)
         {
             LONG crash_cycles = InterlockedCompareExchange(&cycles, 0, 0);
@@ -689,7 +1143,7 @@ main(void)
     }
     else
     {
-        Sleep(run_ms);
+        run_probe_interval(run_ms);
         if (loopback_enabled)
         {
             InterlockedExchange(&loopback_emit, 0);
@@ -697,6 +1151,11 @@ main(void)
         }
         result = asio->lpVtbl->Stop(asio);
         started = 0;
+    }
+    if (benchmark_enabled && !finish_benchmark())
+    {
+        exit_code = fail("benchmark finalization", (LONG)GetLastError());
+        goto dispose;
     }
     if (result != 0 || cycles == 0 || first_index != 0 || callback_thread == 0
         || callback_thread != first_run_thread
@@ -790,6 +1249,8 @@ release:
     active_asio = NULL;
     asio->lpVtbl->Release(asio);
 done:
+    if (benchmark_running && !finish_benchmark() && exit_code == 0)
+        exit_code = fail("benchmark finalization", (LONG)GetLastError());
     if (disposed)
     {
         if (callback_entered_event)

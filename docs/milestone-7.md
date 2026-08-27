@@ -69,6 +69,7 @@ lookahead. A paused endpoint does not increment the counter every period.
   arbitrary ALSA transfer sizes are accepted up to the configured client buffer.
 - No resampling, format conversion, mmap access, or PipeWire-specific code.
 - Current ioplug client buffer is at least two periods because ALSA ioplug
-  rejects a one-period client buffer. The E1x2 SHARED profile negotiates four to
-  eight periods (`256` to `512` frames) independently of the physical B192
-  hardware queue.
+  rejects a one-period client buffer. E1x2 SHARED playback permits a third Q256
+  period, so PipeWire negotiates B768 and can prime startup without changing its
+  steady Q256 target. Daemon staging remains eight Q64 blocks in the independent
+  B512 SHARED ring, separate from the physical B256 hardware queue.
