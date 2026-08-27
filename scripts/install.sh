@@ -337,6 +337,7 @@ PLUGIN_SOURCE="$ROOT/target/release/libasound_module_pcm_sidealsa.so"
 ALSA_CONFIG_PATH=/etc/alsa/conf.d/99-sidealsa.conf
 PIPEWIRE_CONFIG_PATH=/etc/pipewire/pipewire.conf.d/99-sidealsa.conf
 PIPEWIRE_PULSE_CONFIG_PATH=/etc/pipewire/pipewire-pulse.conf.d/99-sidealsa.conf
+WIREPLUMBER_CONFIG_PATH=/etc/wireplumber/wireplumber.conf.d/99-sidealsa.conf
 SERVICE_PATH=/etc/systemd/system/sidealsad.service
 PROFILE_PATH=/etc/sidealsa/profiles/$PROFILE_NAME
 LICENSE_PATH="$PREFIX/share/sidealsa/LICENSE"
@@ -346,13 +347,12 @@ GUI_PATH="$PREFIX/bin/sidealsa-control"
 ADMIN_PATH=/usr/libexec/sidealsa-admin
 DESKTOP_PATH="$PREFIX/share/applications/org.sidealsa.Control.desktop"
 POLKIT_PATH=/usr/share/polkit-1/actions/org.sidealsa.configure.policy
-RETIRED_MANAGED_PATHS=(
-    /etc/wireplumber/wireplumber.conf.d/99-sidealsa.conf
-)
+RETIRED_MANAGED_PATHS=()
 if ((INSTALL_PIPEWIRE == 0)); then
     RETIRED_MANAGED_PATHS+=(
         "$PIPEWIRE_CONFIG_PATH"
         "$PIPEWIRE_PULSE_CONFIG_PATH"
+        "$WIREPLUMBER_CONFIG_PATH"
     )
 fi
 if ((WITH_ASIO == 0)); then
@@ -386,6 +386,7 @@ if ((INSTALL_PIPEWIRE == 1)); then
     MANAGED_PATHS+=(
         "$PIPEWIRE_CONFIG_PATH"
         "$PIPEWIRE_PULSE_CONFIG_PATH"
+        "$WIREPLUMBER_CONFIG_PATH"
     )
 fi
 for doc in "$ROOT"/docs/*.md; do
@@ -529,6 +530,10 @@ if ((INSTALL_PIPEWIRE == 1)); then
     install_managed_copy \
         "$ROOT/configs/pipewire/pipewire-pulse.conf.d/sidealsa.conf" \
         "$PIPEWIRE_PULSE_CONFIG_PATH" \
+        0644
+    install_managed_copy \
+        "$ROOT/configs/wireplumber/wireplumber.conf.d/sidealsa.conf" \
+        "$WIREPLUMBER_CONFIG_PATH" \
         0644
 fi
 

@@ -19,9 +19,11 @@ installing the ALSA definitions in the normal ALSA configuration path. The
 plugin directory must likewise be installed or exposed through
 `ALSA_PLUGIN_DIR`.
 
-The PipeWire and PipeWire Pulse fragments set realtime priority `10`, below the
-ASIO callback at `86` and SideALSA linked hardware worker at `88`. Heavy desktop
-audio work can therefore lose SHARED data without preempting PRO or hardware.
+The PipeWire, PipeWire Pulse, and WirePlumber fragments set realtime priority
+`10`, below the ASIO callback at `46` and SideALSA linked hardware worker at
+`48`. On the reference PREEMPT_RT host those userspace threads also stay below
+the xHCI IRQ thread at `50`. Heavy desktop audio work can therefore lose SHARED
+data without preempting PRO, hardware, or USB completion processing.
 
 The objects disable mmap; the current ioplug supports RW interleaved S32_LE at
 the profile rate and SideALSA performs no resampling. Playback and capture keep
@@ -175,7 +177,8 @@ current zero-lead acceptance is documented in `milestone-asio.md`:
 
 - Static PipeWire objects are currently listed per profile port.
 - No automatic profile-to-PipeWire node generation.
-- No WirePlumber policy or session-manager customization.
+- WirePlumber customization is limited to the realtime-priority ceiling; no
+  routing or default-device policy is installed.
 - No custom PipeWire client; integration remains through the ALSA ioplug.
 - The Q256 start delay is static reference-profile configuration. A different
   external period geometry must update the PipeWire adapter fragment.

@@ -538,12 +538,10 @@ impl HardwareConfig {
             .saturating_mul(u64::from(self.rate))
             .div_ceil(1_000_000_000);
         if self.effective_duplex_link() && self.pro_latency_periods <= 1 {
-            let overhead_frames = (hardware_period_size / LINKED_PHASE_OVERHEAD_DIVISOR).max(1);
             let hardware_period_nanos = u64::from(hardware_period_size)
                 .saturating_mul(1_000_000_000)
                 / u64::from(self.rate);
-            let overhead_nanos =
-                u64::from(overhead_frames).saturating_mul(1_000_000_000) / u64::from(self.rate);
+            let overhead_nanos = hardware_period_nanos / u64::from(LINKED_PHASE_OVERHEAD_DIVISOR);
             if self.pro_handoff_nanos().saturating_add(overhead_nanos) > hardware_period_nanos {
                 return Err(ProfileError::Invalid(
                     "pro_handoff_us leaves no physical-period write reserve".into(),
@@ -589,18 +587,6 @@ impl HardwareConfig {
             return Err(ProfileError::Invalid(
                 "linked_phase_max_attempts requires linked zero-lead PRO".into(),
             ));
-        }
-        if self.linked_phase_max_attempts > 0 {
-            let target_nanos =
-                u128::from(hardware_period_size) * 1_000_000_000 / (u128::from(self.rate) * 2);
-            let overhead_frames = (hardware_period_size / LINKED_PHASE_OVERHEAD_DIVISOR).max(1);
-            let required_nanos = u128::from(self.pro_handoff_nanos())
-                + u128::from(overhead_frames) * 1_000_000_000 / u128::from(self.rate);
-            if target_nanos < required_nanos {
-                return Err(ProfileError::Invalid(
-                    "linked phase target is too short for PRO handoff and overhead".into(),
-                ));
-            }
         }
         if self.shared_latency_periods > MAX_SHARED_LATENCY_PERIODS {
             return Err(ProfileError::Invalid(format!(
@@ -872,11 +858,11 @@ mod tests {
         assert_eq!(profile.device.pro_handoff_us, 500);
         assert_eq!(profile.device.pro_handoff_nanos(), 500_000);
         assert_eq!(profile.device.pro_latency_periods, 0);
-        assert_eq!(profile.device.linked_playback_guard_frames, Some(48));
-        assert_eq!(profile.device.effective_linked_playback_guard_frames(), 48);
+        assert_eq!(profile.device.linked_playback_guard_frames, Some(32));
+        assert_eq!(profile.device.effective_linked_playback_guard_frames(), 32);
         assert!(!profile.device.uses_staged_pro_packets());
         assert_eq!(profile.device.effective_pro_output_latency_frames(), 64);
-        assert_eq!(profile.device.linked_phase_max_attempts, 0);
+        assert_eq!(profile.device.linked_phase_max_attempts, 8);
         assert_eq!(profile.device.effective_shared_buffer_size(), 512);
         assert_eq!(profile.device.shared_latency_periods, 7);
     }
@@ -886,7 +872,7 @@ mod tests {
         let text = E1X2_PROFILE
             .replace("hardware_period_size = 32", "hardware_period_size = 64")
             .replace(
-                "linked_playback_guard_frames = 48",
+                "linked_playback_guard_frames = 32",
                 "linked_playback_guard_frames = 64",
             );
         let profile = Profile::from_toml(&text).expect("whole-period profile should parse");
@@ -970,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_linked_phase_target_shorter_than_handoff() {
+    fn accepts_linked_phase_attempts_with_bounded_handoff() {
         let text = PROFILE
             .replace(
                 "pro_latency_periods = 1",
@@ -982,12 +968,8 @@ mod tests {
                 "duplex_link = true\n        linked_phase_max_attempts = 1",
             );
 
-        let error = Profile::from_toml(&text).expect_err("profile should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("too short for PRO handoff and overhead")
-        );
+        let profile = Profile::from_toml(&text).expect("profile should parse");
+        assert_eq!(profile.device.linked_phase_max_attempts, 1);
     }
 
     #[test]
@@ -1027,7 +1009,7 @@ mod tests {
     #[test]
     fn accepts_reference_guard_with_zero_lead() {
         let profile = Profile::from_toml(E1X2_PROFILE).expect("profile should parse");
-        assert_eq!(profile.device.linked_playback_guard_frames, Some(48));
+        assert_eq!(profile.device.linked_playback_guard_frames, Some(32));
     }
 
     #[test]
@@ -1063,7 +1045,7 @@ mod tests {
     #[test]
     fn zero_lead_guard_leaves_a_full_client_write() {
         let text = E1X2_PROFILE.replace(
-            "linked_playback_guard_frames = 48",
+            "linked_playback_guard_frames = 32",
             "linked_playback_guard_frames = 224",
         );
 

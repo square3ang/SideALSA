@@ -20,14 +20,21 @@ only older capture blocks and use the oldest target that remains valid. SHARED
 capture clients retain ordered FIFO delivery.
 
 `device.pro_latency_periods` configures PRO output lookahead. The E1x2 reference
-profile uses zero lead and a 232-frame startup reserve: one Q64 capture interval,
-the 48-frame playback guard, three Q32 refill-headroom periods, and the 24 frames
+profile uses zero lead and a 216-frame startup reserve: one Q64 capture interval,
+the 32-frame playback guard, three Q32 refill-headroom periods, and the 24 frames
 consumed by the 500 us handoff. Its effective PRO output latency is one Q64 host
 buffer. Higher values trade whole periods of latency for more client margin.
 Maximum value is `7`, limited by the fixed shared-memory ring.
 
+The reference profile also sets `linked_phase_max_attempts = 8`. Each attempt
+runs one second of linked silence with the production handoff and write cadence
+before client readiness. A shortened capture-to-playback write interval rejects
+the hardware start while no client exists. Runtime recovery does not repeat this
+startup-only qualification.
+
 `device.realtime = true` is default. The linked hardware worker runs at
-`device.realtime_priority`; the reference profile uses `88`. Setting realtime
+`device.realtime_priority`; the reference profile uses `48`, below the
+PREEMPT_RT xHCI IRQ thread at `50` on the reference host. Setting realtime
 scheduling requires appropriate process and memory-locking privileges. The
 daemon locks its mappings and prefaults the hardware-thread stack before the
 stream starts.

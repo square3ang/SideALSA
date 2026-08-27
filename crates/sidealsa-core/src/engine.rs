@@ -75,6 +75,15 @@ pub enum EngineError {
     },
     #[error("audio operation stopped")]
     Stopped,
+    #[error(
+        "linked startup remained unstable after {attempts} attempts (minimum capture-to-playback write interval {minimum_write_nanos} ns)"
+    )]
+    LinkedStartupUnstable {
+        attempts: u32,
+        minimum_write_nanos: u64,
+    },
+    #[error("linked startup was interrupted before hardware readiness")]
+    LinkedStartupInterrupted,
 }
 
 pub struct DuplexEngine {
@@ -1155,9 +1164,6 @@ struct LinkedProConfig<'a> {
     sequence_lead: u64,
 }
 
-const LINKED_PHASE_WARMUP_CYCLES: usize = 2;
-const LINKED_PHASE_MEASURED_CYCLES: usize = 4;
-
 fn calibrate_linked_phase(
     playback_pcm: &PCM,
     capture_pcm: &PCM,
@@ -1169,15 +1175,16 @@ fn calibrate_linked_phase(
         return Ok(());
     }
 
-    let target_nanos = linked_phase_target_nanos(config.hardware_period, config.rate);
-    let minimum_reserve = (config.hardware_period / 2).max(1);
+    let target_nanos =
+        linked_phase_target_nanos(config.hardware_period, config.rate, config.handoff_nanos);
+    // Consume one second of hardware time so startup-only schedule changes
+    // finish before any client can observe the stream.
+    let warmup_cycles = linked_phase_warmup_cycles(config.rate, config.period);
     for attempt in 1..=config.phase_max_attempts {
-        let mut samples = [0_u64; LINKED_PHASE_MEASURED_CYCLES];
-        let mut measured = 0;
-        let mut safe_samples = 0;
+        let mut minimum_write_nanos = u64::MAX;
         let mut recovered = false;
 
-        for cycle in 0..(LINKED_PHASE_WARMUP_CYCLES + LINKED_PHASE_MEASURED_CYCLES) {
+        for _ in 0..warmup_cycles {
             if control.stop.load(Ordering::Relaxed) || control.done.load(Ordering::Acquire) {
                 return Ok(());
             }
@@ -1188,18 +1195,31 @@ fn calibrate_linked_phase(
                 config,
                 control,
             ) {
-                Ok(Some((elapsed_nanos, reserve_frames))) => {
-                    if cycle >= LINKED_PHASE_WARMUP_CYCLES {
-                        samples[measured] = elapsed_nanos;
-                        measured += 1;
-                        if elapsed_nanos <= target_nanos && reserve_frames >= minimum_reserve {
-                            safe_samples += 1;
-                        }
+                Ok(Some(elapsed_nanos)) => {
+                    minimum_write_nanos = minimum_write_nanos.min(elapsed_nanos);
+                    if elapsed_nanos < target_nanos {
+                        break;
                     }
                 }
                 Ok(None) => return Ok(()),
                 Err(error) if error.is_stopped() => return Ok(()),
                 Err(error) if error.is_recoverable() => {
+                    if attempt == config.phase_max_attempts {
+                        if let Some(direction) = error.recovery_direction()
+                            && error.is_xrun()
+                        {
+                            control.timeline.record_hardware_xrun(direction);
+                        }
+                        control.timeline.record_linked_phase_calibration(
+                            u64::from(attempt),
+                            0,
+                            false,
+                        );
+                        return Err(EngineError::LinkedStartupUnstable {
+                            attempts: attempt,
+                            minimum_write_nanos: 0,
+                        });
+                    }
                     let dither_frames = linked_phase_dither_frames(attempt, config.hardware_period);
                     recover_linked_streams(
                         playback_pcm,
@@ -1220,21 +1240,28 @@ fn calibrate_linked_phase(
             control
                 .timeline
                 .record_linked_phase_calibration(u64::from(attempt), 0, false);
-            if attempt == config.phase_max_attempts {
-                return Ok(());
-            }
             continue;
         }
 
-        let score_nanos = linked_phase_score(samples);
-        let target_met = safe_samples >= LINKED_PHASE_MEASURED_CYCLES - 1;
+        let score_nanos = if minimum_write_nanos == u64::MAX {
+            0
+        } else {
+            minimum_write_nanos
+        };
+        let target_met = score_nanos >= target_nanos;
         control.timeline.record_linked_phase_calibration(
             u64::from(attempt),
             score_nanos,
             target_met,
         );
-        if target_met || attempt == config.phase_max_attempts {
+        if target_met {
             return Ok(());
+        }
+        if attempt == config.phase_max_attempts {
+            return Err(EngineError::LinkedStartupUnstable {
+                attempts: attempt,
+                minimum_write_nanos: score_nanos,
+            });
         }
 
         let dither_frames = linked_phase_dither_frames(attempt, config.hardware_period);
@@ -1249,7 +1276,7 @@ fn linked_phase_calibration_cycle(
     capture_scratch: &mut [i32],
     config: LinkedProConfig<'_>,
     control: WorkerControl<'_>,
-) -> Result<Option<(u64, alsa::pcm::Frames)>, EngineError> {
+) -> Result<Option<u64>, EngineError> {
     let read = read_capture_samples(
         capture_pcm,
         capture_scratch,
@@ -1268,19 +1295,30 @@ fn linked_phase_calibration_cycle(
         return Ok(None);
     }
 
-    let available = alsa_call(
-        playback_pcm.avail(),
-        "read calibration playback availability",
+    let capture_read_nanos = monotonic_nanos();
+    let playback_delay = alsa_call(
+        playback_pcm.delay(),
+        "read calibration playback delay",
         StreamDirection::Playback,
     )?;
-    let queued_frames = config.buffer.saturating_sub(available.min(config.buffer));
-    let (score_nanos, reserve_frames) = linked_phase_prediction(
-        queued_frames,
+    let handoff_started_nanos = monotonic_nanos();
+    let target_nanos = bounded_pro_handoff_target(
+        capture_read_nanos,
+        handoff_started_nanos,
+        config.handoff_nanos,
+        playback_delay,
+        config.period,
+        config.rate,
+    );
+    wait_for_handoff_target(target_nanos, control)?;
+    wait_for_playback_target(
+        playback_pcm,
+        config.buffer,
         config.playback_floor,
-        config.hardware_period,
         config.rate,
         config.handoff_nanos,
-    );
+        control,
+    )?;
     let written = write_playback_samples(
         playback_pcm,
         config.playback_silence,
@@ -1295,46 +1333,25 @@ fn linked_phase_calibration_cycle(
             required: config.period,
         });
     }
-    Ok(Some((score_nanos, reserve_frames)))
+    Ok(Some(monotonic_nanos().saturating_sub(capture_read_nanos)))
 }
 
-fn linked_phase_score(mut samples: [u64; LINKED_PHASE_MEASURED_CYCLES]) -> u64 {
-    samples.sort_unstable();
-    samples[LINKED_PHASE_MEASURED_CYCLES / 2]
-}
-
-fn linked_phase_target_nanos(hardware_period: alsa::pcm::Frames, rate: u32) -> u64 {
-    u64::try_from(hardware_period)
-        .unwrap_or(1)
-        .max(1)
-        .saturating_mul(1_000_000_000)
-        / (u64::from(rate) * 2)
-}
-
-fn linked_phase_prediction(
-    queued_frames: alsa::pcm::Frames,
-    playback_floor: alsa::pcm::Frames,
+fn linked_phase_target_nanos(
     hardware_period: alsa::pcm::Frames,
     rate: u32,
     handoff_nanos: u64,
-) -> (u64, alsa::pcm::Frames) {
-    let wait_frames = u64::try_from(queued_frames.saturating_sub(playback_floor)).unwrap_or(0);
-    let wait_nanos = wait_frames.saturating_mul(1_000_000_000) / u64::from(rate);
-    let overhead_frames = u64::try_from(
-        (hardware_period / alsa::pcm::Frames::from(LINKED_PHASE_OVERHEAD_DIVISOR)).max(1),
-    )
-    .unwrap_or(1);
-    let overhead_nanos = overhead_frames.saturating_mul(1_000_000_000) / u64::from(rate);
-    let score_nanos = wait_nanos.saturating_add(overhead_nanos);
-    let reserve_frames = if wait_nanos < handoff_nanos {
-        0
-    } else {
-        let drained_frames = wait_frames.saturating_add(overhead_frames);
-        queued_frames.saturating_sub(
-            alsa::pcm::Frames::try_from(drained_frames).unwrap_or(alsa::pcm::Frames::MAX),
-        )
-    };
-    (score_nanos, reserve_frames)
+) -> u64 {
+    let hardware_period_nanos = u64::try_from(hardware_period)
+        .unwrap_or(1)
+        .max(1)
+        .saturating_mul(1_000_000_000)
+        / u64::from(rate);
+    let overhead_nanos = hardware_period_nanos / u64::from(LINKED_PHASE_OVERHEAD_DIVISOR);
+    handoff_nanos.saturating_sub(overhead_nanos)
+}
+
+fn linked_phase_warmup_cycles(rate: u32, period: alsa::pcm::Frames) -> u64 {
+    u64::from(rate).div_ceil(u64::try_from(period).unwrap_or(1).max(1))
 }
 
 fn linked_phase_dither_frames(
@@ -1498,11 +1515,10 @@ fn linked_pro_cycle_loop(
                 return Ok(());
             }
             Err(error) if error.is_recoverable() => {
-                recover_and_calibrate_linked_streams(
+                recover_linked_streams_during_cycle(
                     playback_pcm,
                     capture_pcm,
                     &error,
-                    capture_scratch,
                     config,
                     control,
                 )?;
@@ -1638,11 +1654,10 @@ fn linked_pro_cycle_loop(
         ) {
             Ok(()) => {}
             Err(error) if error.is_recoverable() => {
-                recover_and_calibrate_linked_streams(
+                recover_linked_streams_during_cycle(
                     playback_pcm,
                     capture_pcm,
                     &error,
-                    capture_scratch,
                     config,
                     control,
                 )?;
@@ -1695,11 +1710,10 @@ fn linked_pro_cycle_loop(
                 ) {
                     Ok(()) => {}
                     Err(error) if error.is_recoverable() => {
-                        recover_and_calibrate_linked_streams(
+                        recover_linked_streams_during_cycle(
                             playback_pcm,
                             capture_pcm,
                             &error,
-                            capture_scratch,
                             config,
                             control,
                         )?;
@@ -1752,11 +1766,10 @@ fn linked_pro_cycle_loop(
                     });
                 }
                 Err(error) if error.is_recoverable() => {
-                    recover_and_calibrate_linked_streams(
+                    recover_linked_streams_during_cycle(
                         playback_pcm,
                         capture_pcm,
                         &error,
-                        capture_scratch,
                         config,
                         control,
                     )?;
@@ -1838,11 +1851,10 @@ fn linked_pro_ahead_cycle_loop(
         ) {
             if error.is_recoverable() {
                 pending_capture = None;
-                recover_and_calibrate_linked_streams(
+                recover_linked_streams_during_cycle(
                     playback_pcm,
                     capture_pcm,
                     &error,
-                    capture_scratch,
                     config,
                     control,
                 )?;
@@ -1900,11 +1912,10 @@ fn linked_pro_ahead_cycle_loop(
             }
             Err(error) if error.is_recoverable() => {
                 pending_capture = None;
-                recover_and_calibrate_linked_streams(
+                recover_linked_streams_during_cycle(
                     playback_pcm,
                     capture_pcm,
                     &error,
-                    capture_scratch,
                     config,
                     control,
                 )?;
@@ -1931,11 +1942,10 @@ fn linked_pro_ahead_cycle_loop(
             Ok(read) => read,
             Err(error) if error.is_recoverable() => {
                 pending_capture = None;
-                recover_and_calibrate_linked_streams(
+                recover_linked_streams_during_cycle(
                     playback_pcm,
                     capture_pcm,
                     &error,
-                    capture_scratch,
                     config,
                     control,
                 )?;
@@ -2068,11 +2078,10 @@ fn linked_pro_packet_cycle_loop(
             Err(error) if error.is_recoverable() => {
                 playback_scratch[..config.playback_period_samples].fill(0);
                 pending_capture = None;
-                recover_and_calibrate_linked_streams(
+                recover_linked_streams_during_cycle(
                     playback_pcm,
                     capture_pcm,
                     &error,
-                    capture_scratch,
                     config,
                     control,
                 )?;
@@ -3161,16 +3170,26 @@ fn recover_linked_streams(
     Ok(())
 }
 
-fn recover_and_calibrate_linked_streams(
+fn recover_linked_streams_during_cycle(
     playback_pcm: &PCM,
     capture_pcm: &PCM,
     error: &EngineError,
-    capture_scratch: &mut [i32],
     config: LinkedProConfig<'_>,
     control: WorkerControl<'_>,
 ) -> Result<(), EngineError> {
-    recover_linked_streams(playback_pcm, capture_pcm, error, control, config, 0)?;
-    calibrate_linked_phase(playback_pcm, capture_pcm, capture_scratch, config, control)
+    if control
+        .hardware_ready
+        .is_some_and(|ready| !ready.load(Ordering::Acquire))
+    {
+        // Never publish a replacement start that skipped startup qualification.
+        if let Some(direction) = error.recovery_direction()
+            && error.is_xrun()
+        {
+            control.timeline.record_hardware_xrun(direction);
+        }
+        return Err(EngineError::LinkedStartupInterrupted);
+    }
+    recover_linked_streams(playback_pcm, capture_pcm, error, control, config, 0)
 }
 
 fn recover_stream(
@@ -3472,11 +3491,11 @@ mod tests {
     use super::{
         EngineError, PendingProCapture, ProClock, StreamDirection, WorkerControl,
         align_sequence_forward, alsa_call, bounded_pro_handoff_target, linked_ahead_start_frames,
-        linked_phase_dither_frames, linked_phase_prediction, linked_phase_score,
-        linked_phase_target_nanos, linked_start_frames, linked_zero_lead_playback_floor,
-        observe_pro_capture_target, period_limit_reached, playback_startup_priority,
-        playback_target_sleep, pro_target_sequence, staged_playback_chunk_before_capture,
-        take_pending_pro_capture, take_pro_capture_sequence, uses_staged_packet_cycle,
+        linked_phase_dither_frames, linked_phase_target_nanos, linked_phase_warmup_cycles,
+        linked_start_frames, linked_zero_lead_playback_floor, observe_pro_capture_target,
+        period_limit_reached, playback_startup_priority, playback_target_sleep,
+        pro_target_sequence, staged_playback_chunk_before_capture, take_pending_pro_capture,
+        take_pro_capture_sequence, uses_staged_packet_cycle,
     };
     use crate::HardwareTimeline;
     use std::{
@@ -3679,10 +3698,16 @@ mod tests {
         assert_eq!(linked_zero_lead_playback_floor(32, 32, 128, 64), 64);
         assert_eq!(linked_zero_lead_playback_floor(64, 32, 192, 64), 128);
 
-        let reference_floor = linked_zero_lead_playback_floor(48, 32, 256, 64);
-        assert_eq!(reference_floor, 144);
+        let reference_floor = linked_zero_lead_playback_floor(32, 32, 256, 64);
+        assert_eq!(reference_floor, 128);
         assert_eq!(
             linked_start_frames(64, reference_floor, 256, 48_000, 500_000),
+            216
+        );
+        let expanded_floor = linked_zero_lead_playback_floor(48, 32, 256, 64);
+        assert_eq!(expanded_floor, 144);
+        assert_eq!(
+            linked_start_frames(64, expanded_floor, 256, 48_000, 500_000),
             232
         );
     }
@@ -3720,37 +3745,14 @@ mod tests {
     }
 
     #[test]
-    fn linked_phase_uses_upper_median_and_half_period_target() {
-        assert_eq!(linked_phase_score([600, 200, 400, 300]), 400);
-        assert_eq!(linked_phase_target_nanos(32, 48_000), 333_333);
-        assert_eq!(linked_phase_target_nanos(25, 48_000), 260_416);
+    fn linked_phase_warms_for_one_second_and_preserves_processing_margin() {
+        assert_eq!(linked_phase_warmup_cycles(48_000, 64), 750);
+        assert_eq!(linked_phase_warmup_cycles(48_000, 128), 375);
+        assert_eq!(linked_phase_target_nanos(32, 48_000, 500_000), 416_667);
+        assert_eq!(linked_phase_target_nanos(25, 48_000, 250_000), 184_896);
         assert_eq!(linked_phase_dither_frames(1, 32), 1);
         assert_eq!(linked_phase_dither_frames(31, 32), 31);
         assert_eq!(linked_phase_dither_frames(32, 32), 0);
-    }
-
-    #[test]
-    fn linked_phase_predicts_runtime_wait_without_draining_hardware() {
-        assert_eq!(
-            linked_phase_prediction(32, 32, 32, 48_000, 250_000),
-            (83_333, 0)
-        );
-        assert_eq!(
-            linked_phase_prediction(44, 32, 32, 48_000, 250_000),
-            (333_333, 28)
-        );
-        assert_eq!(
-            linked_phase_prediction(45, 32, 32, 48_000, 250_000),
-            (354_166, 28)
-        );
-        assert_eq!(
-            linked_phase_prediction(20, 32, 32, 48_000, 250_000),
-            (83_333, 0)
-        );
-        assert_eq!(
-            linked_phase_prediction(56, 32, 32, 48_000, 500_000),
-            (583_333, 28)
-        );
     }
 
     #[test]

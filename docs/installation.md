@@ -18,6 +18,7 @@ Installer defaults:
 - ALSA definitions: `/etc/alsa/conf.d/99-sidealsa.conf`
 - PipeWire objects: `/etc/pipewire/pipewire.conf.d/99-sidealsa.conf`
 - PipeWire Pulse scheduling: `/etc/pipewire/pipewire-pulse.conf.d/99-sidealsa.conf`
+- WirePlumber scheduling: `/etc/wireplumber/wireplumber.conf.d/99-sidealsa.conf`
 - daemon service: `sidealsad.service`
 - socket: `/tmp/sidealsad.sock`
 - control panel: `/usr/local/bin/sidealsa-control`
@@ -29,7 +30,10 @@ Installer defaults:
 The profile is seeded only on first install. Reinstalling or upgrading never
 overwrites it, including when `--force` is used. Uninstall also preserves it.
 Profile defaults therefore do not migrate an existing installation. Review the
-profile diff first, then explicitly install the repository version when wanted:
+profile diff first, then explicitly install the repository version when wanted.
+Profiles created before the USB IRQ-order fix retain their saved priorities;
+set `realtime_priority = 48` and `pro_realtime_priority = 46`, or replace an
+otherwise unmodified profile:
 
 ```text
 scripts/install.sh --replace-profile
@@ -43,13 +47,24 @@ Automatic adapter generation for arbitrary validated profiles is not yet
 implemented.
 
 The Q64/Q32 E1x2 packet pipeline uses `pro_latency_periods = 0`,
-`linked_playback_guard_frames = 48`, and `pro_handoff_us = 500`. Capture block N
+`linked_playback_guard_frames = 32`, `linked_phase_max_attempts = 8`, and
+`pro_handoff_us = 500`. Capture block N
 is returned as playback block N after the bounded client handoff, so native PRO
 and ASIO use the same callback timeline. The profile reports 64 frames of PRO
 output latency. The 500-us handoff covers observed Wine callback overhead under
 desktop capture load. A delayed hardware wake shortens that handoff when needed
-to retain one Q64 period for the next ALSA write. Linked startup primes 232
-frames, including three Q32 refill-headroom periods.
+to retain one Q64 period for the next ALSA write. Linked startup primes 216
+frames: one Q64 capture interval, a 32-frame guard, three Q32 refill-headroom
+periods, and the 24 frames consumed by the handoff.
+
+Before the control socket opens, each startup attempt runs 750 silence cycles,
+one second at 48 kHz/Q64, using the normal handoff and playback-write cadence.
+Any capture-to-playback write interval shorter than the configured handoff less
+one eighth of a physical period rejects that start. A rejected attempt restarts
+the linked hardware before clients exist; eight failed attempts fail daemon
+startup instead of exposing an unqualified stream. These maintenance transfers
+do not advance the published hardware timeline. Runtime client misses and
+normal XRUN recovery never invoke the startup qualifier.
 
 The ALSA ioplug keeps SideALSA SHARED transfers at Q64 and uses the independent
 B512 daemon ring. It aggregates four internal blocks per Q256 external period.
@@ -60,9 +75,12 @@ SHARED playback consumes data after seven internal periods (`448` frames), so
 desktop scheduling remains isolated from the physical B256 timeline. Playback
 and capture adapters keep PipeWire timer scheduling enabled.
 PipeWire's global clock quantum stays distribution-managed. The installed
-PipeWire and PipeWire Pulse fragments cap their realtime priority at `10`. The
-reference priority order is linked hardware `88`, ASIO callback `86`,
-WirePlumber `83`, and PipeWire/Pulse `10`.
+PipeWire, PipeWire Pulse, and WirePlumber fragments cap their realtime priority
+at `10`. On the reference PREEMPT_RT host the xHCI IRQ thread runs at `50`, so
+the priority order is xHCI IRQ `50`, linked hardware `48`, ASIO callback `46`,
+and desktop audio/session-manager work `10`. USB completion IRQs must preempt
+every userspace audio worker; assigning PRO or hardware above the xHCI IRQ can
+move physical duplex phase when another isochronous endpoint starts or stops.
 The callback continues with normal scheduling and reports
 `pro_realtime_failures` when the Wine process lacks realtime scheduling rights.
 Existing profiles that omit
@@ -80,9 +98,9 @@ systemctl --user enable --now pipewire.socket pipewire-pulse.socket
 systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service
 ```
 
-WirePlumber does not need a separate Lua rule. PipeWire creates SideALSA ALSA
-adapter nodes from the installed fragment; WirePlumber manages those nodes and
-does not receive default-sink or default-source changes from the installer.
+WirePlumber does not need a Lua rule. PipeWire creates SideALSA ALSA adapter
+nodes from the installed fragment; the WirePlumber fragment only caps its data
+loop priority and does not change default-sink or default-source policy.
 
 Install without starting the daemon:
 

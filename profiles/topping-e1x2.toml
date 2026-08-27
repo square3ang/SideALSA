@@ -7,13 +7,16 @@ buffer_size = 256
 shared_buffer_size = 512
 playback_timer_scheduling = true
 duplex_link = true
-linked_playback_guard_frames = 48
+linked_playback_guard_frames = 32
+# Qualify one second of linked silence before exposing clients.
+linked_phase_max_attempts = 8
 pro_latency_periods = 0
 pro_handoff_us = 500
-pro_realtime_priority = 86
+# Keep userspace audio below the PREEMPT_RT xHCI IRQ thread (FIFO 50 here).
+pro_realtime_priority = 46
 shared_latency_periods = 7
 realtime = true
-realtime_priority = 88
+realtime_priority = 48
 
 [device.playback]
 device = "hw:OTG,0"

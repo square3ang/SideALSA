@@ -113,7 +113,9 @@ The installer creates the selected profile only when it does not exist. Later
 installs preserve `/etc/sidealsa/profiles/*.toml`, including with `--force`.
 After reviewing local changes, use `--replace-profile` to adopt a new reference
 profile. The current Q64/Q32 reference uses
-`linked_playback_guard_frames = 48` and `pro_latency_periods = 0`.
+`linked_playback_guard_frames = 32`, `linked_phase_max_attempts = 8`, and
+`pro_latency_periods = 0`. It qualifies one second of linked silence before the
+daemon exposes its control socket.
 
 Use `--no-gui` when Qt or polkit integration is not wanted. The privileged
 helper is always installed at `/usr/libexec/sidealsa-admin`, outside a custom
@@ -444,7 +446,7 @@ frontend residual`. It prints raw ASIO and paired native values separately and
 accepts only the `ASIO - native` residual. A baseline-to-reacquisition shift in
 the common path is reported separately and is not misclassified as either an
 ASIO regression or a hardware-only event. The native reference runs at the same
-default realtime priority (`86`) as the ASIO worker.
+default realtime priority (`46`) as the ASIO worker.
 
 Probe result `77` means daemon or Wine driver unavailable. Check:
 

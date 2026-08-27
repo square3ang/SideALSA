@@ -7,8 +7,8 @@ registration, DLL ABI, and `CreateThread` bridge required for Wine TEB setup.
 
 The adapter expects the daemon profile to expose a `64`-frame logical period.
 The reference E1x2 profile uses physical ALSA Q32, aggregates transfers into
-Q64 client cycles, and keeps `buffer_size = 256`. Linked startup primes 232
-frames: one Q64 capture interval, a 48-frame physical write reserve, three Q32
+Q64 client cycles, and keeps `buffer_size = 256`. Linked startup primes 216
+frames: one Q64 capture interval, a 32-frame physical write reserve, three Q32
 refill-headroom periods, and the 24 frames consumed by the 500 us client
 handoff.
 
@@ -56,32 +56,28 @@ Control-socket operations use a one-second read/write timeout so worker teardown
 cannot wait forever on a stalled daemon control plane.
 
 `device.linked_phase_max_attempts` optionally calibrates linked zero-lead
-startup before the control socket opens. Each attempt runs two warmup and four
-measured silence cycles. Each cycle reads synchronized playback occupancy after
-the capture block, predicts the normal writer's wait and reserve with a
-four-frame processing margin, then writes silence immediately without draining
-toward an underrun. At least three of four
-measurements must fit within half a physical period while retaining half a
-physical period of queued playback. A rejected attempt drops, prepares, primes,
-relinks, dithers, and restarts the hardware. These intentional starts increment
-generation, timeline-reset, and phase-rebase counters, but not hardware-XRUN
-counters. Exhaustion uses the final running phase instead of stopping the
-daemon. This timing score classifies starts; analog loopback remains the latency
-authority. Linked XRUN recovery repeats calibration before client callbacks
-resume. Warmup and measured maintenance transfers do not advance
-`sample_position`, playback/capture positions, or `periods_processed`;
-generation and reset counters identify the discontinuity.
+startup before the control socket opens. Each attempt runs one second of silence
+at the production capture, handoff, playback-target, and write cadence. The
+minimum observed capture-to-playback write interval must reach the configured
+handoff less one eighth of a physical period. A shorter cycle
+drops, prepares, primes, relinks, dithers, and restarts the hardware before any
+client exists. Intentional retries increment generation, timeline-reset, and
+phase-rebase counters, but not hardware-XRUN counters. Exhausting the configured
+attempts fails daemon startup instead of exposing an unqualified final stream.
+Maintenance transfers do not advance `sample_position`, playback/capture
+positions, or `periods_processed`. `linked_phase_score_nanos` reports the final
+attempt's minimum write interval; analog loopback remains the latency authority.
 
-The E1x2 reference profile disables startup calibration. An earlier runtime
-rebase experiment produced 18 intentional rebases and 16 genuine capture XRUNs
-during a live Discord and PRO run, showing that client-triggered linked restarts
-are not safe on this device. A later startup-only run exhausted 32 attempts,
-added 16 capture XRUNs and 32 timeline resets, and never met the phase target.
-That candidate was also rejected. An armed deadline miss writes one
+The E1x2 reference profile enables eight startup attempts. Runtime recovery does
+not rerun the qualifier, and a recoverable error between qualification and first
+readiness fails that startup instead of publishing an unqualified restart. An
+earlier occupancy-prediction qualifier and a client-triggered runtime rebase
+experiment were rejected after producing genuine capture XRUNs and repeated
+timeline resets. An armed deadline miss writes one
 exact-sequence silence fallback, discards any stale late block, and resumes with
 the next exact sequence while hardware remains continuous.
 
-The reference profile keeps ALSA hardware `buffer_size = 256`, a 48-frame linked
+The reference profile keeps ALSA hardware `buffer_size = 256`, a 32-frame linked
 playback guard, and an independent `shared_buffer_size = 512`. SHARED capacity
 does not alter the physical queue.
 
@@ -141,19 +137,20 @@ ASIO frontend residual`, reports the paired `ASIO - native` residual, and
 reports the native baseline-to-reacquisition change separately as a common-path
 shift. Only the frontend residual participates in ASIO-specific acceptance; the
 common-path shift remains a core/hardware stability finding. The native
-reference uses the ASIO worker's default realtime priority of `86`.
+reference uses the ASIO worker's default realtime priority of `46`.
 
 ASIO begins with the first playback-clock target and publishes playback under
 that exact sequence. The E1x2 profile keeps zero process-ahead blocks. It uses a
-Q32 packet cadence, a 48-frame playback guard, and a real 500 us client handoff.
+Q32 packet cadence, a 32-frame playback guard, and a real 500 us client handoff.
 The daemon never waits past that bounded cutoff. It samples the exact
 shared-memory sequence once, substitutes silence when absent, and resumes only
 with the next exact sequence.
 
 The ASIO frontend owns its callback thread and attempts to raise it to the
 profile's `device.pro_realtime_priority`. When omitted, it defaults to two below
-the hardware worker; the reference profile therefore uses `86` below the linked
-hardware worker at `88`. It continues with normal scheduling and increments
+the hardware worker; the reference profile therefore uses `46` below the linked
+hardware worker at `48`. Both stay below the reference PREEMPT_RT xHCI IRQ
+thread at `50`. It continues with normal scheduling and increments
 `pro_realtime_failures` when the Wine process lacks realtime rights. Native ALSA
 clients retain application-owned scheduling because the plugin cannot safely
 promote arbitrary host threads. The ASIO worker enters realtime before sending
@@ -205,9 +202,9 @@ XRUNs, realtime-promotion failures, generation changes, and timeline resets all
 remained zero. RT1 was sufficient against these normal-priority host workers
 because any `SCHED_FIFO` thread preempts them. RT86 produced the tightest
 callback tail, while heartbeat and worker-throughput variation showed no
-material host-responsiveness penalty. The reference profile therefore retains
-RT86, two levels below the RT88 hardware worker, rather than lowering ASIO below
-other realtime audio work.
+material host-responsiveness penalty. That benchmark originally selected RT86
+below an RT88 hardware worker. Later USB-transition testing superseded that
+choice because both userspace priorities were above the xHCI IRQ thread.
 
 A 400 us callback-load calibration was too close to that 450 us zero-lead
 handoff: separate fresh-start runs produced client misses at both RT40 and RT86.
@@ -258,8 +255,8 @@ cargo run --release -p sidealsa-cli --bin sidealsa-stats -- --socket /tmp/sideal
   but crash/reacquisition under the same load moved 370 to 394 frames. A later
   unloaded run moved 424 to 394 frames. A 96-frame guard also failed to prevent
   a load-related transition. Those one-period-lead guard experiments did not
-  solve the issue. The current zero-lead profile uses a 48-frame guaranteed
-  guard and a 232-frame startup prime. Its reserve covers ALSA availability
+  solve the issue. A later zero-lead safety baseline used a 48-frame guaranteed
+  guard and a 232-frame startup prime. Its reserve covered ALSA availability
   granularity, USB-driver transfer advancement, and one delayed-wakeup Q32.
 - USB descriptors put playback and capture on the same internal UAC2 clock
   source, but playback uses an asynchronous explicit-feedback endpoint with
@@ -269,15 +266,15 @@ cargo run --release -p sidealsa-cli --bin sidealsa-stats -- --socket /tmp/sideal
 - Earlier Discord/PipeWire and delayed-PRO/SHARED tests predate the zero-lead
   revision. They established miss isolation but are not latency acceptance data
   for the current revision. The rejected 64-frame/two-Q32 startup prime remains
-  rejected because it caused real Discord activation XRUNs; zero-lead startup
-  now primes 232 frames so the 48-frame guard remains after refill advancement
-  and the client handoff.
+  rejected because it caused real Discord activation XRUNs. The current
+  zero-lead startup primes 216 frames so the 32-frame guard and three Q32
+  refill-headroom periods remain after the client handoff.
 - Client diagnostics expose expired capture blocks, playback publication
   failures, realtime promotion failures, callback overruns, and maximum callback
   duration without logging from the audio thread.
-- Runtime PRO rebasing is not exposed. Startup phase calibration remains
-  configurable but is disabled in the E1x2 profile. Deadline misses never
-  request a hardware restart.
+- Runtime PRO rebasing is not exposed. The E1x2 profile enables startup-only
+  qualification with at most eight attempts. Deadline misses never request a
+  hardware restart.
 - With the former B192 profile, direct ALSA Q64, zero-lead native PRO, and
   zero-lead ASIO each measured exactly 351 frames on the then-canonical B192
   hardware start. The 30000-period
@@ -334,11 +331,11 @@ cargo run --release -p sidealsa-cli --bin sidealsa-stats -- --socket /tmp/sideal
   SideALSA adapter nodes and daemon remained at zero.
 - A normal-priority native PRO negative control under the same pressure produced
   452 client deadline misses and lost 18 of 195 pulses without affecting the
-  hardware timeline. Repeating the 12000-period test with the profile's required
-  `chrt -f 86` scheduling detected all 188 pulses at a fixed 374 frames with zero
-  PRO miss, hardware XRUN, or timeline-reset delta. Native PRO hosts must arrange
-  their own realtime callback scheduling; the client library does not promote
-  arbitrary application threads.
+  hardware timeline. Repeating the 12000-period test with the then-profile's
+  required `chrt -f 86` scheduling detected all 188 pulses at a fixed 374
+  frames, with zero PRO miss, hardware XRUN, or timeline-reset delta. Native PRO
+  hosts must arrange their own realtime callback scheduling; the client library
+  does not promote arbitrary application threads.
 - The B256/guard48/500-us profile retains Q64 daemon and ASIO blocks. Its first
   buffered desktop revision exposed SHARED as Q256/B512 with PipeWire timer
   scheduling. The prior Q64
@@ -391,6 +388,38 @@ cargo run --release -p sidealsa-cli --bin sidealsa-stats -- --socket /tmp/sideal
   source-matching maximum sample delta, PipeWire correction near `1.0`, and zero
   SideALSA or PipeWire error delta. The extra external period is startup
   capacity; it does not change PRO timing or the steady Q256 PipeWire target.
+- On the reference PREEMPT_RT host, the xHCI IRQ thread runs as FIFO `50`.
+  Running the SideALSA hardware and PRO workers at `88` and `86` inverted that
+  ordering. During one 1080p60 USB-video transition run, analog loopback moved
+  from 376 to 346 frames with no pulse loss, XRUN, generation change, or reset.
+  USB3 LPM disabling did not prevent a separate 372-to-396-frame transition.
+  The reference profile now uses hardware `48` and PRO `46`, while PipeWire,
+  PipeWire Pulse, and WirePlumber use `10`.
+- The corrected priority order completed 80 uncompressed 1080p60 USB-video
+  start/stop transitions across three hardware starts. CPU saturation, four
+  memory-copy workers, active PipeWire playback, and 3282 measured pulses were
+  included. Each hardware start retained its exact 366-, 384-, or 378-frame
+  phase with zero pulse loss, PRO miss, hardware XRUN, generation change, or
+  timeline reset. Startup phase can still differ between actual hardware
+  restarts; with the then-current guard48 profile, the fix prevented normal
+  runtime load transitions from moving it.
+- A later repeated-start investigation reproduced stable 384- and 390-frame
+  starts and 336-to-390-frame settling without an ALSA XRUN. Reducing only the
+  startup prime was rejected: a 200-frame prime reached 418 frames during loaded
+  startup, while a 136-frame prime reached 402 frames. The accepted profile uses
+  guard32, a 216-frame prime, one second of pre-ready silence, and up to eight
+  startup-only qualification attempts.
+- With that profile, 93 measurable unloaded fresh starts each remained fixed at
+  320-369 frames. Thirty PID-matched starts under 12 CPU workers, four memory
+  workers, active PipeWire playback, and repeated 1080p60 USB-video opens each
+  remained fixed at 320-368 frames. Two starts were rejected and rebased before
+  readiness; all client-visible PRO, hardware-XRUN, and reset deltas were zero.
+- Three 45000-period loaded runs measured 2109 pulses. A 350-frame start settled
+  once at 374 frames, the following run remained fixed at 374, and a separately
+  selected 362-frame start remained fixed at 362. The measured maximum was 374
+  frames, or 7.792 ms, with zero lost pulse, PRO miss, hardware-XRUN, or runtime
+  timeline-reset delta. This bounds the observed reference-host result below
+  8 ms; the qualifier does not directly measure analog latency.
 
 ## Limitations
 
@@ -398,14 +427,21 @@ cargo run --release -p sidealsa-cli --bin sidealsa-stats -- --socket /tmp/sideal
 - Fixed sample rate and buffer size; no runtime rate switching.
 - Float32 ASIO buffers converted to physical S32_LE.
 - `GetLatencies` reports the 64-frame input and 64-frame software output
-  path, but not USB, converter, cable-loopback, or profile-calibrated latency.
+  path, but not USB, converter, cable-loopback, or startup-qualified latency.
 - Earlier builds showed sub-Q64 common-path shifts while both ALSA streams
   remained `RUNNING`. Shallow/late SideALSA refill and SHARED work ordering were
   confirmed software triggers, so these shifts must not be labeled as
   hardware-only. The crash/reacquisition harness checks each leg for stable
   phase, compares ASIO with an immediately following native PRO run, and reports
-  any remaining common-path shift separately. The refill-order fix still needs
-  a longer multi-hour stability run.
+  any remaining common-path shift separately. The startup qualifier prevents
+  clients from seeing the initial one-second settling interval, but one loaded
+  run still moved from 350 to 374 frames afterward. A longer multi-hour
+  stability run is still required.
+- Freezing the daemon process is not normal scheduler load. A later explicit
+  3 ms `SIGSTOP` sequence repopulated the USB playback queue and changed analog
+  phase without an ALSA XRUN. Runtime continuity is therefore not guaranteed
+  across process suspension, debugger stops, or higher-priority external RT
+  threads; userspace audio priorities must remain below the USB IRQ thread.
 - The zero-lead revision has not yet repeated the full Discord playback,
   microphone, and screen-sharing soak.
 - Hardware-engine stop is non-draining. A finite `max_periods` run or daemon
