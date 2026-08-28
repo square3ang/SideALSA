@@ -29,13 +29,13 @@ After capture, the daemon also bounds the handoff by current ALSA playback delay
 A late RT wake therefore shortens or skips the client wait before it consumes
 the Q64 emergency write reserve.
 
-Protocol v14 carries the playback-ready eventfd, timing diagnostics, physical
+Protocol v15 carries the playback-ready eventfd, timing diagnostics, physical
 hardware period, effective PRO output latency, linked-start phase calibration
-result, independent SHARED buffer size, and the loaded profile fingerprint.
-Shared-memory v8 carries the
+result, independent SHARED buffer size, per-port SHARED playback diagnostics,
+and the loaded profile fingerprint. Shared-memory v9 carries the
 daemon's authoritative playback and activation watermarks plus the
-shared-capture discontinuity counter, playback publication timestamps, and
-hardware timeline generation.
+shared-capture discontinuity counter, playback publication timestamps, client
+playback diagnostics, and hardware timeline generation.
 Shared-memory slot state and sequence ownership remain authoritative for
 whether a playback block is ready.
 The client chooses the oldest capture target not older than that watermark, so
@@ -54,6 +54,13 @@ same worker and PRO activation. `DisposeBuffers` or driver close performs the
 actual stream stop, joins the worker, and releases exclusive PRO ownership.
 Control-socket operations use a one-second read/write timeout so worker teardown
 cannot wait forever on a stalled daemon control plane.
+
+A hardware-generation change, capture-ring discontinuity, or backward capture
+sequence resets the worker's local cycle state and restarts the same PRO session.
+The driver requests an ASIO host resync and then resumes callbacks instead of
+permanently poisoning the worker. Daemon disconnects and other stream failures
+remain terminal and request a host reset. A host callback that blocks forever
+cannot be recovered internally because that callback owns the worker thread.
 
 `device.linked_phase_max_attempts` optionally calibrates linked zero-lead
 startup before the control socket opens. Each attempt runs one second of silence
@@ -90,8 +97,8 @@ cmake --build build-asio --target \
 ```
 
 Outputs include `sidealsa-asio64.dll`, `sidealsa-asio64.dll.so`,
-`sidealsa-asio-probe.exe`, and `sidealsa-asio-loopback-test.exe`. The build tree
-also contains Wine's `x86_64-windows` and `x86_64-unix` lookup layout.
+`sidealsa-asio-probe.exe.so`, and `sidealsa-asio-loopback-test.exe.so`. The build
+tree also contains Wine's `x86_64-windows` and `x86_64-unix` lookup layout.
 
 ## Probe
 
@@ -103,8 +110,12 @@ cp build-asio/sidealsa-asio64.dll "$WINEPREFIX/drive_c/windows/system32/"
 WINEDLLPATH="$PWD/build-asio" wine regsvr32 /s sidealsa-asio64.dll
 SIDEALSA_SOCKET=/tmp/sidealsad.sock \
 WINEDLLPATH="$PWD/build-asio" \
-"$PWD/build-asio/sidealsa-asio-probe.exe"
+wine "$PWD/build-asio/sidealsa-asio-probe.exe.so"
 ```
+
+Invoke the `.exe.so` host directly. Wine's generated `.exe` wrapper prepends its
+invocation directory to `WINEDLLPATH`; invoking that wrapper by a relative path
+can make COM lookup fail on current Wine releases.
 
 The probe checks COM contracts, channel counts, `64`-frame buffer negotiation,
 64-frame reported output latency, S32-to-float channel metadata, buffer
@@ -116,8 +127,8 @@ With playback channel 0 physically looped to capture channel 4, run the strict
 analog test and abrupt-process reacquisition harness:
 
 ```text
-WINELOADER=wine WINEDLLPATH="$PWD/build-asio" \
-  build-asio/sidealsa-asio-loopback-test.exe
+WINEDLLPATH="$PWD/build-asio" wine \
+  build-asio/sidealsa-asio-loopback-test.exe.so
 scripts/test-asio-reacquire.sh
 ```
 
@@ -170,7 +181,7 @@ SIDEALSA_ASIO_PROBE_CALLBACK_WORK_US=350 \
 SIDEALSA_ASIO_PROBE_HEARTBEAT_MS=10 \
 SIDEALSA_ASIO_PROBE_RT_PRIORITY=40 \
 WINEDLLPATH="$PWD/build-asio" \
-  build-asio/sidealsa-asio-loopback-test.exe
+  wine build-asio/sidealsa-asio-loopback-test.exe.so
 ```
 
 The worker allocation is committed and touched before `Start`. The workers then

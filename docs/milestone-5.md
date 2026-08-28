@@ -16,7 +16,9 @@ The RT bridge performs fixed channel mapping and saturating `i32` addition:
 - Active SHARED playback blocks are added to mapped physical channels.
 - Active SHARED capture ports receive mapped logical blocks.
 - The first missing SHARED playback block in an armed episode increments
-  `shared_underruns` and contributes silence. The next valid block rearms it.
+  `shared_underruns`. It contributes silence by default, or repeats that port's
+  last valid logical block when `shared_playback_repeat_on_underrun = true`.
+  The next valid block refreshes the cache and rearms the endpoint.
 - Full SHARED capture rings increment `shared_overruns`.
 
 SHARED misses never increment PRO misses, hardware XRUN counters, generation,
@@ -65,7 +67,11 @@ XRUNs, PRO misses, generation, and timeline resets remain zero.
 
 An endpoint arms only after its first exact playback block. A missing block
 disarms it after recording one underrun, so an inactive or paused PipeWire node
-does not repeatedly count the same outage at the hardware period rate.
+does not repeatedly count the same outage at the hardware period rate. Optional
+repeat concealment continues through the outage without changing that counter.
+The cache is invalidated by stop, close, lifecycle restart, or hardware timeline
+generation change. Repetition is unbounded until valid playback resumes and can
+produce a loop tone during a long outage.
 
 Observed on Topping E1x2 at Q32 with profile realtime scheduling: 1500 delayed playback
 periods produced 95 shared underruns, zero hardware XRUNs, zero PRO misses, and

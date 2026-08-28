@@ -59,7 +59,9 @@ Unit tests cover the ioplug buffer minimum and interleaved S32_LE area copies.
 SHARED playback also realigns its sequence after a late callback. If PipeWire
 has no catch-up block, one missing sequence becomes one daemon underrun; the
 endpoint then disarms until the next valid block resumes at the configured
-lookahead. A paused endpoint does not increment the counter every period.
+lookahead. A paused endpoint does not increment the counter every period. The
+optional SHARED repeat setting reuses the last valid logical period during that
+outage without changing ioplug sequencing or XRUN behavior.
 
 ## Limitations
 

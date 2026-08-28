@@ -452,6 +452,7 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o: /home/square3ang/SideALSA/crates
   /usr/include/qt6/QtGui/QFont \
   /usr/include/qt6/QtGui/QRegularExpressionValidator \
   /usr/include/qt6/QtGui/QTransform \
+  /usr/include/qt6/QtGui/QWheelEvent \
   /usr/include/qt6/QtGui/qaction.h \
   /usr/include/qt6/QtGui/qbitmap.h \
   /usr/include/qt6/QtGui/qbrush.h \
@@ -495,12 +496,14 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o: /home/square3ang/SideALSA/crates
   /usr/include/qt6/QtGui/qvector2d.h \
   /usr/include/qt6/QtGui/qvectornd.h \
   /usr/include/qt6/QtGui/qwindowdefs.h \
+  /usr/include/qt6/QtWidgets/QAbstractSpinBox \
   /usr/include/qt6/QtWidgets/QApplication \
   /usr/include/qt6/QtWidgets/QCheckBox \
   /usr/include/qt6/QtWidgets/QComboBox \
   /usr/include/qt6/QtWidgets/QFormLayout \
   /usr/include/qt6/QtWidgets/QFrame \
   /usr/include/qt6/QtWidgets/QGridLayout \
+  /usr/include/qt6/QtWidgets/QHBoxLayout \
   /usr/include/qt6/QtWidgets/QLabel \
   /usr/include/qt6/QtWidgets/QLayout \
   /usr/include/qt6/QtWidgets/QLineEdit \
@@ -510,6 +513,7 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o: /home/square3ang/SideALSA/crates
   /usr/include/qt6/QtWidgets/QScrollArea \
   /usr/include/qt6/QtWidgets/QSpinBox \
   /usr/include/qt6/QtWidgets/QStyle \
+  /usr/include/qt6/QtWidgets/QTabWidget \
   /usr/include/qt6/QtWidgets/QVBoxLayout \
   /usr/include/qt6/QtWidgets/QWidget \
   /usr/include/qt6/QtWidgets/qabstractbutton.h \
@@ -764,6 +768,12 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 
 /usr/include/qt6/QtWidgets/qtwidgetsexports.h:
 
+/usr/include/qt6/QtWidgets/qtabbar.h:
+
+/usr/include/qt6/QtWidgets/qstyleoption.h:
+
+/usr/include/qt6/QtWidgets/qstyle.h:
+
 /usr/include/c++/16/unordered_map:
 
 /usr/include/qt6/QtWidgets/qscrollarea.h:
@@ -928,8 +938,6 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 
 /usr/include/c++/16/bits/stdexcept_throw.h:
 
-/usr/include/qt6/QtWidgets/qstyle.h:
-
 /usr/lib/gcc/x86_64-pc-linux-gnu/16/include/stdarg.h:
 
 /usr/include/c++/16/bits/stl_uninitialized.h:
@@ -975,8 +983,6 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 /usr/include/c++/16/bits/node_handle.h:
 
 /usr/include/c++/16/bits/new_except.h:
-
-/usr/include/qt6/QtWidgets/qtabbar.h:
 
 /usr/include/c++/16/bits/new_allocator.h:
 
@@ -1055,8 +1061,6 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 /usr/include/c++/16/bits/stdexcept_throwfwd.h:
 
 /usr/include/qt6/QtCore/qprocessordetection.h:
-
-/usr/include/c++/16/bits/stl_construct.h:
 
 /usr/include/bits/xopen_lim.h:
 
@@ -1406,8 +1410,6 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 
 /usr/include/c++/16/bits/std_function.h:
 
-/usr/include/c++/16/bits/exception.h:
-
 /usr/lib/libicuuc.so.78:
 
 /usr/include/c++/16/iterator:
@@ -1543,6 +1545,8 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 /usr/include/qt6/QtCore/q20utility.h:
 
 /usr/include/qt6/QtCore/q23type_traits.h:
+
+/usr/include/qt6/QtWidgets/QHBoxLayout:
 
 /usr/include/qt6/QtCore/qabstracteventdispatcher.h:
 
@@ -1790,13 +1794,17 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 
 /usr/include/qt6/QtGui/qbrush.h:
 
+/usr/include/c++/16/bits/exception.h:
+
+/usr/include/qt6/QtGui/QWheelEvent:
+
 /usr/include/qt6/QtGui/qcolor.h:
+
+/usr/include/qt6/QtWidgets/qtabwidget.h:
 
 /usr/include/bits/floatn-common.h:
 
 /usr/include/c++/16/bits/invoke.h:
-
-/usr/include/qt6/QtWidgets/qtabwidget.h:
 
 /usr/include/qt6/QtGui/qevent.h:
 
@@ -1858,6 +1866,10 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 
 /usr/include/qt6/QtGui/qvector2d.h:
 
+/usr/include/c++/16/bits/stl_construct.h:
+
+/usr/include/qt6/QtWidgets/QAbstractSpinBox:
+
 /usr/include/qt6/QtWidgets/QCheckBox:
 
 /usr/include/bits/types/__FILE.h:
@@ -1867,6 +1879,8 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 /usr/include/qt6/QtWidgets/QMainWindow:
 
 /usr/include/qt6/QtWidgets/QStyle:
+
+/usr/include/qt6/QtWidgets/QTabWidget:
 
 /usr/include/c++/16/utility:
 
@@ -1903,5 +1917,3 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o:
 /usr/include/qt6/QtWidgets/qmessagebox.h:
 
 /usr/include/qt6/QtWidgets/qpushbutton.h:
-
-/usr/include/qt6/QtWidgets/qstyleoption.h:

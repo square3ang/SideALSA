@@ -2415,8 +2415,8 @@ fn playback_worker_loop(
     let mut sequence = 0_u64;
     let mut successful_periods = 0_u64;
     let mut output_scratch = output_scratch;
-    let mut announced_sequence = None;
-    let mut prepared_sequence = None;
+    let mut announced_output = None;
+    let mut prepared_output = None;
 
     loop {
         if control.stop.load(Ordering::Relaxed)
@@ -2427,7 +2427,9 @@ fn playback_worker_loop(
             return Ok(());
         }
 
-        if announced_sequence != Some(sequence) {
+        if !announced_output.is_some_and(|(announced, _, _)| announced == sequence) {
+            let hardware_generation = control.timeline.generation();
+            let playback_epoch = playback_source_epoch(playback_source.as_deref(), control)?;
             if let Some(source) = playback_source.as_deref_mut()
                 && catch_unwind(AssertUnwindSafe(|| {
                     source.prepare_playback(sequence);
@@ -2437,7 +2439,7 @@ fn playback_worker_loop(
                 control.done.store(true, Ordering::Release);
                 return Err(EngineError::WorkerPanic);
             }
-            announced_sequence = Some(sequence);
+            announced_output = Some((sequence, hardware_generation, playback_epoch));
         }
 
         let wait_result = if config.timer_scheduling {
@@ -2487,15 +2489,42 @@ fn playback_worker_loop(
         if control.stop.load(Ordering::Relaxed) || control.done.load(Ordering::Acquire) {
             continue;
         }
-        if prepared_sequence != Some(sequence) {
-            if let (Some(source), Some(scratch)) = (
-                playback_source.as_deref_mut(),
-                output_scratch.as_deref_mut(),
-            ) {
-                control.timeline.record_pro_wait_budget(0);
+        let hardware_generation = control.timeline.generation();
+        let playback_epoch = playback_source_epoch(playback_source.as_deref(), control)?;
+        if !prepared_output_matches(
+            prepared_output,
+            sequence,
+            hardware_generation,
+            playback_epoch,
+        ) {
+            if let Some(scratch) = output_scratch.as_deref_mut() {
                 scratch[..config.period_samples].fill(0);
-                if catch_unwind(AssertUnwindSafe(|| {
-                    source.process_playback(sequence, &mut scratch[..config.period_samples]);
+            }
+            if announced_output_matches(
+                announced_output,
+                sequence,
+                hardware_generation,
+                playback_epoch,
+            ) {
+                if let (Some(source), Some(scratch)) = (
+                    playback_source.as_deref_mut(),
+                    output_scratch.as_deref_mut(),
+                ) {
+                    control.timeline.record_pro_wait_budget(0);
+                    if catch_unwind(AssertUnwindSafe(|| {
+                        source.process_playback(sequence, &mut scratch[..config.period_samples]);
+                    }))
+                    .is_err()
+                    {
+                        control.done.store(true, Ordering::Release);
+                        return Err(EngineError::WorkerPanic);
+                    }
+                }
+                if let (Some(source), Some(scratch)) = (
+                    playback_source.as_deref_mut(),
+                    output_scratch.as_deref_mut(),
+                ) && catch_unwind(AssertUnwindSafe(|| {
+                    source.commit_playback(sequence, &mut scratch[..config.period_samples]);
                 }))
                 .is_err()
                 {
@@ -2503,18 +2532,13 @@ fn playback_worker_loop(
                     return Err(EngineError::WorkerPanic);
                 }
             }
-            if let (Some(source), Some(scratch)) = (
-                playback_source.as_deref_mut(),
-                output_scratch.as_deref_mut(),
-            ) && catch_unwind(AssertUnwindSafe(|| {
-                source.commit_playback(sequence, &mut scratch[..config.period_samples]);
-            }))
-            .is_err()
+            if control.timeline.generation() != hardware_generation
+                || playback_source_epoch(playback_source.as_deref(), control)? != playback_epoch
             {
-                control.done.store(true, Ordering::Release);
-                return Err(EngineError::WorkerPanic);
+                prepared_output = None;
+                continue;
             }
-            prepared_sequence = Some(sequence);
+            prepared_output = Some((sequence, hardware_generation, playback_epoch));
         }
         if let Ok(status) = pcm.status() {
             let delay = status.get_delay();
@@ -2528,6 +2552,19 @@ fn playback_worker_loop(
                 status.get_avail(),
                 config.buffer,
             );
+        }
+
+        let write_generation = control.timeline.generation();
+        let write_epoch = playback_source_epoch(playback_source.as_deref(), control)?;
+        if write_generation != hardware_generation {
+            prepared_output = None;
+            continue;
+        }
+        if !prepared_output_matches(prepared_output, sequence, write_generation, write_epoch) {
+            if let Some(scratch) = output_scratch.as_deref_mut() {
+                scratch[..config.period_samples].fill(0);
+            }
+            prepared_output = Some((sequence, write_generation, write_epoch));
         }
 
         control
@@ -2552,8 +2589,8 @@ fn playback_worker_loop(
                 position = position.wrapping_add(config.period as u64);
                 sequence = sequence.wrapping_add(1);
                 successful_periods = successful_periods.saturating_add(1);
-                announced_sequence = None;
-                prepared_sequence = None;
+                announced_output = None;
+                prepared_output = None;
                 if let Some(clock) = pro_clock {
                     clock.publish(pro_target_sequence(sequence, config.sequence_lead));
                 }
@@ -2604,6 +2641,36 @@ fn playback_worker_loop(
             }
         }
     }
+}
+
+fn playback_source_epoch(
+    source: Option<&dyn ProPlaybackSource>,
+    control: WorkerControl<'_>,
+) -> Result<u64, EngineError> {
+    source.map_or(Ok(0), |source| {
+        catch_unwind(AssertUnwindSafe(|| source.playback_epoch())).map_err(|_| {
+            control.done.store(true, Ordering::Release);
+            EngineError::WorkerPanic
+        })
+    })
+}
+
+fn prepared_output_matches(
+    prepared: Option<(u64, u64, u64)>,
+    sequence: u64,
+    generation: u64,
+    playback_epoch: u64,
+) -> bool {
+    prepared == Some((sequence, generation, playback_epoch))
+}
+
+fn announced_output_matches(
+    announced: Option<(u64, u64, u64)>,
+    sequence: u64,
+    generation: u64,
+    playback_epoch: u64,
+) -> bool {
+    announced == Some((sequence, generation, playback_epoch))
 }
 
 fn period_limit_reached(successful_periods: u64, max_periods: Option<u64>) -> bool {
@@ -3490,12 +3557,13 @@ impl EngineError {
 mod tests {
     use super::{
         EngineError, PendingProCapture, ProClock, StreamDirection, WorkerControl,
-        align_sequence_forward, alsa_call, bounded_pro_handoff_target, linked_ahead_start_frames,
-        linked_phase_dither_frames, linked_phase_target_nanos, linked_phase_warmup_cycles,
-        linked_start_frames, linked_zero_lead_playback_floor, observe_pro_capture_target,
-        period_limit_reached, playback_startup_priority, playback_target_sleep,
-        pro_target_sequence, staged_playback_chunk_before_capture, take_pending_pro_capture,
-        take_pro_capture_sequence, uses_staged_packet_cycle,
+        align_sequence_forward, alsa_call, announced_output_matches, bounded_pro_handoff_target,
+        linked_ahead_start_frames, linked_phase_dither_frames, linked_phase_target_nanos,
+        linked_phase_warmup_cycles, linked_start_frames, linked_zero_lead_playback_floor,
+        observe_pro_capture_target, period_limit_reached, playback_startup_priority,
+        playback_target_sleep, prepared_output_matches, pro_target_sequence,
+        staged_playback_chunk_before_capture, take_pending_pro_capture, take_pro_capture_sequence,
+        uses_staged_packet_cycle,
     };
     use crate::HardwareTimeline;
     use std::{
@@ -3610,6 +3678,20 @@ mod tests {
         assert!(!period_limit_reached(1, Some(2)));
         assert!(period_limit_reached(2, Some(2)));
         assert!(!period_limit_reached(u64::MAX, None));
+    }
+
+    #[test]
+    fn playback_recovery_reuses_output_only_within_the_same_generation() {
+        let prepared = Some((42, 7, 3));
+
+        assert!(prepared_output_matches(prepared, 42, 7, 3));
+        assert!(!prepared_output_matches(prepared, 42, 8, 3));
+        assert!(!prepared_output_matches(prepared, 43, 7, 3));
+        assert!(!prepared_output_matches(prepared, 42, 7, 4));
+        assert!(announced_output_matches(prepared, 42, 7, 3));
+        assert!(!announced_output_matches(prepared, 42, 8, 3));
+        assert!(!announced_output_matches(prepared, 43, 7, 3));
+        assert!(!announced_output_matches(prepared, 42, 7, 4));
     }
 
     #[test]

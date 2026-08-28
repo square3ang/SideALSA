@@ -309,6 +309,21 @@ pub unsafe extern "C" fn sidealsa_stream_transfer(
 #[unsafe(no_mangle)]
 /// # Safety
 ///
+/// `stream` must be a live handle returned by `sidealsa_stream_open`.
+pub unsafe extern "C" fn sidealsa_stream_record_playback_xrun(stream: *mut SideAlsaStream) {
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+        if let Some(stream) = stream.as_ref()
+            && stream.playback
+            && !stream.pro
+        {
+            stream.stream.record_playback_xrun();
+        }
+    }));
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
 /// `stream` must be null or a live handle returned by `sidealsa_stream_open`.
 pub unsafe extern "C" fn sidealsa_stream_position(stream: *const SideAlsaStream) -> u64 {
     catch_unwind(AssertUnwindSafe(|| unsafe {
@@ -560,9 +575,27 @@ impl SideAlsaStream {
                 queued_periods,
             )?;
             if plan.expired_periods > 0 {
+                let action =
+                    expired_playback_action(self.pro, plan.expired_periods, queued_periods);
                 self.discard_playback_periods(plan.expired_periods)?;
-                self.next_playback_sequence = Some(plan.sequence);
-                return Err(libc::EPIPE);
+                match action {
+                    ExpiredPlaybackAction::Xrun => {
+                        self.next_playback_sequence = Some(plan.sequence);
+                        return Err(libc::EPIPE);
+                    }
+                    ExpiredPlaybackAction::Realign { discarded_periods } => {
+                        self.stream.record_expired_playback_periods(
+                            u64::try_from(discarded_periods).unwrap_or(u64::MAX),
+                        );
+                        self.next_playback_sequence =
+                            realigned_playback_sequence(plan.sequence, self.playback_fifo_frames);
+                        if self.next_playback_sequence.is_none() {
+                            self.playback_cycle_sequence = None;
+                        }
+                        progressed = true;
+                        continue;
+                    }
+                }
             }
             let sequence = plan.sequence;
             self.next_playback_sequence = Some(sequence);
@@ -748,6 +781,28 @@ fn wait_timeout(nonblock: bool) -> Duration {
 struct PlaybackSequencePlan {
     sequence: u64,
     expired_periods: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpiredPlaybackAction {
+    Xrun,
+    Realign { discarded_periods: usize },
+}
+
+fn expired_playback_action(
+    pro: bool,
+    expired_periods: usize,
+    queued_periods: usize,
+) -> ExpiredPlaybackAction {
+    if pro {
+        return ExpiredPlaybackAction::Xrun;
+    }
+    let discarded_periods = expired_periods.min(queued_periods);
+    ExpiredPlaybackAction::Realign { discarded_periods }
+}
+
+fn realigned_playback_sequence(sequence: u64, queued_frames: usize) -> Option<u64> {
+    (queued_frames != 0).then_some(sequence)
 }
 
 fn plan_playback_sequence_with_queue(
@@ -1262,6 +1317,36 @@ mod tests {
         discard_playback_fifo_periods(&mut exhausted_fifo, &mut exhausted_frames, 3, 2, 1)
             .expect("expiry beyond the queue should discard the whole queue");
         assert_eq!(exhausted_frames, 0);
+
+        assert_eq!(
+            expired_playback_action(false, 1, 3),
+            ExpiredPlaybackAction::Realign {
+                discarded_periods: 1,
+            }
+        );
+        assert_eq!(
+            expired_playback_action(false, 3, 1),
+            ExpiredPlaybackAction::Realign {
+                discarded_periods: 1,
+            }
+        );
+        assert_eq!(realigned_playback_sequence(104, 0), None);
+        assert_eq!(realigned_playback_sequence(104, 1), Some(104));
+
+        let mut partial_fifo = [10, 11, 20, 21, 30];
+        let mut partial_frames = 5;
+        discard_playback_fifo_periods(&mut partial_fifo, &mut partial_frames, 2, 2, 1)
+            .expect("complete expired periods should leave a partial period queued");
+        assert_eq!(partial_frames, 1);
+        assert_eq!(realigned_playback_sequence(104, partial_frames), Some(104));
+    }
+
+    #[test]
+    fn pro_expired_playback_still_requires_xrun_recovery() {
+        assert_eq!(
+            expired_playback_action(true, 1, 3),
+            ExpiredPlaybackAction::Xrun
+        );
     }
 
     #[test]

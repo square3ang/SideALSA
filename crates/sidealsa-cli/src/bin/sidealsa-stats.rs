@@ -135,6 +135,20 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
             "callback_overruns={} callback_max_nanos={}",
             stats.pro_callback_overruns, stats.pro_callback_max_nanos,
         );
+        for port in &stats.shared_playback_ports {
+            println!(
+                "shared_playback_port={} underruns={} last_underrun_sequence={} last_underrun_nanos={} last_sequence_lag_periods={} max_sequence_lag_periods={} expired_playback_periods={} submit_failures={} xruns={}",
+                port.port_id,
+                port.underruns,
+                port.last_underrun_sequence,
+                port.last_underrun_nanos,
+                port.last_sequence_lag_periods,
+                port.max_sequence_lag_periods,
+                port.expired_playback_periods,
+                port.playback_submit_failures,
+                port.playback_xruns,
+            );
+        }
         thread::sleep(Duration::from_millis(args.interval_ms));
     }
     Ok(())

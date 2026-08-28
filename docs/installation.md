@@ -39,6 +39,18 @@ otherwise unmodified profile:
 scripts/install.sh --replace-profile
 ```
 
+Use `--preserve-pipewire` when updating SideALSA binaries or profiles without
+rewriting the installed PipeWire adapter files or restarting the user PipeWire
+services. This mode requires the three adapter files to be present in the
+existing SideALSA install manifest and retains their previous ownership hashes.
+
+The reference profile enables
+`shared_playback_repeat_on_underrun = true`. Existing profiles that omit it
+retain the previous silence fallback. The control panel exposes the setting as
+a checkbox. When enabled, a SHARED playback port repeats its last valid logical
+period until exact-sequence playback resumes; a long outage can therefore
+produce a repeating tone.
+
 The installed ALSA and PipeWire adapter fragments are currently static for the
 reference E1x2 port IDs (`line1` through `line4`, `mic1`, `mic2`, and
 `input34` through `input910`). The installer rejects a custom profile missing
@@ -91,7 +103,7 @@ With `device.realtime = true`, `sidealsad` locks current and future mappings wit
 Startup fails instead of running an unprotected RT loop when memory locking is
 unavailable. The installed service supplies `LimitMEMLOCK=infinity`.
 
-Restart user PipeWire and WirePlumber after installation:
+After a normal installation, restart user PipeWire and WirePlumber if needed:
 
 ```text
 systemctl --user enable --now pipewire.socket pipewire-pulse.socket
@@ -114,11 +126,14 @@ Skip the Qt control panel and polkit helper:
 scripts/install.sh --no-gui
 ```
 
-The control panel edits all timing fields. Applying a change authenticates with
-polkit, validates and atomically replaces the root-owned profile, restarts the
-fixed system service, and verifies the new root-owned socket peer against
-systemd's `MainPID` and the complete loaded profile fingerprint. On failure it
-restores the original profile and verifies the rollback restart. After a
+The control panel groups timing fields into buffer, duplex, and scheduling tabs
+with persistent status and apply actions. Direct numeric inputs avoid detached
+platform step controls and ignore unfocused wheel events. Applying a change
+authenticates with polkit, validates and atomically replaces the root-owned
+profile, restarts the fixed system service, and verifies the new root-owned
+socket peer against systemd's `MainPID` and the complete loaded profile
+fingerprint. On failure it restores the original profile, verifies the rollback
+restart, and keeps pending GUI values available for correction. After a
 successful restart or a reported failure that may have restarted the daemon,
 including rollback, the control panel restarts active user PipeWire services so
 static adapters reopen against the current daemon. Direct PRO and SHARED clients
@@ -126,9 +141,10 @@ still need to reconnect. A warning with the manual `systemctl --user restart`
 command is shown if the user-service restart fails or times out; an otherwise
 verified daemon change remains applied.
 
-The installer also stops active user audio before restarting `sidealsad` and
-waits for the new socket before restoring those services. This prevents static
-PipeWire adapters from opening before the daemon is ready.
+Unless `--preserve-pipewire` is used, the installer also stops active user audio
+before restarting `sidealsad` and waits for the new socket before restoring
+those services. This prevents static PipeWire adapters from opening before the
+daemon is ready. Preserve mode leaves those user services running.
 
 Install Wine ASIO binaries when CMake, `winegcc`, and `winebuild` are available:
 

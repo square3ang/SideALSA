@@ -16,6 +16,7 @@ FORCE=0
 REPLACE_PROFILE=0
 NO_START=0
 INSTALL_PIPEWIRE=1
+PRESERVE_PIPEWIRE=0
 INSTALL_GUI=1
 USER_AUDIO_WAS_STOPPED=0
 USER_AUDIO_UNITS=()
@@ -68,7 +69,8 @@ wait_for_socket() {
 }
 
 stop_user_audio() {
-    if [[ -n "$DESTDIR" || "$EUID" -eq 0 || "$NO_START" -eq 1 || "$INSTALL_PIPEWIRE" -eq 0 ]]; then
+    if [[ -n "$DESTDIR" || "$EUID" -eq 0 || "$NO_START" -eq 1 \
+        || "$INSTALL_PIPEWIRE" -eq 0 || "$PRESERVE_PIPEWIRE" -eq 1 ]]; then
         return
     fi
     command -v systemctl >/dev/null 2>&1 || return
@@ -136,6 +138,7 @@ Options:
   --replace-profile         Replace existing device profile
   --no-start                Enable service without starting it
   --no-pipewire             Skip PipeWire adapter configuration
+  --preserve-pipewire       Keep PipeWire files and user services untouched
   --no-gui                  Skip Qt control panel and privileged helper
   -h, --help                Show this help
 
@@ -190,6 +193,10 @@ while (($# > 0)); do
             INSTALL_PIPEWIRE=0
             shift
             ;;
+        --preserve-pipewire)
+            PRESERVE_PIPEWIRE=1
+            shift
+            ;;
         --no-gui)
             INSTALL_GUI=0
             shift
@@ -208,6 +215,8 @@ done
 [[ "$SOCKET_PATH" == /* ]] || die "socket path must be absolute"
 [[ "$DESTDIR" == /* || -z "$DESTDIR" ]] || die "DESTDIR must be absolute"
 [[ "$ALSA_PLUGIN_DIR" == /* || -z "$ALSA_PLUGIN_DIR" ]] || die "ALSA plugin path must be absolute"
+((INSTALL_PIPEWIRE == 1 || PRESERVE_PIPEWIRE == 0)) || \
+    die "--no-pipewire and --preserve-pipewire are mutually exclusive"
 
 if [[ "$DESTDIR" == "/" ]]; then
     DESTDIR=
@@ -243,9 +252,9 @@ destination() {
 }
 
 file_hash() {
-    local hash
-    read -r hash _ < <(sha256sum "$1")
-    printf '%s\n' "$hash"
+    local output
+    output="$(sha256sum -- "$1")" || return
+    printf '%s\n' "${output%% *}"
 }
 
 SUDO_READY=0
@@ -373,6 +382,7 @@ if ((INSTALL_GUI == 0)); then
 fi
 
 MANAGED_PATHS=()
+PRESERVED_MANAGED_PATHS=()
 for binary in "${BINARIES[@]}"; do
     MANAGED_PATHS+=("$PREFIX/bin/$binary")
 done
@@ -388,6 +398,13 @@ if ((INSTALL_PIPEWIRE == 1)); then
         "$PIPEWIRE_PULSE_CONFIG_PATH"
         "$WIREPLUMBER_CONFIG_PATH"
     )
+    if ((PRESERVE_PIPEWIRE == 1)); then
+        PRESERVED_MANAGED_PATHS+=(
+            "$PIPEWIRE_CONFIG_PATH"
+            "$PIPEWIRE_PULSE_CONFIG_PATH"
+            "$WIREPLUMBER_CONFIG_PATH"
+        )
+    fi
 fi
 for doc in "$ROOT"/docs/*.md; do
     MANAGED_PATHS+=("$DOC_PREFIX/$(basename -- "$doc")")
@@ -420,7 +437,18 @@ if [[ -f "$MANIFEST_ACTUAL" ]]; then
     done < "$MANIFEST_ACTUAL"
 fi
 
+declare -A PRESERVED_PATHS=()
+for path in "${PRESERVED_MANAGED_PATHS[@]}"; do
+    actual="$(destination "$path")"
+    [[ -n "${OLD_HASHES[$path]+owned}" ]] || \
+        die "cannot preserve installer-unmanaged PipeWire file: $actual"
+    [[ -f "$actual" && -r "$actual" ]] || \
+        die "cannot preserve missing or unreadable PipeWire file: $actual"
+    PRESERVED_PATHS["$path"]=1
+done
+
 for path in "${MANAGED_PATHS[@]}"; do
+    [[ -z "${PRESERVED_PATHS[$path]+preserved}" ]] || continue
     actual="$(destination "$path")"
     if [[ -e "$actual" && -z "${OLD_HASHES[$path]+owned}" && $FORCE -eq 0 ]]; then
         die "refusing to replace unmanaged file: $actual (use --force)"
@@ -522,7 +550,7 @@ sed \
     "$ROOT/packaging/sidealsad.service.in" > "$service_temp"
 run_privileged install -D -m 0644 "$service_temp" "$(destination "$SERVICE_PATH")"
 
-if ((INSTALL_PIPEWIRE == 1)); then
+if ((INSTALL_PIPEWIRE == 1 && PRESERVE_PIPEWIRE == 0)); then
     install_managed_copy \
         "$ROOT/configs/pipewire/pipewire.conf.d/sidealsa.conf" \
         "$PIPEWIRE_CONFIG_PATH" \
@@ -552,7 +580,12 @@ manifest_temp="$TMP_DIR/install-manifest"
 {
     printf '# SideALSA install manifest v1\n'
     for path in "${MANAGED_PATHS[@]}"; do
-        printf '%s\t%s\n' "$(file_hash "$(destination "$path")")" "$path"
+        if [[ -n "${PRESERVED_PATHS[$path]+preserved}" ]]; then
+            hash="${OLD_HASHES[$path]}"
+        else
+            hash="$(file_hash "$(destination "$path")")"
+        fi
+        printf '%s\t%s\n' "$hash" "$path"
     done
 } > "$manifest_temp"
 run_privileged install -D -m 0644 "$manifest_temp" "$(destination "$MANIFEST_PATH")"
@@ -577,7 +610,7 @@ if [[ -z "$DESTDIR" ]]; then
     else
         warn "systemctl not found; start sidealsad.service manually"
     fi
-    if ((INSTALL_PIPEWIRE == 1)); then
+    if ((INSTALL_PIPEWIRE == 1 && PRESERVE_PIPEWIRE == 0)); then
         info "start/restart user PipeWire session and PulseAudio compatibility:"
         info "  systemctl --user enable --now pipewire.socket pipewire-pulse.socket"
         info "  systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service"

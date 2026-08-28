@@ -31,6 +31,7 @@ pub const ASIOST_FLOAT32_LSB: c_int = 19;
 const ASIO_MESSAGE_RESET_REQUEST: c_int = 3;
 const ASIO_MESSAGE_RESYNC_REQUEST: c_int = 5;
 pub const ASIO_MESSAGE_SUPPORTS_TIME_INFO: c_int = 7;
+const WORKER_POLL_HEARTBEAT_MS: c_int = 100;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -578,7 +579,9 @@ impl AsioDriver {
             let generation = gate.set_running(true);
             inner.state = DriverState::Running;
             drop(inner);
-            if let Err(error) = wait_for_acknowledgement(&gate, generation, self.control_timeout) {
+            if let Err(error) =
+                wait_for_acknowledgement(&gate, generation, true, self.control_timeout)
+            {
                 self.cancel_failed_start(&gate);
                 return self.complete_worker_wait(error);
             }
@@ -652,7 +655,7 @@ impl AsioDriver {
         inner.state = DriverState::Running;
         unsafe { &*context }.ready.store(true, Ordering::Release);
         drop(inner);
-        if let Err(error) = wait_for_acknowledgement(&start_gate, 0, self.control_timeout) {
+        if let Err(error) = wait_for_acknowledgement(&start_gate, 0, true, self.control_timeout) {
             self.cancel_failed_start(&start_gate);
             return self.complete_worker_wait(error);
         }
@@ -797,7 +800,7 @@ impl AsioDriver {
             };
             (gate, generation)
         };
-        wait_for_acknowledgement(&gate, generation, self.control_timeout)?;
+        wait_for_acknowledgement(&gate, generation, false, self.control_timeout)?;
         let mut inner = self.lock()?;
         if inner.state == DriverState::Stopping && inner.quiesce_generation == Some(generation) {
             inner.quiesce_generation = None;
@@ -1124,7 +1127,8 @@ impl HostBuffers {
 struct WorkerGate {
     fd: RawFd,
     command: AtomicU64,
-    acknowledged: AtomicU64,
+    running_acknowledged: AtomicU64,
+    stopped_acknowledged: AtomicU64,
     failure: AtomicU64,
     alive: AtomicBool,
 }
@@ -1140,7 +1144,8 @@ impl WorkerGate {
         Ok(Self {
             fd,
             command: AtomicU64::new(u64::from(running)),
-            acknowledged: AtomicU64::new(u64::MAX),
+            running_acknowledged: AtomicU64::new(u64::MAX),
+            stopped_acknowledged: AtomicU64::new(u64::MAX),
             failure: AtomicU64::new(0),
             alive: AtomicBool::new(true),
         })
@@ -1174,8 +1179,22 @@ impl WorkerGate {
         (command >> 1, command & 1 != 0)
     }
 
-    fn acknowledge(&self, generation: u64) {
-        self.acknowledged.store(generation, Ordering::Release);
+    fn acknowledge(&self, generation: u64, running: bool) {
+        let acknowledged = if running {
+            &self.running_acknowledged
+        } else {
+            &self.stopped_acknowledged
+        };
+        acknowledged.store(generation, Ordering::Release);
+    }
+
+    fn acknowledged(&self, running: bool) -> u64 {
+        let acknowledged = if running {
+            &self.running_acknowledged
+        } else {
+            &self.stopped_acknowledged
+        };
+        acknowledged.load(Ordering::Acquire)
     }
 
     fn is_alive(&self) -> bool {
@@ -1229,12 +1248,13 @@ impl Drop for WorkerGate {
 fn wait_for_acknowledgement(
     gate: &WorkerGate,
     generation: u64,
+    running: bool,
     timeout: Duration,
 ) -> Result<(), AsioError> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .unwrap_or_else(Instant::now);
-    while gate.acknowledged.load(Ordering::Acquire) != generation {
+    while gate.acknowledged(running) != generation {
         if let Some(failure) = gate.failure() {
             return Err(failure.error());
         }
@@ -1245,6 +1265,12 @@ fn wait_for_acknowledgement(
             return Err(AsioError::WorkerTimeout);
         }
         thread::sleep(Duration::from_micros(50));
+    }
+    if let Some(failure) = gate.failure() {
+        return Err(failure.error());
+    }
+    if !gate.is_alive() {
+        return Err(AsioError::Worker);
     }
     Ok(())
 }
@@ -1314,30 +1340,33 @@ fn run_worker(stream: &mut AudioStream, input: &WorkerInput) -> Result<(), AsioE
         }
     };
     let result = match stream.start() {
-        Ok(()) => worker_loop(
-            stream,
-            audio_fd.as_raw_fd(),
-            control_fd.as_raw_fd(),
-            &input.stop,
-            &input.gate,
-            &input.buffers,
-            &input.active,
-            input.callbacks,
-            input.time_info,
-            input.rate,
-            input.period_frames,
-            &mut capture,
-            &mut playback,
-            &input.position,
-        ),
+        Ok(()) => catch_unwind(AssertUnwindSafe(|| {
+            worker_loop(
+                stream,
+                audio_fd.as_raw_fd(),
+                control_fd.as_raw_fd(),
+                &input.stop,
+                &input.gate,
+                &input.buffers,
+                &input.active,
+                input.callbacks,
+                input.time_info,
+                input.rate,
+                input.period_frames,
+                &mut capture,
+                &mut playback,
+                &input.position,
+            )
+        }))
+        .unwrap_or(Err(AsioError::Worker)),
         Err(error) => Err(error.into()),
     };
     drop(realtime);
-    let error = match result {
-        Ok(()) => stream.stop().err().map(AsioError::from),
-        Err(error) => Some(error),
-    };
-    error.map_or(Ok(()), Err)
+    let stop_result = stream.stop().map_err(AsioError::from);
+    match result {
+        Err(error) => Err(error),
+        Ok(()) => stop_result,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1362,6 +1391,27 @@ fn worker_loop(
     let mut run_generation = u64::MAX;
     let mut last_active_sequence = None;
     let mut stopping_after = None;
+    macro_rules! recover_discontinuity {
+        ($result:expr) => {
+            match $result.map_err(AsioError::from) {
+                Ok(value) => value,
+                Err(error) if is_recoverable_discontinuity(&error) => {
+                    recover_worker_discontinuity(
+                        stream,
+                        gate,
+                        callbacks,
+                        &mut run_generation,
+                        &mut buffer_index,
+                        &mut previous_sequence,
+                        &mut last_active_sequence,
+                        &mut stopping_after,
+                    )?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+    }
     while !stop.is_requested() {
         let _ = apply_gate_transition(
             gate,
@@ -1372,12 +1422,16 @@ fn worker_loop(
             &mut stopping_after,
         );
         let acquisition_generation = run_generation;
-        let sequence = match wait_worker_event(stream, audio_fd, control_fd, stop, gate)? {
+        let sequence = match recover_discontinuity!(wait_worker_event(
+            stream, audio_fd, control_fd, stop, gate
+        )) {
             WorkerEvent::Cycle(sequence) => sequence,
             WorkerEvent::Gate => continue,
             WorkerEvent::Stop => break,
         };
-        let Some(block_sequence) = stream.capture_buffer_for_sequence(sequence, capture)? else {
+        let Some(block_sequence) =
+            recover_discontinuity!(stream.capture_buffer_for_sequence(sequence, capture))
+        else {
             continue;
         };
         check_daemon_control(control_fd)?;
@@ -1391,17 +1445,17 @@ fn worker_loop(
         );
         if !running {
             playback.fill(0);
-            let _ = stream.submit_playback(block_sequence, playback)?;
+            let _ = recover_discontinuity!(stream.submit_playback(block_sequence, playback));
             if stopping_after
                 .is_some_and(|sequence| sequence_is_after(stream.playback_sequence(), sequence))
             {
-                gate.acknowledge(run_generation);
+                gate.acknowledge(run_generation, false);
             }
             continue;
         }
         if !acquired_block_is_current(acquisition_generation, run_generation) {
             playback.fill(0);
-            let _ = stream.submit_playback(block_sequence, playback)?;
+            let _ = recover_discontinuity!(stream.submit_playback(block_sequence, playback));
             continue;
         }
         let (next_buffer_index, samples) = match advance_asio_cycle(
@@ -1417,10 +1471,22 @@ fn worker_loop(
             } => (buffer_index, sample_position),
             CycleAdvance::Duplicate => {
                 playback.fill(0);
-                let _ = stream.submit_playback(block_sequence, playback)?;
+                let _ = recover_discontinuity!(stream.submit_playback(block_sequence, playback));
                 continue;
             }
-            CycleAdvance::Backward => return Err(AsioError::CaptureSequenceBackward),
+            CycleAdvance::Backward => {
+                recover_worker_discontinuity(
+                    stream,
+                    gate,
+                    callbacks,
+                    &mut run_generation,
+                    &mut buffer_index,
+                    &mut previous_sequence,
+                    &mut last_active_sequence,
+                    &mut stopping_after,
+                )?;
+                continue;
+            }
         };
         buffer_index = next_buffer_index;
         previous_sequence = Some(block_sequence);
@@ -1436,10 +1502,54 @@ fn worker_loop(
             / u64::from(rate);
         stream.record_callback_timing(callback_duration, period_nanos);
         copy_host_to_playback(buffers, active, buffer_index, playback, period_frames);
-        if !stream.submit_playback(block_sequence, playback)? {
+        if !recover_discontinuity!(stream.submit_playback(block_sequence, playback)) {
             continue;
         }
         last_active_sequence = Some(block_sequence);
+    }
+    Ok(())
+}
+
+fn is_recoverable_discontinuity(error: &AsioError) -> bool {
+    matches!(
+        error,
+        AsioError::Client(ClientError::CaptureDiscontinuity) | AsioError::CaptureSequenceBackward
+    )
+}
+
+trait WorkerStreamRecovery {
+    fn restart_after_discontinuity(&mut self) -> Result<(), AsioError>;
+}
+
+impl WorkerStreamRecovery for AudioStream {
+    fn restart_after_discontinuity(&mut self) -> Result<(), AsioError> {
+        self.prepare()?;
+        self.start()?;
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_worker_discontinuity<S: WorkerStreamRecovery>(
+    stream: &mut S,
+    gate: &WorkerGate,
+    callbacks: AsioCallbacks,
+    run_generation: &mut u64,
+    buffer_index: &mut usize,
+    previous_sequence: &mut Option<u64>,
+    last_active_sequence: &mut Option<u64>,
+    stopping_after: &mut Option<u64>,
+) -> Result<(), AsioError> {
+    stream.restart_after_discontinuity()?;
+    *buffer_index = 0;
+    *previous_sequence = None;
+    *last_active_sequence = None;
+    *stopping_after = None;
+    let (generation, running) = gate.command();
+    *run_generation = generation;
+    gate.acknowledge(generation, running);
+    if running {
+        notify_worker_failure(callbacks, WorkerFailure::CaptureDiscontinuity);
     }
     Ok(())
 }
@@ -1466,11 +1576,11 @@ fn apply_gate_transition(
         *previous_sequence = None;
         *last_active_sequence = None;
         *stopping_after = None;
-        gate.acknowledge(generation);
+        gate.acknowledge(generation, true);
     } else {
         *stopping_after = *last_active_sequence;
         if stopping_after.is_none() {
-            gate.acknowledge(generation);
+            gate.acknowledge(generation, false);
         }
     }
     running
@@ -1568,7 +1678,13 @@ fn wait_worker_event(
         for fd in &mut fds {
             fd.revents = 0;
         }
-        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        let result = unsafe {
+            libc::poll(
+                fds.as_mut_ptr(),
+                fds.len() as libc::nfds_t,
+                WORKER_POLL_HEARTBEAT_MS,
+            )
+        };
         if result < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::Interrupted {
@@ -2281,6 +2397,23 @@ mod tests {
 
     static FAILURE_NOTIFICATION: std::sync::atomic::AtomicI32 =
         std::sync::atomic::AtomicI32::new(0);
+    static FAILURE_NOTIFICATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[derive(Default)]
+    struct FakeRecoveryStream {
+        restarts: usize,
+        gate_transition: Option<(Arc<WorkerGate>, bool)>,
+    }
+
+    impl WorkerStreamRecovery for FakeRecoveryStream {
+        fn restart_after_discontinuity(&mut self) -> Result<(), AsioError> {
+            self.restarts += 1;
+            if let Some((gate, running)) = &self.gate_transition {
+                gate.set_running(*running);
+            }
+            Ok(())
+        }
+    }
 
     unsafe extern "C" fn unused_create(
         _context: *mut c_void,
@@ -2350,7 +2483,7 @@ mod tests {
             timeout,
         ));
         let gate = Arc::new(WorkerGate::new(true).expect("gate should open"));
-        gate.acknowledge(0);
+        gate.acknowledge(0, true);
         let buffers = Arc::new(HostBuffers::new(1, 1, 64).expect("buffers should allocate"));
         let weak_buffers = Arc::downgrade(&buffers);
         let mut inner = driver.inner.lock().expect("lock should work");
@@ -2469,22 +2602,180 @@ mod tests {
     fn worker_gate_quiesces_and_restarts_by_generation() {
         let gate = WorkerGate::new(true).expect("gate should open");
         assert_eq!(gate.command(), (0, true));
-        gate.acknowledge(0);
-        wait_for_acknowledgement(&gate, 0, Duration::from_millis(10))
+        gate.acknowledge(0, true);
+        wait_for_acknowledgement(&gate, 0, true, Duration::from_millis(10))
             .expect("start should be acknowledged");
 
         let stopped = gate.set_running(false);
         assert_eq!(gate.command(), (stopped, false));
-        gate.acknowledge(stopped);
-        wait_for_acknowledgement(&gate, stopped, Duration::from_millis(10))
+        gate.acknowledge(stopped, false);
+        wait_for_acknowledgement(&gate, stopped, false, Duration::from_millis(10))
             .expect("stop should be acknowledged");
 
         let restarted = gate.set_running(true);
         assert_eq!(gate.command(), (restarted, true));
         assert_ne!(stopped, restarted);
-        gate.acknowledge(restarted);
-        wait_for_acknowledgement(&gate, restarted, Duration::from_millis(10))
+        gate.acknowledge(restarted, true);
+        wait_for_acknowledgement(&gate, restarted, true, Duration::from_millis(10))
             .expect("restart should be acknowledged");
+    }
+
+    #[test]
+    fn worker_gate_keeps_start_acknowledgement_after_stop_acknowledgement() {
+        let gate = WorkerGate::new(true).expect("gate should open");
+        gate.acknowledge(0, true);
+        let stopped = gate.set_running(false);
+        gate.acknowledge(stopped, false);
+
+        wait_for_acknowledgement(&gate, 0, true, Duration::from_millis(10))
+            .expect("later stop acknowledgement must not hide start acknowledgement");
+    }
+
+    #[test]
+    fn worker_failure_after_acknowledgement_is_not_reported_as_success() {
+        let gate = WorkerGate::new(true).expect("gate should open");
+        gate.acknowledge(0, true);
+        gate.publish_failure(WorkerFailure::CaptureDiscontinuity);
+
+        assert!(matches!(
+            wait_for_acknowledgement(&gate, 0, true, Duration::from_millis(10)),
+            Err(AsioError::WorkerStopped(
+                "audio capture must be resynchronized"
+            ))
+        ));
+    }
+
+    #[test]
+    fn capture_discontinuities_are_recoverable_worker_events() {
+        assert!(is_recoverable_discontinuity(&AsioError::Client(
+            ClientError::CaptureDiscontinuity
+        )));
+        assert!(is_recoverable_discontinuity(
+            &AsioError::CaptureSequenceBackward
+        ));
+        assert!(!is_recoverable_discontinuity(
+            &AsioError::DaemonDisconnected
+        ));
+    }
+
+    #[test]
+    fn worker_recovery_restarts_stream_resets_cycle_and_requests_resync() {
+        let _notification_guard = FAILURE_NOTIFICATION_LOCK
+            .lock()
+            .expect("notification lock should work");
+        let gate = WorkerGate::new(true).expect("gate should open");
+        let mut stream = FakeRecoveryStream::default();
+        let callbacks = AsioCallbacks {
+            asio_message: Some(test_asio_message),
+            ..AsioCallbacks::default()
+        };
+        let mut run_generation = u64::MAX;
+        let mut buffer_index = 1;
+        let mut previous_sequence = Some(10);
+        let mut last_active_sequence = Some(10);
+        let mut stopping_after = Some(10);
+        FAILURE_NOTIFICATION.store(0, Ordering::Release);
+
+        recover_worker_discontinuity(
+            &mut stream,
+            &gate,
+            callbacks,
+            &mut run_generation,
+            &mut buffer_index,
+            &mut previous_sequence,
+            &mut last_active_sequence,
+            &mut stopping_after,
+        )
+        .expect("capture discontinuity should recover");
+
+        assert_eq!(stream.restarts, 1);
+        assert_eq!(run_generation, 0);
+        assert_eq!(buffer_index, 0);
+        assert_eq!(previous_sequence, None);
+        assert_eq!(last_active_sequence, None);
+        assert_eq!(stopping_after, None);
+        assert_eq!(
+            FAILURE_NOTIFICATION.load(Ordering::Acquire),
+            ASIO_MESSAGE_RESYNC_REQUEST
+        );
+        wait_for_acknowledgement(&gate, 0, true, Duration::from_millis(10))
+            .expect("recovered running generation should be acknowledged");
+        assert_eq!(gate.failure(), None);
+        assert!(gate.is_alive());
+    }
+
+    #[test]
+    fn worker_recovery_acknowledges_start_racing_a_stopped_stream() {
+        let _notification_guard = FAILURE_NOTIFICATION_LOCK
+            .lock()
+            .expect("notification lock should work");
+        let gate = Arc::new(WorkerGate::new(false).expect("gate should open"));
+        let mut stream = FakeRecoveryStream {
+            restarts: 0,
+            gate_transition: Some((Arc::clone(&gate), true)),
+        };
+        let callbacks = AsioCallbacks {
+            asio_message: Some(test_asio_message),
+            ..AsioCallbacks::default()
+        };
+        let mut run_generation = 0;
+        let mut buffer_index = 1;
+        let mut previous_sequence = Some(10);
+        let mut last_active_sequence = Some(10);
+        let mut stopping_after = Some(10);
+        FAILURE_NOTIFICATION.store(0, Ordering::Release);
+
+        recover_worker_discontinuity(
+            &mut stream,
+            &gate,
+            callbacks,
+            &mut run_generation,
+            &mut buffer_index,
+            &mut previous_sequence,
+            &mut last_active_sequence,
+            &mut stopping_after,
+        )
+        .expect("capture discontinuity should recover");
+
+        assert_eq!(gate.command(), (1, true));
+        wait_for_acknowledgement(&gate, 1, true, Duration::from_millis(10))
+            .expect("concurrent start should be acknowledged");
+        assert_eq!(run_generation, 1);
+        assert_eq!(
+            FAILURE_NOTIFICATION.load(Ordering::Acquire),
+            ASIO_MESSAGE_RESYNC_REQUEST
+        );
+    }
+
+    #[test]
+    fn worker_recovery_acknowledges_stop_racing_a_running_stream() {
+        let gate = Arc::new(WorkerGate::new(true).expect("gate should open"));
+        let mut stream = FakeRecoveryStream {
+            restarts: 0,
+            gate_transition: Some((Arc::clone(&gate), false)),
+        };
+        let mut run_generation = 0;
+        let mut buffer_index = 1;
+        let mut previous_sequence = Some(10);
+        let mut last_active_sequence = Some(10);
+        let mut stopping_after = Some(10);
+
+        recover_worker_discontinuity(
+            &mut stream,
+            &gate,
+            AsioCallbacks::default(),
+            &mut run_generation,
+            &mut buffer_index,
+            &mut previous_sequence,
+            &mut last_active_sequence,
+            &mut stopping_after,
+        )
+        .expect("capture discontinuity should recover");
+
+        assert_eq!(gate.command(), (1, false));
+        wait_for_acknowledgement(&gate, 1, false, Duration::from_millis(10))
+            .expect("concurrent stop should be acknowledged");
+        assert_eq!(run_generation, 1);
     }
 
     #[test]
@@ -2513,7 +2804,7 @@ mod tests {
         let (generation, running) = gate.command();
         assert!(!running);
 
-        gate.acknowledge(generation);
+        gate.acknowledge(generation, false);
         TEST_THREAD_ID.set(1);
         driver.stop().expect("external Stop should finalize");
         assert_eq!(
@@ -2684,6 +2975,9 @@ mod tests {
 
     #[test]
     fn worker_failure_requests_host_reset_or_resync() {
+        let _notification_guard = FAILURE_NOTIFICATION_LOCK
+            .lock()
+            .expect("notification lock should work");
         let callbacks = AsioCallbacks {
             buffer_switch: Some(test_buffer_switch),
             asio_message: Some(test_asio_message),

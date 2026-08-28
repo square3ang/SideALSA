@@ -178,6 +178,20 @@ fn main() {
     );
     println!("shared_underruns={}", stats.shared_underruns);
     println!("shared_overruns={}", stats.shared_overruns);
+    for port in &stats.shared_playback_ports {
+        println!(
+            "shared_playback_port={} underruns={} last_underrun_sequence={} last_underrun_nanos={} last_sequence_lag_periods={} max_sequence_lag_periods={} expired_playback_periods={} submit_failures={} xruns={}",
+            port.port_id,
+            port.underruns,
+            port.last_underrun_sequence,
+            port.last_underrun_nanos,
+            port.last_sequence_lag_periods,
+            port.max_sequence_lag_periods,
+            port.expired_playback_periods,
+            port.playback_submit_failures,
+            port.playback_xruns,
+        );
+    }
 }
 
 fn lock_process_memory() -> io::Result<()> {

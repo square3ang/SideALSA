@@ -22,8 +22,9 @@ extern int sidealsa_stream_prepare(sidealsa_stream_t *stream);
 extern int sidealsa_stream_set_nonblock(sidealsa_stream_t *stream, int nonblock);
 extern int sidealsa_stream_drain(sidealsa_stream_t *stream);
 extern ssize_t sidealsa_stream_transfer(sidealsa_stream_t *stream,
-                                        const snd_pcm_channel_area_t *areas,
-                                        size_t offset, size_t frames);
+					 const snd_pcm_channel_area_t *areas,
+					 size_t offset, size_t frames);
+extern void sidealsa_stream_record_playback_xrun(sidealsa_stream_t *stream);
 extern uint64_t sidealsa_stream_position(const sidealsa_stream_t *stream);
 extern int sidealsa_stream_close(sidealsa_stream_t *stream);
 
@@ -45,8 +46,11 @@ static void sidealsa_set_error_state(snd_pcm_ioplug_t *io, long result)
 {
 	if (result == -ENODEV)
 		snd_pcm_ioplug_set_state(io, SND_PCM_STATE_DISCONNECTED);
-	else if (result == -EPIPE)
+	else if (result == -EPIPE) {
+		sidealsa_pcm_t *pcm = io->private_data;
+		sidealsa_stream_record_playback_xrun(pcm->stream);
 		snd_pcm_ioplug_set_state(io, SND_PCM_STATE_XRUN);
+	}
 }
 
 static int sidealsa_sync_nonblock(snd_pcm_ioplug_t *io)
@@ -123,8 +127,10 @@ static snd_pcm_sframes_t sidealsa_pointer(snd_pcm_ioplug_t *io)
 		return 0;
 	snd_pcm_uframes_t hw_ptr = position % boundary;
 	if (io->state == SND_PCM_STATE_RUNNING &&
-	    snd_pcm_ioplug_avail(io, hw_ptr, io->appl_ptr) > io->buffer_size)
+	    snd_pcm_ioplug_avail(io, hw_ptr, io->appl_ptr) > io->buffer_size) {
+		sidealsa_stream_record_playback_xrun(pcm->stream);
 		return -EPIPE;
+	}
 	return (snd_pcm_sframes_t)hw_ptr;
 }
 

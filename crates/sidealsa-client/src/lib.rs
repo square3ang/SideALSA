@@ -282,6 +282,14 @@ impl AudioStream {
             .record_client_callback_timing(duration_nanos, period_nanos);
     }
 
+    pub fn record_expired_playback_periods(&self, periods: u64) {
+        self.region.record_client_expired_playback_periods(periods);
+    }
+
+    pub fn record_playback_xrun(&self) {
+        self.region.record_client_playback_xrun();
+    }
+
     pub fn start(&mut self) -> Result<(), ClientError> {
         self.ensure_open()?;
         if self.started {
@@ -1739,6 +1747,78 @@ mod tests {
             Err(ClientError::CaptureDiscontinuity)
         ));
         stream.closed = true;
+    }
+
+    #[test]
+    fn stream_can_stop_and_restart_after_hardware_generation_change() {
+        let server_region = SharedRegion::create(1, 0, 1).expect("region should create");
+        server_region.set_hardware_generation(4);
+        let client_fd = unsafe { libc::dup(server_region.fd()) };
+        assert!(client_fd >= 0);
+        let capture_fd = event_fd();
+        let signal_fd = unsafe { libc::dup(capture_fd) };
+        assert!(signal_fd >= 0);
+        let info = server_region.info();
+        let (mut peer, control) = UnixStream::pair().expect("socket pair should create");
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Shared(PortDirection::Capture),
+            info,
+            owned_fds([client_fd, capture_fd, event_fd(), event_fd()]),
+        )
+        .expect("stream should create");
+        stream.started = true;
+        server_region.set_hardware_generation(5);
+        let server = thread::spawn(move || {
+            assert_eq!(
+                sidealsa_protocol::read_request(&mut peer).expect("stop should arrive"),
+                Request::Stop { session_id: 9 }
+            );
+            sidealsa_protocol::write_response(&mut peer, &Response::Ack)
+                .expect("stop ack should write");
+            assert_eq!(
+                sidealsa_protocol::read_request(&mut peer).expect("restart should arrive"),
+                Request::Start { session_id: 9 }
+            );
+            server_region.set_lifecycle_generation(1);
+            sidealsa_protocol::write_response(&mut peer, &Response::Ack)
+                .expect("start ack should write");
+            let mut producer_index = 0;
+            assert!(server_region.try_publish_capture(&mut producer_index, 17, &[17]));
+            signal_event(signal_fd);
+            unsafe { libc::close(signal_fd) };
+            assert_eq!(
+                sidealsa_protocol::read_request(&mut peer).expect("final stop should arrive"),
+                Request::Stop { session_id: 9 }
+            );
+            sidealsa_protocol::write_response(&mut peer, &Response::Ack)
+                .expect("final stop ack should write");
+        });
+
+        assert!(matches!(
+            stream.wait_period(Duration::ZERO),
+            Err(ClientError::CaptureDiscontinuity)
+        ));
+        stream.prepare().expect("stream should prepare again");
+        stream.start().expect("stream should restart");
+        assert_eq!(
+            stream
+                .wait_period(Duration::from_millis(100))
+                .expect("capture should resume"),
+            17
+        );
+        let mut capture = [0];
+        assert_eq!(
+            stream
+                .capture_buffer_for_sequence(17, &mut capture)
+                .expect("capture should read after restart"),
+            Some(17)
+        );
+        assert_eq!(capture, [17]);
+        stream.stop().expect("stream should stop");
+        stream.closed = true;
+        server.join().expect("server should not panic");
     }
 
     #[test]

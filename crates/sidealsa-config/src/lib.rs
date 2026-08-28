@@ -49,6 +49,8 @@ pub struct HardwareConfig {
     pub pro_realtime_priority: Option<u32>,
     #[serde(default = "default_shared_latency_periods")]
     pub shared_latency_periods: u32,
+    #[serde(default)]
+    pub shared_playback_repeat_on_underrun: bool,
     #[serde(default = "default_realtime")]
     pub realtime: bool,
     #[serde(default = "default_realtime_priority")]
@@ -73,6 +75,7 @@ pub struct TimingSettings {
     pub pro_handoff_us: u32,
     pub pro_realtime_priority: Option<u32>,
     pub shared_latency_periods: u32,
+    pub shared_playback_repeat_on_underrun: bool,
     pub realtime: bool,
     pub realtime_priority: u32,
 }
@@ -230,6 +233,7 @@ impl From<&HardwareConfig> for TimingSettings {
             pro_handoff_us: config.pro_handoff_us,
             pro_realtime_priority: config.pro_realtime_priority,
             shared_latency_periods: config.shared_latency_periods,
+            shared_playback_repeat_on_underrun: config.shared_playback_repeat_on_underrun,
             realtime: config.realtime,
             realtime_priority: config.realtime_priority,
         }
@@ -252,6 +256,7 @@ impl TimingSettings {
         config.pro_handoff_us = self.pro_handoff_us;
         config.pro_realtime_priority = self.pro_realtime_priority;
         config.shared_latency_periods = self.shared_latency_periods;
+        config.shared_playback_repeat_on_underrun = self.shared_playback_repeat_on_underrun;
         config.realtime = self.realtime;
         config.realtime_priority = self.realtime_priority;
     }
@@ -272,6 +277,7 @@ impl TimingSettings {
         hash_u32(&mut hash, self.pro_handoff_us);
         hash_optional_u32(&mut hash, self.pro_realtime_priority);
         hash_u32(&mut hash, self.shared_latency_periods);
+        hash_bool(&mut hash, self.shared_playback_repeat_on_underrun);
         hash_bool(&mut hash, self.realtime);
         hash_u32(&mut hash, self.realtime_priority);
         hash
@@ -316,6 +322,11 @@ fn write_timing(device: &mut Table, timing: &TimingSettings) {
         device,
         "shared_latency_periods",
         timing.shared_latency_periods,
+    );
+    set_bool(
+        device,
+        "shared_playback_repeat_on_underrun",
+        timing.shared_playback_repeat_on_underrun,
     );
     set_bool(device, "realtime", timing.realtime);
     set_u32(device, "realtime_priority", timing.realtime_priority);
@@ -792,6 +803,7 @@ mod tests {
         pro_latency_periods = 1
         pro_realtime_priority = 15
         shared_latency_periods = 4
+        shared_playback_repeat_on_underrun = true
         realtime = true
         realtime_priority = 50
 
@@ -844,6 +856,7 @@ mod tests {
         assert_eq!(profile.device.effective_linked_playback_guard_frames(), 32);
         assert_eq!(profile.device.linked_phase_max_attempts, 0);
         assert_eq!(profile.device.shared_latency_periods, 4);
+        assert!(profile.device.shared_playback_repeat_on_underrun);
         assert!(profile.device.realtime);
         assert_eq!(profile.device.realtime_priority, 50);
         assert_eq!(profile.ports.playback.len(), 2);
@@ -865,6 +878,7 @@ mod tests {
         assert_eq!(profile.device.linked_phase_max_attempts, 8);
         assert_eq!(profile.device.effective_shared_buffer_size(), 512);
         assert_eq!(profile.device.shared_latency_periods, 7);
+        assert!(profile.device.shared_playback_repeat_on_underrun);
     }
 
     #[test]
@@ -1241,6 +1255,7 @@ mod tests {
             .replace("playback_timer_scheduling = true\n", "")
             .replace("duplex_link = true\n", "")
             .replace("shared_latency_periods = 4\n", "")
+            .replace("shared_playback_repeat_on_underrun = true\n", "")
             .replace("realtime = true\n", "")
             .replace("realtime_priority = 50\n", "");
         let profile = Profile::from_toml(&text).expect("profile should parse");
@@ -1253,6 +1268,7 @@ mod tests {
         assert_eq!(profile.device.duplex_link, None);
         assert!(profile.device.effective_duplex_link());
         assert_eq!(profile.device.shared_latency_periods, 4);
+        assert!(!profile.device.shared_playback_repeat_on_underrun);
         assert!(profile.device.realtime);
         assert_eq!(profile.device.realtime_priority, 50);
     }
@@ -1437,6 +1453,7 @@ mod tests {
         timing.shared_buffer_size = Some(128);
         timing.linked_playback_guard_frames = Some(16);
         timing.pro_realtime_priority = Some(30);
+        timing.shared_playback_repeat_on_underrun = false;
 
         document
             .apply_timing(&timing)
@@ -1449,6 +1466,7 @@ mod tests {
         assert_eq!(document.profile().device.rate, 44_100);
         assert_eq!(document.profile().device.hardware_period_size, Some(16));
         assert_eq!(document.profile().device.shared_buffer_size, Some(128));
+        assert!(!document.profile().device.shared_playback_repeat_on_underrun);
         assert_eq!(
             document.profile().device.linked_playback_guard_frames,
             Some(16)
@@ -1500,6 +1518,10 @@ mod tests {
 
         changed = timing.clone();
         changed.duplex_link = None;
+        assert_ne!(timing.fingerprint(), changed.fingerprint());
+
+        changed = timing.clone();
+        changed.shared_playback_repeat_on_underrun = false;
         assert_ne!(timing.fingerprint(), changed.fingerprint());
     }
 

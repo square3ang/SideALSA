@@ -6,14 +6,14 @@ use std::{
 
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 14;
+pub const PROTOCOL_VERSION: u16 = 15;
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"SALS";
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 pub const FEATURE_PRO: u32 = 1 << 0;
 pub const FEATURE_SHARED: u32 = 1 << 1;
 
 pub const SHARED_MAGIC: u32 = u32::from_le_bytes(*b"SASH");
-pub const SHARED_VERSION: u16 = 8;
+pub const SHARED_VERSION: u16 = 9;
 pub const SHARED_SLOT_COUNT: u32 = 8;
 pub const SHARED_SLOT_FREE: u32 = 0;
 pub const SHARED_SLOT_READY: u32 = 1;
@@ -110,7 +110,7 @@ impl TryFrom<u8> for PortDirection {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     pub generation: u64,
     pub sample_position: u64,
@@ -159,6 +159,20 @@ pub struct Stats {
     pub shared_overruns: u64,
     pub timeline_resets: u64,
     pub periods_processed: u64,
+    pub shared_playback_ports: Vec<SharedPlaybackPortStats>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SharedPlaybackPortStats {
+    pub port_id: String,
+    pub underruns: u64,
+    pub last_underrun_sequence: u64,
+    pub last_underrun_nanos: u64,
+    pub last_sequence_lag_periods: u64,
+    pub max_sequence_lag_periods: u64,
+    pub expired_playback_periods: u64,
+    pub playback_submit_failures: u64,
+    pub playback_xruns: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -469,7 +483,7 @@ fn encode_response_payload(response: &Response) -> Result<(ResponseCode, Vec<u8>
         Response::Busy => ResponseCode::Busy,
         Response::Unsupported => ResponseCode::Unsupported,
         Response::Stats(stats) => {
-            encode_stats(&mut payload, stats);
+            encode_stats(&mut payload, stats)?;
             ResponseCode::Stats
         }
         Response::Error { code, message } => {
@@ -605,7 +619,7 @@ fn decode_shared_info(decoder: &mut Decoder<'_>) -> Result<SharedRegionInfo, Pro
     })
 }
 
-fn encode_stats(payload: &mut Vec<u8>, stats: &Stats) {
+fn encode_stats(payload: &mut Vec<u8>, stats: &Stats) -> Result<(), ProtocolError> {
     for value in [
         stats.generation,
         stats.sample_position,
@@ -657,10 +671,29 @@ fn encode_stats(payload: &mut Vec<u8>, stats: &Stats) {
     ] {
         put_u64(payload, value);
     }
+    let count = u16::try_from(stats.shared_playback_ports.len())
+        .map_err(|_| ProtocolError::TooManyItems)?;
+    put_u16(payload, count);
+    for port in &stats.shared_playback_ports {
+        put_string(payload, &port.port_id)?;
+        for value in [
+            port.underruns,
+            port.last_underrun_sequence,
+            port.last_underrun_nanos,
+            port.last_sequence_lag_periods,
+            port.max_sequence_lag_periods,
+            port.expired_playback_periods,
+            port.playback_submit_failures,
+            port.playback_xruns,
+        ] {
+            put_u64(payload, value);
+        }
+    }
+    Ok(())
 }
 
 fn decode_stats(decoder: &mut Decoder<'_>) -> Result<Stats, ProtocolError> {
-    Ok(Stats {
+    let mut stats = Stats {
         generation: decoder.u64()?,
         sample_position: decoder.u64()?,
         playback_position: decoder.u64()?,
@@ -708,7 +741,24 @@ fn decode_stats(decoder: &mut Decoder<'_>) -> Result<Stats, ProtocolError> {
         shared_overruns: decoder.u64()?,
         timeline_resets: decoder.u64()?,
         periods_processed: decoder.u64()?,
-    })
+        shared_playback_ports: Vec::new(),
+    };
+    let port_count = decoder.u16()? as usize;
+    stats.shared_playback_ports.reserve(port_count);
+    for _ in 0..port_count {
+        stats.shared_playback_ports.push(SharedPlaybackPortStats {
+            port_id: decoder.string()?,
+            underruns: decoder.u64()?,
+            last_underrun_sequence: decoder.u64()?,
+            last_underrun_nanos: decoder.u64()?,
+            last_sequence_lag_periods: decoder.u64()?,
+            max_sequence_lag_periods: decoder.u64()?,
+            expired_playback_periods: decoder.u64()?,
+            playback_submit_failures: decoder.u64()?,
+            playback_xruns: decoder.u64()?,
+        });
+    }
+    Ok(stats)
 }
 
 fn put_u16(payload: &mut Vec<u8>, value: u16) {
@@ -823,7 +873,10 @@ pub struct SharedRegionHeader {
     pub start_sequence: AtomicU64,
     pub capture_discontinuities: AtomicU64,
     pub client_expired_capture_blocks: AtomicU64,
+    pub client_expired_playback_periods: AtomicU64,
     pub client_playback_submit_failures: AtomicU64,
+    pub client_playback_xruns: AtomicU64,
+    pub client_playback_sequence: AtomicU64,
     pub client_realtime_failures: AtomicU64,
     pub client_callback_overruns: AtomicU64,
     pub client_callback_max_nanos: AtomicU64,
@@ -853,7 +906,10 @@ impl SharedRegionHeader {
             start_sequence: AtomicU64::new(0),
             capture_discontinuities: AtomicU64::new(0),
             client_expired_capture_blocks: AtomicU64::new(0),
+            client_expired_playback_periods: AtomicU64::new(0),
             client_playback_submit_failures: AtomicU64::new(0),
+            client_playback_xruns: AtomicU64::new(0),
+            client_playback_sequence: AtomicU64::new(0),
             client_realtime_failures: AtomicU64::new(0),
             client_callback_overruns: AtomicU64::new(0),
             client_callback_max_nanos: AtomicU64::new(0),
@@ -1071,6 +1127,17 @@ mod tests {
             shared_overruns: 15,
             timeline_resets: 16,
             periods_processed: 17,
+            shared_playback_ports: vec![SharedPlaybackPortStats {
+                port_id: "line1".into(),
+                underruns: 18,
+                last_underrun_sequence: 19,
+                last_underrun_nanos: 20,
+                last_sequence_lag_periods: 21,
+                max_sequence_lag_periods: 22,
+                expired_playback_periods: 23,
+                playback_submit_failures: 24,
+                playback_xruns: 25,
+            }],
         }));
         let bytes = encode_response(&response).expect("response should encode");
         let decoded = decode_response(&bytes).expect("response should decode");

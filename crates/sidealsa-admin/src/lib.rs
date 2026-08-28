@@ -311,6 +311,9 @@ pub fn parse_timing_assignments(
                 timing.pro_realtime_priority = parse_optional_u32(key, value)?
             }
             "shared_latency_periods" => timing.shared_latency_periods = parse_u32(key, value)?,
+            "shared_playback_repeat_on_underrun" => {
+                timing.shared_playback_repeat_on_underrun = parse_bool(key, value)?
+            }
             "realtime" => timing.realtime = parse_bool(key, value)?,
             "realtime_priority" => timing.realtime_priority = parse_u32(key, value)?,
             _ => {
@@ -581,6 +584,11 @@ fn push_timing(output: &mut String, timing: &TimingSettings) {
         "shared_latency_periods",
         &timing.shared_latency_periods.to_string(),
     );
+    push_setting(
+        output,
+        "shared_playback_repeat_on_underrun",
+        bool_text(timing.shared_playback_repeat_on_underrun),
+    );
     push_setting(output, "realtime", bool_text(timing.realtime));
     push_setting(
         output,
@@ -696,6 +704,7 @@ mod tests {
             "pro_handoff_us=500".into(),
             "pro_realtime_priority=40".into(),
             "shared_latency_periods=4".into(),
+            "shared_playback_repeat_on_underrun=false".into(),
             "realtime=false".into(),
             "realtime_priority=60".into(),
         ];
@@ -709,6 +718,7 @@ mod tests {
         assert_eq!(timing.duplex_link, None);
         assert_eq!(timing.linked_playback_guard_frames, None);
         assert!(!timing.playback_timer_scheduling);
+        assert!(!timing.shared_playback_repeat_on_underrun);
         assert!(!timing.realtime);
     }
 

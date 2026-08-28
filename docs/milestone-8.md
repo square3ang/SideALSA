@@ -41,8 +41,10 @@ or PRO timing.
 
 If a PipeWire callback is late, the ioplug uses all queued catch-up periods. If
 no catch-up block exists, it leaves one explicit sequence gap and immediately
-realigns later blocks to the seven-period target. The daemon substitutes silence
-for that one gap; lateness does not permanently reduce SHARED lookahead.
+realigns later blocks to the seven-period target. The reference profile repeats
+that port's last valid logical Q64 block until the next exact block arrives.
+Profiles that disable repeat concealment substitute silence instead. Neither
+fallback permanently reduces SHARED lookahead or changes the hardware timeline.
 
 Capture notifications are level-triggered through eventfd. The client drains a
 coalesced notification whenever it accepts a ready slot, scans past free ring

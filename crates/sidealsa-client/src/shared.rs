@@ -219,10 +219,38 @@ impl SharedRegion {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn client_expired_playback_periods(&self) -> u64 {
+        self.header()
+            .client_expired_playback_periods
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn record_client_expired_playback_periods(&self, periods: u64) {
+        self.header()
+            .client_expired_playback_periods
+            .fetch_add(periods, Ordering::Relaxed);
+    }
+
     pub fn client_playback_submit_failures(&self) -> u64 {
         self.header()
             .client_playback_submit_failures
             .load(Ordering::Relaxed)
+    }
+
+    pub fn record_client_playback_xrun(&self) {
+        self.header()
+            .client_playback_xruns
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn client_playback_xruns(&self) -> u64 {
+        self.header().client_playback_xruns.load(Ordering::Relaxed)
+    }
+
+    pub fn client_playback_sequence(&self) -> u64 {
+        self.header()
+            .client_playback_sequence
+            .load(Ordering::Acquire)
     }
 
     pub fn record_client_realtime_failure(&self) {
@@ -459,6 +487,11 @@ impl SharedRegion {
             };
             slot.published_nanos
                 .store(published_nanos, Ordering::Relaxed);
+            if timestamp_publication {
+                self.header()
+                    .client_playback_sequence
+                    .store(sequence, Ordering::Release);
+            }
             slot.state.store(SHARED_SLOT_READY, Ordering::Release);
             *producer_index = next_index(index, slot_count);
             return true;
@@ -1128,6 +1161,8 @@ mod tests {
         region.record_client_realtime_failure();
         region.record_client_callback_timing(500, 1_000);
         region.record_client_callback_timing(1_500, 1_000);
+        region.record_client_expired_playback_periods(3);
+        region.record_client_playback_xrun();
         region.record_capture_discontinuity();
 
         let mut producer_index = 0;
@@ -1145,6 +1180,22 @@ mod tests {
         assert_eq!(region.client_callback_overruns(), 1);
         assert_eq!(region.client_callback_max_nanos(), 1_500);
         assert_eq!(region.capture_discontinuities(), 1);
+        assert_eq!(region.client_expired_playback_periods(), 3);
         assert_eq!(region.client_playback_submit_failures(), 1);
+        assert_eq!(region.client_playback_xruns(), 1);
+        assert_eq!(region.client_playback_sequence(), 7);
+    }
+
+    #[test]
+    fn playback_sequence_tracker_follows_wrapping_publications() {
+        let region = SharedRegion::create(1, 1, 0).expect("region should create");
+        let mut producer_index = 0;
+        let mut samples = [0];
+
+        assert!(region.try_client_publish_playback(&mut producer_index, u64::MAX, &[1]));
+        assert_eq!(region.client_playback_sequence(), u64::MAX);
+        assert!(region.try_consume_playback(u64::MAX, &mut samples));
+        assert!(region.try_client_publish_playback(&mut producer_index, 0, &[2]));
+        assert_eq!(region.client_playback_sequence(), 0);
     }
 }

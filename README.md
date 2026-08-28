@@ -8,15 +8,16 @@ physical USB audio device and exposes two independent client paths:
 - **PRO**: exclusive, low-latency, complete physical channel layout.
 - **SHARED**: buffered logical ports for PipeWire and desktop applications.
 
-The hardware timeline keeps running when a client misses a deadline. A client
-miss becomes silence and a diagnostic counter, not an ALSA restart.
+The hardware timeline keeps running when a client misses a deadline. A PRO miss
+becomes silence, while a SHARED playback miss uses the profile-selected silence
+or repeat-last-block fallback. Both remain diagnostic events, not ALSA restarts.
 
 Initial reference device: **Topping E1x2 OTG**.
 
 | Path | Purpose | Failure behavior |
 | --- | --- | --- |
 | **PRO** | Exclusive DAW, native ALSA, and Wine/Proton ASIO | A missed exact-sequence block becomes silence |
-| **SHARED** | PipeWire and desktop logical ports | Each late client is isolated and buffered |
+| **SHARED** | PipeWire and desktop logical ports | Each late client is isolated; fallback is configurable |
 | **Hardware** | One continuous duplex ALSA timeline | Only a real ALSA failure triggers XRUN recovery |
 
 Current profile: `48 kHz`, `S32_LE`, `64`-frame client periods, `32`-frame
@@ -114,8 +115,9 @@ installs preserve `/etc/sidealsa/profiles/*.toml`, including with `--force`.
 After reviewing local changes, use `--replace-profile` to adopt a new reference
 profile. The current Q64/Q32 reference uses
 `linked_playback_guard_frames = 32`, `linked_phase_max_attempts = 8`, and
-`pro_latency_periods = 0`. It qualifies one second of linked silence before the
-daemon exposes its control socket.
+`pro_latency_periods = 0`. It also enables
+`shared_playback_repeat_on_underrun = true`. The daemon qualifies one second of
+linked silence before exposing its control socket.
 
 Use `--no-gui` when Qt or polkit integration is not wanted. The privileged
 helper is always installed at `/usr/libexec/sidealsa-admin`, outside a custom
@@ -177,7 +179,12 @@ sidealsa-control
 The Qt control panel edits the complete hardware timing set: sample rate,
 logical and physical periods, hardware and SHARED buffers, playback queue,
 duplex/link controls, PRO and SHARED lead, handoff budget, and realtime
-priorities.
+priorities. Buffer, duplex, and scheduling settings use separate tabs while the
+daemon state and actions remain visible in a fixed footer. Numeric fields use
+direct entry instead of detached step buttons, ignore accidental wheel changes
+until focused, and enable Apply only after a value changes or a daemon restart
+is required. Reloading or closing asks before discarding edits, and a failed
+apply keeps the pending values available for correction or retry.
 
 Apply is transactional:
 
@@ -242,7 +249,26 @@ Expected hardware counters stay at zero. Shared startup is armed by its first
 consumed block, so startup silence does not count as an underrun. The first
 missing block after arming increments `shared_underruns` and disarms that
 episode; the next valid block rearms it. A paused client therefore does not add
-one underrun per hardware period.
+one underrun per hardware period. With
+`shared_playback_repeat_on_underrun = true`, the daemon keeps mixing that port's
+last valid logical block until a new exact block arrives. With the setting
+omitted or `false`, its missing contribution is silence. Stop, close, restart,
+and hardware-generation changes invalidate the cache. Long outages can produce
+a repeating tone when concealment is enabled. `sidealsa-stats` also reports
+persistent diagnostics for each SHARED playback port:
+
+- `underruns` identifies the affected port and records the last missing
+  sequence, monotonic timestamp, and current/maximum sequence lag.
+- `expired_playback_periods` counts stale client periods discarded by the ALSA
+  ioplug. SHARED playback realigns after discarding them instead of forcing an
+  ALSA XRUN; PRO keeps its strict `EPIPE` behavior.
+- `submit_failures` counts publications rejected because no shared-memory slot
+  was available.
+- `xruns` counts SHARED playback `EPIPE` results that reached the ALSA plugin,
+  including pointer drift and genuine stream discontinuities.
+
+These per-port counters survive client close and reopen for the lifetime of the
+daemon. They reset when `sidealsad` restarts.
 
 ### osu! Exclusive ALSA
 
@@ -303,7 +329,9 @@ Artifacts:
 build-asio/sidealsa-asio64.dll
 build-asio/sidealsa-asio64.dll.so
 build-asio/sidealsa-asio-probe.exe
+build-asio/sidealsa-asio-probe.exe.so
 build-asio/sidealsa-asio-loopback-test.exe
+build-asio/sidealsa-asio-loopback-test.exe.so
 ```
 
 The runtime layout also provides Wine 10+ `sidealsa-asio.dll` aliases.
@@ -417,8 +445,12 @@ Run the built probe against the running daemon:
 SIDEALSA_SOCKET=/tmp/sidealsad.sock \
 WINEDLLPATH="$HOME/.local/lib/wine" \
 WINEPREFIX="$HOME/.wine" \
-WINELOADER=wine build-asio/sidealsa-asio-probe.exe
+wine build-asio/sidealsa-asio-probe.exe.so
 ```
+
+Run the `.exe.so` host directly through Wine. The generated `.exe` wrapper
+prepends its invocation directory to `WINEDLLPATH`; invoking that wrapper by a
+relative path can make COM lookup fail on current Wine releases.
 
 The probe checks COM activation, channel counts, `64`-frame buffer negotiation,
 64-frame output latency, sample rate, buffer pointers, callback quiescence after
@@ -428,8 +460,8 @@ With playback channel 0 physically looped to capture channel 4, run strict
 latency and abrupt-reacquisition checks:
 
 ```sh
-WINELOADER=wine WINEDLLPATH="$PWD/build-asio" \
-  build-asio/sidealsa-asio-loopback-test.exe
+WINEDLLPATH="$PWD/build-asio" wine \
+  build-asio/sidealsa-asio-loopback-test.exe.so
 scripts/test-asio-reacquire.sh
 ```
 

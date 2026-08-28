@@ -453,6 +453,7 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o
  /usr/include/qt6/QtGui/QFont
  /usr/include/qt6/QtGui/QRegularExpressionValidator
  /usr/include/qt6/QtGui/QTransform
+ /usr/include/qt6/QtGui/QWheelEvent
  /usr/include/qt6/QtGui/qaction.h
  /usr/include/qt6/QtGui/qbitmap.h
  /usr/include/qt6/QtGui/qbrush.h
@@ -496,12 +497,14 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o
  /usr/include/qt6/QtGui/qvector2d.h
  /usr/include/qt6/QtGui/qvectornd.h
  /usr/include/qt6/QtGui/qwindowdefs.h
+ /usr/include/qt6/QtWidgets/QAbstractSpinBox
  /usr/include/qt6/QtWidgets/QApplication
  /usr/include/qt6/QtWidgets/QCheckBox
  /usr/include/qt6/QtWidgets/QComboBox
  /usr/include/qt6/QtWidgets/QFormLayout
  /usr/include/qt6/QtWidgets/QFrame
  /usr/include/qt6/QtWidgets/QGridLayout
+ /usr/include/qt6/QtWidgets/QHBoxLayout
  /usr/include/qt6/QtWidgets/QLabel
  /usr/include/qt6/QtWidgets/QLayout
  /usr/include/qt6/QtWidgets/QLineEdit
@@ -511,6 +514,7 @@ CMakeFiles/sidealsa-control.dir/src/main.cpp.o
  /usr/include/qt6/QtWidgets/QScrollArea
  /usr/include/qt6/QtWidgets/QSpinBox
  /usr/include/qt6/QtWidgets/QStyle
+ /usr/include/qt6/QtWidgets/QTabWidget
  /usr/include/qt6/QtWidgets/QVBoxLayout
  /usr/include/qt6/QtWidgets/QWidget
  /usr/include/qt6/QtWidgets/qabstractbutton.h

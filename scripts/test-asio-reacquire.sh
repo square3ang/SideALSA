@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 BUILD_DIR="${SIDEALSA_ASIO_BUILD_DIR:-$ROOT/build-asio}"
-TEST="$BUILD_DIR/sidealsa-asio-loopback-test.exe"
+TEST="$BUILD_DIR/sidealsa-asio-loopback-test.exe.so"
 STATS="${SIDEALSA_STATS:-$ROOT/target/release/sidealsa-stats}"
 NATIVE_TEST="${SIDEALSA_LOOPBACK_TEST:-$ROOT/target/release/sidealsa-loopback-test}"
 NATIVE_RT_PRIORITY="${SIDEALSA_NATIVE_RT_PRIORITY:-46}"
@@ -121,7 +121,7 @@ fi
 set +e
 baseline_output="$(timeout --signal=KILL "${RUN_TIMEOUT}s" env \
     SIDEALSA_SOCKET="$SOCKET_PATH" SIDEALSA_ASIO_PROBE_MS="$RUN_MS" WINEDEBUG=-all \
-    WINELOADER="$WINE_COMMAND" WINEDLLPATH="$BUILD_DIR" "$TEST" 2>&1)"
+    WINEDLLPATH="$BUILD_DIR" "$WINE_COMMAND" "$TEST" 2>&1)"
 baseline_status=$?
 set -e
 printf '%s\n' "$baseline_output"
@@ -152,7 +152,7 @@ check_phase_normalized_parity baseline "$baseline" "$baseline_native"
 set +e
 crash_output="$(timeout --signal=KILL 10s env SIDEALSA_SOCKET="$SOCKET_PATH" \
     SIDEALSA_ASIO_PROBE_MS=1000 SIDEALSA_ASIO_CRASH_AFTER_START=1 WINEDEBUG=-all \
-    WINELOADER="$WINE_COMMAND" WINEDLLPATH="$BUILD_DIR" "$TEST" 2>&1)"
+    WINEDLLPATH="$BUILD_DIR" "$WINE_COMMAND" "$TEST" 2>&1)"
 crash_status=$?
 set -e
 printf '%s\n' "$crash_output"
@@ -170,8 +170,7 @@ sleep 1
 set +e
 reacquire_output="$(timeout --signal=KILL "${RUN_TIMEOUT}s" env \
     SIDEALSA_SOCKET="$SOCKET_PATH" SIDEALSA_ASIO_PROBE_MS="$RUN_MS" \
-    WINEDEBUG=-all WINELOADER="$WINE_COMMAND" WINEDLLPATH="$BUILD_DIR" \
-    "$TEST" 2>&1)"
+    WINEDEBUG=-all WINEDLLPATH="$BUILD_DIR" "$WINE_COMMAND" "$TEST" 2>&1)"
 reacquire_status=$?
 set -e
 printf '%s\n' "$reacquire_output"

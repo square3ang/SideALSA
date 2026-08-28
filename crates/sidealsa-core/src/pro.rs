@@ -16,6 +16,11 @@ pub trait ProCaptureSink: Send {
 }
 
 pub trait ProPlaybackSource: Send {
+    /// Changes whenever previously rendered output is no longer valid for reuse.
+    fn playback_epoch(&self) -> u64 {
+        0
+    }
+
     /// Publishes the next sequence watermark before the hardware wait.
     fn prepare_playback(&mut self, _sequence: u64) {}
 
