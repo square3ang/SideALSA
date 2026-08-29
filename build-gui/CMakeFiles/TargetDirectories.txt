@@ -1,7 +1,0 @@
-/home/square3ang/SideALSA/build-gui/CMakeFiles/sidealsa-control.dir
-/home/square3ang/SideALSA/build-gui/CMakeFiles/edit_cache.dir
-/home/square3ang/SideALSA/build-gui/CMakeFiles/rebuild_cache.dir
-/home/square3ang/SideALSA/build-gui/CMakeFiles/list_install_components.dir
-/home/square3ang/SideALSA/build-gui/CMakeFiles/install.dir
-/home/square3ang/SideALSA/build-gui/CMakeFiles/install/local.dir
-/home/square3ang/SideALSA/build-gui/CMakeFiles/install/strip.dir
