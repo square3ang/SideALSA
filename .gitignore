@@ -132,3 +132,4 @@ Cargo.lock
 
 /build-asio/
 /build-asio-*/
+/build-gui/
