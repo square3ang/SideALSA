@@ -7,7 +7,8 @@ buffer_size = 256
 shared_buffer_size = 512
 playback_timer_scheduling = true
 duplex_link = true
-linked_playback_guard_frames = 32
+# Keep three Q32 refill periods behind the 48-frame physical write guard.
+linked_playback_guard_frames = 48
 # Qualify one second of linked silence before exposing clients.
 linked_phase_max_attempts = 8
 pro_latency_periods = 0

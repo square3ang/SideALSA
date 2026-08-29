@@ -7,8 +7,8 @@ registration, DLL ABI, and `CreateThread` bridge required for Wine TEB setup.
 
 The adapter expects the daemon profile to expose a `64`-frame logical period.
 The reference E1x2 profile uses physical ALSA Q32, aggregates transfers into
-Q64 client cycles, and keeps `buffer_size = 256`. Linked startup primes 216
-frames: one Q64 capture interval, a 32-frame physical write reserve, three Q32
+Q64 client cycles, and keeps `buffer_size = 256`. Linked startup primes 232
+frames: one Q64 capture interval, a 48-frame physical write reserve, three Q32
 refill-headroom periods, and the 24 frames consumed by the 500 us client
 handoff.
 
@@ -29,10 +29,14 @@ After capture, the daemon also bounds the handoff by current ALSA playback delay
 A late RT wake therefore shortens or skips the client wait before it consumes
 the Q64 emergency write reserve.
 
-Protocol v15 carries the playback-ready eventfd, timing diagnostics, physical
+Protocol v16 carries the playback-ready eventfd, timing diagnostics, physical
 hardware period, effective PRO output latency, linked-start phase calibration
 result, independent SHARED buffer size, per-port SHARED playback diagnostics,
-and the loaded profile fingerprint. Shared-memory v9 carries the
+the loaded profile fingerprint, and a recent 128-sample duplex pointer-phase
+window. The pointer phase uses ALSA's default audio timestamp to normalize the
+playback and capture hardware-pointer observations by their separate status
+query times. It is an observational diagnostic, not a USB-link or analog
+timestamp. Shared-memory v9 carries the
 daemon's authoritative playback and activation watermarks plus the
 shared-capture discontinuity counter, playback publication timestamps, client
 playback diagnostics, and hardware timeline generation.
@@ -84,7 +88,7 @@ timeline resets. An armed deadline miss writes one
 exact-sequence silence fallback, discards any stale late block, and resumes with
 the next exact sequence while hardware remains continuous.
 
-The reference profile keeps ALSA hardware `buffer_size = 256`, a 32-frame linked
+The reference profile keeps ALSA hardware `buffer_size = 256`, a 48-frame linked
 playback guard, and an independent `shared_buffer_size = 512`. SHARED capacity
 does not alter the physical queue.
 
@@ -130,6 +134,7 @@ analog test and abrupt-process reacquisition harness:
 WINEDLLPATH="$PWD/build-asio" wine \
   build-asio/sidealsa-asio-loopback-test.exe.so
 scripts/test-asio-reacquire.sh
+scripts/test-asio-phase-stress.sh
 ```
 
 The loopback executable fails on a lost pulse, variable phase, callback-index
@@ -150,9 +155,38 @@ shift. Only the frontend residual participates in ASIO-specific acceptance; the
 common-path shift remains a core/hardware stability finding. The native
 reference uses the ASIO worker's default realtime priority of `46`.
 
+`test-asio-phase-stress.sh` runs native analog references before and after two
+ASIO legs while a fresh release workspace build runs from an isolated Cargo
+target directory. It writes all long-running output below `target/phase-stress`
+and bounds every child with `timeout`. A failed native preflight, including a
+busy PRO slot, exits before Cargo starts. Compare unrestricted scheduling with
+an xHCI-core exclusion without restarting the daemon:
+
+```text
+scripts/test-asio-phase-stress.sh
+SIDEALSA_STRESS_CPU_LIST=1-5,7-11 scripts/test-asio-phase-stress.sh
+```
+
+Pass a command after `--` to replace the default `cargo build --release
+--workspace` stress load.
+
+Set `SIDEALSA_ASIO_IDLE_REACQUIRE_ROUNDS` to repeat the stress command with no
+PRO owner and run a native reference after every round. All rounds complete so
+the final daemon counters are checked even when an earlier analog phase differs:
+
+```text
+SIDEALSA_ASIO_IDLE_REACQUIRE_ROUNDS=3 \
+  scripts/test-asio-phase-stress.sh -- cargo build --release --workspace
+```
+
+The harness is intentionally strict: any PRO/client deadline miss fails the
+run even when every analog measurement remains fixed. In that case the native
+before/after logs and the ASIO min/max values still distinguish successful
+hardware/phase isolation from a fully clean client-scheduling pass.
+
 ASIO begins with the first playback-clock target and publishes playback under
 that exact sequence. The E1x2 profile keeps zero process-ahead blocks. It uses a
-Q32 packet cadence, a 32-frame playback guard, and a real 500 us client handoff.
+Q32 packet cadence, a 48-frame playback guard, and a real 500 us client handoff.
 The daemon never waits past that bounded cutoff. It samples the exact
 shared-memory sequence once, substitutes silence when absent, and resumes only
 with the next exact sequence.
@@ -278,7 +312,7 @@ cargo run --release -p sidealsa-cli --bin sidealsa-stats -- --socket /tmp/sideal
   revision. They established miss isolation but are not latency acceptance data
   for the current revision. The rejected 64-frame/two-Q32 startup prime remains
   rejected because it caused real Discord activation XRUNs. The current
-  zero-lead startup primes 216 frames so the 32-frame guard and three Q32
+  zero-lead startup primes 232 frames so the 48-frame guard and three Q32
   refill-headroom periods remain after the client handoff.
 - Client diagnostics expose expired capture blocks, playback publication
   failures, realtime promotion failures, callback overruns, and maximum callback
@@ -417,8 +451,8 @@ cargo run --release -p sidealsa-cli --bin sidealsa-stats -- --socket /tmp/sideal
 - A later repeated-start investigation reproduced stable 384- and 390-frame
   starts and 336-to-390-frame settling without an ALSA XRUN. Reducing only the
   startup prime was rejected: a 200-frame prime reached 418 frames during loaded
-  startup, while a 136-frame prime reached 402 frames. The accepted profile uses
-  guard32, a 216-frame prime, one second of pre-ready silence, and up to eight
+  startup, while a 136-frame prime reached 402 frames. The then-accepted profile
+  used guard32, a 216-frame prime, one second of pre-ready silence, and up to eight
   startup-only qualification attempts.
 - With that profile, 93 measurable unloaded fresh starts each remained fixed at
   320-369 frames. Thirty PID-matched starts under 12 CPU workers, four memory
@@ -431,6 +465,41 @@ cargo run --release -p sidealsa-cli --bin sidealsa-stats -- --socket /tmp/sideal
   frames, or 7.792 ms, with zero lost pulse, PRO miss, hardware-XRUN, or runtime
   timeline-reset delta. This bounds the observed reference-host result below
   8 ms; the qualifier does not directly measure analog latency.
+- The current guard48/232-frame profile then ran three consecutive stress
+  windows, each overlapping both 20-second ASIO legs with six clean release
+  workspace builds. All 2854 native and ASIO loopback measurements remained
+  exactly 348 frames (7.25 ms), with zero lost pulse, hardware XRUN, core miss,
+  generation change, or timeline reset. One window passed every strict check;
+  the other two isolated one and three late PRO blocks respectively while the
+  hardware and phase continued unchanged. The largest observed callback was
+  1.1553 ms, beyond the 500 us handoff but still below one Q64 period.
+- Stronger repeated-reacquisition runs disproved that result as a runtime
+  guarantee. One full-Q64 guard48 run on daemon PID 1394432 moved native analog
+  phase from 372 to 409 frames during concurrent ASIO and six clean workspace
+  builds. The new 409-frame phase persisted through no-PRO stress and native
+  reacquisition while hardware XRUN, timeline reset, generation, and core-miss
+  counters stayed unchanged. On another fresh start, no-PRO build stress,
+  ASIO-only operation, and native-plus-build stress each retained a fixed
+  360-frame phase; the combined trigger is intermittent rather than a simple
+  lifecycle transition.
+- ALSA pointer phase does not identify every analog transition. An earlier
+  372-to-355-frame analog move coincided with an opposite approximately
+  17-frame pointer move, but the 372-to-409 run changed pointer median only from
+  3.371 to 3.292 ms and it later returned to 3.366 ms while analog stayed at
+  409. A split-Q32 run also moved analog from 360 to 396 after pointer phase had
+  already settled. The metric must not drive automatic phase correction.
+- Additional refill candidates were rejected. Capping Q64 write overshoot to
+  one Q32 packet still moved analog 366 to 391 frames with ring delay capped at
+  7. Splitting each Q64 write into paced Q32 halves later moved 360 to 396 with
+  the same ring cap. A zero-lead guard63 run moved 387 to 358 after a no-PRO
+  build round and reached one playback low watermark. Relaxing validation for a
+  maximal steady 192-frame floor and guard96 moved 390 to 379 during the first
+  concurrent ASIO/build window and also reached one low watermark. Both guard
+  experiments were reverted to guard48.
+- A process-wide absolute `CLOCK_MONOTONIC` playback schedule was rejected
+  before hardware deployment. Its cadence would free-run against the
+  asynchronous USB feedback clock and consume the 500 us handoff under normal
+  oscillator error. Per-cycle ALSA availability remains the clock authority.
 
 ## Limitations
 
@@ -439,15 +508,16 @@ cargo run --release -p sidealsa-cli --bin sidealsa-stats -- --socket /tmp/sideal
 - Float32 ASIO buffers converted to physical S32_LE.
 - `GetLatencies` reports the 64-frame input and 64-frame software output
   path, but not USB, converter, cable-loopback, or startup-qualified latency.
-- Earlier builds showed sub-Q64 common-path shifts while both ALSA streams
-  remained `RUNNING`. Shallow/late SideALSA refill and SHARED work ordering were
-  confirmed software triggers, so these shifts must not be labeled as
-  hardware-only. The crash/reacquisition harness checks each leg for stable
-  phase, compares ASIO with an immediately following native PRO run, and reports
-  any remaining common-path shift separately. The startup qualifier prevents
-  clients from seeing the initial one-second settling interval, but one loaded
-  run still moved from 350 to 374 frames afterward. A longer multi-hour
-  stability run is still required.
+- Sub-Q64 common-path shifts still occur while both ALSA streams remain
+  `RUNNING`. Shallow/late refill and SHARED work ordering were confirmed
+  software triggers, but guard48, Q32 overshoot caps, split-Q32 pacing, and the
+  maximum zero-lead steady queue all failed to provide a runtime invariant.
+  The crash/reacquisition harness checks each leg for stable phase, compares
+  ASIO with an immediately following native PRO run, and reports common-path
+  shifts separately. The startup qualifier hides initial settling but cannot
+  prevent a later USB/device-side transition. No current userspace detector can
+  infer every analog move from ALSA pointer timestamps, so strict runtime analog
+  phase continuity remains unresolved.
 - Freezing the daemon process is not normal scheduler load. A later explicit
   3 ms `SIGSTOP` sequence repopulated the USB playback queue and changed analog
   phase without an ALSA XRUN. Runtime continuity is therefore not guaranteed

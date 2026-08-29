@@ -59,14 +59,14 @@ Automatic adapter generation for arbitrary validated profiles is not yet
 implemented.
 
 The Q64/Q32 E1x2 packet pipeline uses `pro_latency_periods = 0`,
-`linked_playback_guard_frames = 32`, `linked_phase_max_attempts = 8`, and
+`linked_playback_guard_frames = 48`, `linked_phase_max_attempts = 8`, and
 `pro_handoff_us = 500`. Capture block N
 is returned as playback block N after the bounded client handoff, so native PRO
 and ASIO use the same callback timeline. The profile reports 64 frames of PRO
 output latency. The 500-us handoff covers observed Wine callback overhead under
 desktop capture load. A delayed hardware wake shortens that handoff when needed
-to retain one Q64 period for the next ALSA write. Linked startup primes 216
-frames: one Q64 capture interval, a 32-frame guard, three Q32 refill-headroom
+to retain one Q64 period for the next ALSA write. Linked startup primes 232
+frames: one Q64 capture interval, a 48-frame guard, three Q32 refill-headroom
 periods, and the 24 frames consumed by the handoff.
 
 Before the control socket opens, each startup attempt runs 750 silence cycles,
@@ -93,6 +93,9 @@ the priority order is xHCI IRQ `50`, linked hardware `48`, ASIO callback `46`,
 and desktop audio/session-manager work `10`. USB completion IRQs must preempt
 every userspace audio worker; assigning PRO or hardware above the xHCI IRQ can
 move physical duplex phase when another isochronous endpoint starts or stops.
+Correct priority ordering removes that known inversion but does not guarantee
+fixed analog phase: strict concurrent ASIO/build and no-PRO reacquisition tests
+have still observed sub-Q64 moves without an ALSA XRUN or timeline reset.
 The callback continues with normal scheduling and reports
 `pro_realtime_failures` when the Wine process lacks realtime scheduling rights.
 Existing profiles that omit

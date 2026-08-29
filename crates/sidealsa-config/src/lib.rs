@@ -871,8 +871,8 @@ mod tests {
         assert_eq!(profile.device.pro_handoff_us, 500);
         assert_eq!(profile.device.pro_handoff_nanos(), 500_000);
         assert_eq!(profile.device.pro_latency_periods, 0);
-        assert_eq!(profile.device.linked_playback_guard_frames, Some(32));
-        assert_eq!(profile.device.effective_linked_playback_guard_frames(), 32);
+        assert_eq!(profile.device.linked_playback_guard_frames, Some(48));
+        assert_eq!(profile.device.effective_linked_playback_guard_frames(), 48);
         assert!(!profile.device.uses_staged_pro_packets());
         assert_eq!(profile.device.effective_pro_output_latency_frames(), 64);
         assert_eq!(profile.device.linked_phase_max_attempts, 8);
@@ -886,7 +886,7 @@ mod tests {
         let text = E1X2_PROFILE
             .replace("hardware_period_size = 32", "hardware_period_size = 64")
             .replace(
-                "linked_playback_guard_frames = 32",
+                "linked_playback_guard_frames = 48",
                 "linked_playback_guard_frames = 64",
             );
         let profile = Profile::from_toml(&text).expect("whole-period profile should parse");
@@ -1023,7 +1023,7 @@ mod tests {
     #[test]
     fn accepts_reference_guard_with_zero_lead() {
         let profile = Profile::from_toml(E1X2_PROFILE).expect("profile should parse");
-        assert_eq!(profile.device.linked_playback_guard_frames, Some(32));
+        assert_eq!(profile.device.linked_playback_guard_frames, Some(48));
     }
 
     #[test]
@@ -1059,7 +1059,7 @@ mod tests {
     #[test]
     fn zero_lead_guard_leaves_a_full_client_write() {
         let text = E1X2_PROFILE.replace(
-            "linked_playback_guard_frames = 32",
+            "linked_playback_guard_frames = 48",
             "linked_playback_guard_frames = 224",
         );
 

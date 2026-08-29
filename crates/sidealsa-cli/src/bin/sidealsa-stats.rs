@@ -114,6 +114,13 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
             stats.capture_to_playback_write_max_nanos,
         );
         println!(
+            "duplex_pointer_phase_nanos={} duplex_pointer_phase_min_nanos={} duplex_pointer_phase_max_nanos={} duplex_pointer_phase_samples={}",
+            stats.duplex_pointer_phase_nanos,
+            stats.duplex_pointer_phase_min_nanos,
+            stats.duplex_pointer_phase_max_nanos,
+            stats.duplex_pointer_phase_samples,
+        );
+        println!(
             "linked_phase_attempts={} linked_phase_rebases={} linked_phase_score_nanos={} linked_phase_target_met={}",
             stats.linked_phase_attempts,
             stats.linked_phase_rebases,

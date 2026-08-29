@@ -10,7 +10,7 @@ use std::{
 
 use alsa::{
     Direction, ValueOr,
-    pcm::{Access, Format, HwParams, PCM, State},
+    pcm::{Access, AudioTstampType, Format, HwParams, PCM, State, Status, StatusBuilder},
 };
 use thiserror::Error;
 
@@ -1542,13 +1542,32 @@ fn linked_pro_cycle_loop(
         }
 
         let capture_read_nanos = monotonic_nanos();
-        let playback_delay_at_capture = playback_pcm.delay().ok();
-        if let Ok(delay) = capture_pcm.delay() {
+        let capture_status = pcm_status_with_audio_timestamp(capture_pcm).ok();
+        let playback_status_at_capture = pcm_status_with_audio_timestamp(playback_pcm).ok();
+        let playback_delay_at_capture = playback_status_at_capture
+            .as_ref()
+            .map(Status::get_delay)
+            .or_else(|| playback_pcm.delay().ok());
+        if let Some(delay) = capture_status
+            .as_ref()
+            .map(Status::get_delay)
+            .or_else(|| capture_pcm.delay().ok())
+        {
             control.timeline.update_pcm_delay(
                 StreamDirection::Capture,
                 delay,
                 config.period as u64,
             );
+        }
+        if let (Some(playback_status), Some(capture_status)) =
+            (playback_status_at_capture.as_ref(), capture_status.as_ref())
+        {
+            control
+                .timeline
+                .record_duplex_pointer_phase(duplex_pointer_phase_nanos(
+                    playback_status,
+                    capture_status,
+                ));
         }
         capture_position = capture_position.wrapping_add(config.period as u64);
         control.timeline.update_capture_position(capture_position);
@@ -3038,6 +3057,38 @@ fn monotonic_nanos() -> u64 {
         .saturating_add(u64::try_from(timestamp.tv_nsec).unwrap_or(0))
 }
 
+fn pcm_status_with_audio_timestamp(pcm: &PCM) -> alsa::Result<Status> {
+    StatusBuilder::new()
+        .audio_htstamp_config(AudioTstampType::Default, false)
+        .build(pcm)
+}
+
+fn duplex_pointer_phase_nanos(playback: &Status, capture: &Status) -> i64 {
+    duplex_pointer_phase_from_timestamps(
+        playback.get_htstamp(),
+        playback.get_audio_htstamp(),
+        capture.get_htstamp(),
+        capture.get_audio_htstamp(),
+    )
+}
+
+fn duplex_pointer_phase_from_timestamps(
+    playback_system: libc::timespec,
+    playback_audio: libc::timespec,
+    capture_system: libc::timespec,
+    capture_audio: libc::timespec,
+) -> i64 {
+    let playback_offset = timespec_nanos(playback_audio) - timespec_nanos(playback_system);
+    let capture_offset = timespec_nanos(capture_audio) - timespec_nanos(capture_system);
+    (playback_offset - capture_offset).clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+fn timespec_nanos(timestamp: libc::timespec) -> i128 {
+    i128::from(timestamp.tv_sec)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(i128::from(timestamp.tv_nsec))
+}
+
 fn playback_target_sleep(remaining: alsa::pcm::Frames, rate: u32, prewake_nanos: u64) -> Duration {
     let frames = u64::try_from(remaining).unwrap_or(0);
     let nanos = frames.saturating_mul(1_000_000_000) / u64::from(rate);
@@ -3558,12 +3609,12 @@ mod tests {
     use super::{
         EngineError, PendingProCapture, ProClock, StreamDirection, WorkerControl,
         align_sequence_forward, alsa_call, announced_output_matches, bounded_pro_handoff_target,
-        linked_ahead_start_frames, linked_phase_dither_frames, linked_phase_target_nanos,
-        linked_phase_warmup_cycles, linked_start_frames, linked_zero_lead_playback_floor,
-        observe_pro_capture_target, period_limit_reached, playback_startup_priority,
-        playback_target_sleep, prepared_output_matches, pro_target_sequence,
-        staged_playback_chunk_before_capture, take_pending_pro_capture, take_pro_capture_sequence,
-        uses_staged_packet_cycle,
+        duplex_pointer_phase_from_timestamps, linked_ahead_start_frames,
+        linked_phase_dither_frames, linked_phase_target_nanos, linked_phase_warmup_cycles,
+        linked_start_frames, linked_zero_lead_playback_floor, observe_pro_capture_target,
+        period_limit_reached, playback_startup_priority, playback_target_sleep,
+        prepared_output_matches, pro_target_sequence, staged_playback_chunk_before_capture,
+        take_pending_pro_capture, take_pro_capture_sequence, uses_staged_packet_cycle,
     };
     use crate::HardwareTimeline;
     use std::{
@@ -3780,16 +3831,16 @@ mod tests {
         assert_eq!(linked_zero_lead_playback_floor(32, 32, 128, 64), 64);
         assert_eq!(linked_zero_lead_playback_floor(64, 32, 192, 64), 128);
 
-        let reference_floor = linked_zero_lead_playback_floor(32, 32, 256, 64);
-        assert_eq!(reference_floor, 128);
+        let compact_floor = linked_zero_lead_playback_floor(32, 32, 256, 64);
+        assert_eq!(compact_floor, 128);
         assert_eq!(
-            linked_start_frames(64, reference_floor, 256, 48_000, 500_000),
+            linked_start_frames(64, compact_floor, 256, 48_000, 500_000),
             216
         );
-        let expanded_floor = linked_zero_lead_playback_floor(48, 32, 256, 64);
-        assert_eq!(expanded_floor, 144);
+        let reference_floor = linked_zero_lead_playback_floor(48, 32, 256, 64);
+        assert_eq!(reference_floor, 144);
         assert_eq!(
-            linked_start_frames(64, expanded_floor, 256, 48_000, 500_000),
+            linked_start_frames(64, reference_floor, 256, 48_000, 500_000),
             232
         );
     }
@@ -3807,6 +3858,24 @@ mod tests {
         assert_eq!(
             bounded_pro_handoff_target(1_000_000, 1_050_000, 500_000, 32, 64, 48_000),
             1_000_000
+        );
+    }
+
+    #[test]
+    fn duplex_pointer_phase_normalizes_status_query_time() {
+        let timestamp = |nanos: i64| libc::timespec {
+            tv_sec: nanos / 1_000_000_000,
+            tv_nsec: nanos % 1_000_000_000,
+        };
+
+        assert_eq!(
+            duplex_pointer_phase_from_timestamps(
+                timestamp(10_000_300_000),
+                timestamp(2_000_300_000),
+                timestamp(10_000_900_000),
+                timestamp(2_000_400_000),
+            ),
+            500_000
         );
     }
 

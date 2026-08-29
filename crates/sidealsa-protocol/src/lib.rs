@@ -6,7 +6,7 @@ use std::{
 
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 15;
+pub const PROTOCOL_VERSION: u16 = 16;
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"SALS";
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 pub const FEATURE_PRO: u32 = 1 << 0;
@@ -139,6 +139,10 @@ pub struct Stats {
     pub capture_to_playback_write_nanos: u64,
     pub capture_to_playback_write_min_nanos: u64,
     pub capture_to_playback_write_max_nanos: u64,
+    pub duplex_pointer_phase_nanos: i64,
+    pub duplex_pointer_phase_min_nanos: i64,
+    pub duplex_pointer_phase_max_nanos: i64,
+    pub duplex_pointer_phase_samples: u64,
     pub linked_phase_attempts: u64,
     pub linked_phase_rebases: u64,
     pub linked_phase_score_nanos: u64,
@@ -648,6 +652,10 @@ fn encode_stats(payload: &mut Vec<u8>, stats: &Stats) -> Result<(), ProtocolErro
         stats.capture_to_playback_write_nanos,
         stats.capture_to_playback_write_min_nanos,
         stats.capture_to_playback_write_max_nanos,
+        stats.duplex_pointer_phase_nanos as u64,
+        stats.duplex_pointer_phase_min_nanos as u64,
+        stats.duplex_pointer_phase_max_nanos as u64,
+        stats.duplex_pointer_phase_samples,
         stats.linked_phase_attempts,
         stats.linked_phase_rebases,
         stats.linked_phase_score_nanos,
@@ -721,6 +729,10 @@ fn decode_stats(decoder: &mut Decoder<'_>) -> Result<Stats, ProtocolError> {
         capture_to_playback_write_nanos: decoder.u64()?,
         capture_to_playback_write_min_nanos: decoder.u64()?,
         capture_to_playback_write_max_nanos: decoder.u64()?,
+        duplex_pointer_phase_nanos: decoder.u64()? as i64,
+        duplex_pointer_phase_min_nanos: decoder.u64()? as i64,
+        duplex_pointer_phase_max_nanos: decoder.u64()? as i64,
+        duplex_pointer_phase_samples: decoder.u64()?,
         linked_phase_attempts: decoder.u64()?,
         linked_phase_rebases: decoder.u64()?,
         linked_phase_score_nanos: decoder.u64()?,
@@ -1107,6 +1119,10 @@ mod tests {
             capture_to_playback_write_nanos: 70,
             capture_to_playback_write_min_nanos: 65,
             capture_to_playback_write_max_nanos: 75,
+            duplex_pointer_phase_nanos: -500_000,
+            duplex_pointer_phase_min_nanos: -600_000,
+            duplex_pointer_phase_max_nanos: -400_000,
+            duplex_pointer_phase_samples: 128,
             linked_phase_attempts: 3,
             linked_phase_rebases: 2,
             linked_phase_score_nanos: 333_333,

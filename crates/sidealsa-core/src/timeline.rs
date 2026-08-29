@@ -1,8 +1,18 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use crate::StreamDirection;
 
 const PRO_TIMING_SLOT_COUNT: usize = 8;
+const DUPLEX_POINTER_PHASE_SAMPLE_COUNT: usize = 128;
+
+#[derive(Debug)]
+struct DuplexPointerPhaseSamples([AtomicI64; DUPLEX_POINTER_PHASE_SAMPLE_COUNT]);
+
+impl Default for DuplexPointerPhaseSamples {
+    fn default() -> Self {
+        Self([const { AtomicI64::new(0) }; DUPLEX_POINTER_PHASE_SAMPLE_COUNT])
+    }
+}
 
 #[derive(Debug, Default)]
 struct ProTimingSlot {
@@ -39,6 +49,8 @@ pub struct HardwareTimeline {
     capture_to_playback_write_nanos: AtomicU64,
     capture_to_playback_write_min_nanos: AtomicU64,
     capture_to_playback_write_max_nanos: AtomicU64,
+    duplex_pointer_phase_samples: DuplexPointerPhaseSamples,
+    duplex_pointer_phase_sample_count: AtomicU64,
     linked_phase_result_epoch: AtomicU64,
     linked_phase_attempts: AtomicU64,
     linked_phase_rebases: AtomicU64,
@@ -87,6 +99,10 @@ pub struct HardwareStats {
     pub capture_to_playback_write_nanos: u64,
     pub capture_to_playback_write_min_nanos: u64,
     pub capture_to_playback_write_max_nanos: u64,
+    pub duplex_pointer_phase_nanos: i64,
+    pub duplex_pointer_phase_min_nanos: i64,
+    pub duplex_pointer_phase_max_nanos: i64,
+    pub duplex_pointer_phase_samples: u64,
     pub linked_phase_attempts: u64,
     pub linked_phase_rebases: u64,
     pub linked_phase_score_nanos: u64,
@@ -112,6 +128,12 @@ impl HardwareTimeline {
     pub fn snapshot(&self) -> HardwareStats {
         let (linked_phase_attempts, linked_phase_score_nanos, linked_phase_target_met) =
             self.linked_phase_calibration();
+        let (
+            duplex_pointer_phase_nanos,
+            duplex_pointer_phase_min_nanos,
+            duplex_pointer_phase_max_nanos,
+            duplex_pointer_phase_samples,
+        ) = self.duplex_pointer_phase();
         HardwareStats {
             generation: self.generation.load(Ordering::Relaxed),
             sample_position: self.sample_position.load(Ordering::Relaxed),
@@ -164,6 +186,10 @@ impl HardwareTimeline {
             capture_to_playback_write_max_nanos: self
                 .capture_to_playback_write_max_nanos
                 .load(Ordering::Relaxed),
+            duplex_pointer_phase_nanos,
+            duplex_pointer_phase_min_nanos,
+            duplex_pointer_phase_max_nanos,
+            duplex_pointer_phase_samples,
             linked_phase_attempts,
             linked_phase_rebases: self.linked_phase_rebases.load(Ordering::Relaxed),
             linked_phase_score_nanos,
@@ -316,6 +342,38 @@ impl HardwareTimeline {
         update_maximum(&self.capture_to_playback_write_max_nanos, duration);
     }
 
+    pub(crate) fn record_duplex_pointer_phase(&self, nanos: i64) {
+        let count = self
+            .duplex_pointer_phase_sample_count
+            .load(Ordering::Relaxed);
+        let slot = count as usize % DUPLEX_POINTER_PHASE_SAMPLE_COUNT;
+        self.duplex_pointer_phase_samples.0[slot].store(nanos, Ordering::Relaxed);
+        self.duplex_pointer_phase_sample_count
+            .store(count.wrapping_add(1), Ordering::Release);
+    }
+
+    fn duplex_pointer_phase(&self) -> (i64, i64, i64, u64) {
+        let total = self
+            .duplex_pointer_phase_sample_count
+            .load(Ordering::Acquire);
+        let count = usize::try_from(total)
+            .unwrap_or(usize::MAX)
+            .min(DUPLEX_POINTER_PHASE_SAMPLE_COUNT);
+        if count == 0 {
+            return (0, 0, 0, 0);
+        }
+
+        let start = total.saturating_sub(count as u64);
+        let mut samples = [0_i64; DUPLEX_POINTER_PHASE_SAMPLE_COUNT];
+        for (offset, sample) in samples[..count].iter_mut().enumerate() {
+            let index =
+                start.wrapping_add(offset as u64) as usize % DUPLEX_POINTER_PHASE_SAMPLE_COUNT;
+            *sample = self.duplex_pointer_phase_samples.0[index].load(Ordering::Relaxed);
+        }
+        samples[..count].sort_unstable();
+        (samples[count / 2], samples[0], samples[count - 1], total)
+    }
+
     pub fn record_pro_deadline_miss(&self) {
         self.pro_deadline_misses.fetch_add(1, Ordering::Relaxed);
         self.pro_client_deadline_misses
@@ -366,6 +424,8 @@ impl HardwareTimeline {
     pub(crate) fn reset_after_hardware_restart(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.timeline_resets.fetch_add(1, Ordering::Relaxed);
+        self.duplex_pointer_phase_sample_count
+            .store(0, Ordering::Release);
         self.record_linked_phase_calibration(0, 0, false);
     }
 
@@ -373,6 +433,8 @@ impl HardwareTimeline {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.timeline_resets.fetch_add(1, Ordering::Relaxed);
         self.linked_phase_rebases.fetch_add(1, Ordering::Relaxed);
+        self.duplex_pointer_phase_sample_count
+            .store(0, Ordering::Release);
     }
 }
 
@@ -554,6 +616,23 @@ mod tests {
         assert_eq!(stats.capture_to_playback_write_nanos, 60);
         assert_eq!(stats.capture_to_playback_write_min_nanos, 60);
         assert_eq!(stats.capture_to_playback_write_max_nanos, 60);
+    }
+
+    #[test]
+    fn duplex_pointer_phase_reports_the_recent_window() {
+        let timeline = HardwareTimeline::default();
+        for nanos in 1..=130 {
+            timeline.record_duplex_pointer_phase(nanos);
+        }
+
+        let stats = timeline.snapshot();
+        assert_eq!(stats.duplex_pointer_phase_nanos, 67);
+        assert_eq!(stats.duplex_pointer_phase_min_nanos, 3);
+        assert_eq!(stats.duplex_pointer_phase_max_nanos, 130);
+        assert_eq!(stats.duplex_pointer_phase_samples, 130);
+
+        timeline.reset_after_hardware_restart();
+        assert_eq!(timeline.snapshot().duplex_pointer_phase_samples, 0);
     }
 
     #[test]
