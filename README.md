@@ -1,582 +1,512 @@
 # SideALSA
 
-> One hardware clock. Two isolated client domains. No client owns the timeline.
+SideALSA is an experimental userspace professional-audio layer for Linux. A
+single daemon owns the physical ALSA interface and exposes two isolated client
+domains:
 
-SideALSA is a userspace professional-audio layer built on ALSA. It owns one
-physical USB audio device and exposes two independent client paths:
+- **PRO** is exclusive, low-latency, and exposes the complete physical channel
+  set to native clients, the ALSA plugin, and the Wine ASIO frontend.
+- **SHARED** provides independently buffered logical ports for PipeWire and
+  desktop audio. Different ports can run together, with one owner per port.
 
-- **PRO**: exclusive, low-latency, complete physical channel layout.
-- **SHARED**: buffered logical ports for PipeWire and desktop applications.
+The central invariant is:
 
-The hardware timeline keeps running when a client misses a deadline. A PRO miss
-becomes silence, while a SHARED playback miss uses the profile-selected silence
-or repeat-last-block fallback. Both remain diagnostic events, not ALSA restarts.
+```text
+client deadline miss != hardware XRUN
+```
 
-Initial reference device: **Topping E1x2 OTG**.
+The hardware timeline continues when a client is late or disappears. SideALSA
+is not a general audio graph, a resampler, or a JACK replacement.
 
-| Path | Purpose | Failure behavior |
-| --- | --- | --- |
-| **PRO** | Exclusive DAW, native ALSA, and Wine/Proton ASIO | A missed exact-sequence block becomes silence |
-| **SHARED** | PipeWire and desktop logical ports | Each late client is isolated; fallback is configurable |
-| **Hardware** | One continuous duplex ALSA timeline | Only a real ALSA failure triggers XRUN recovery |
+## Project Status
 
-Current profile: `48 kHz`, `S32_LE`, `64`-frame client periods, `32`-frame
-physical periods, `256`-frame hardware buffer, 8 playback channels, and 10
-capture channels. The linked zero-lead PRO path reports 64 input frames and 64
-output frames. Its `500 us` bounded handoff accommodates Wine callback overhead
-without adding a whole period of PRO latency.
+SideALSA currently implements the complete prototype path from a physical ALSA
+device to native, ALSA, PipeWire, Qt, and Wine clients.
 
-## Status
+| Component | Status |
+| --- | --- |
+| Direct duplex ALSA engine and XRUN recovery | Implemented |
+| `sidealsad` hardware owner and diagnostics | Implemented |
+| Exclusive PRO shared-memory client | Implemented |
+| Buffered SHARED logical ports | Implemented |
+| ALSA external ioplug | Implemented, S32_LE/RW-interleaved only |
+| PipeWire integration through the ALSA ioplug | Implemented with static reference-port configuration |
+| Qt 6 control panel and privileged profile helper | Implemented |
+| x86_64 Wine/Proton ASIO frontend | Experimental |
 
-Working paths:
+The Topping E1x2 OTG is the first and currently the only fully exercised
+reference device. The core is profile-driven, but installation-time ALSA and
+PipeWire adapter generation for arbitrary profiles is not implemented yet.
 
-- Direct duplex ALSA ownership through `sidealsad`.
-- PRO client protocol and exclusive ownership.
-- Shared logical playback/capture ports.
-- ALSA ioplug for raw `sidealsa_pro` and hidden PipeWire backing PCMs.
-- PipeWire adapters backed by the ALSA ioplug.
-- Experimental 64-bit Wine/Proton ASIO frontend.
-- Qt 6 timing control panel with authenticated apply and automatic rollback.
-
-Not implemented:
-
-- ALSA ioplug mmap access.
-- Resampling or format conversion.
-- Advanced routing or DSP.
-- 32-bit ASIO/WoW64 frontend.
+This is pre-release software. Do not treat successful startup or zero XRUN
+counters as proof of fixed end-to-end analog latency; see
+[Known Limitations](#known-limitations).
 
 ## Architecture
 
 ```text
-Topping E1x2 hw:OTG,0
-          |
-      sidealsad
-       /      \
-     PRO     SHARED
-      |        |
-   ASIO/DAW  ALSA ioplug
-                 |
-              PipeWire
+                              Physical ALSA device
+                                      hw:X,Y
+                                         |
+                                  +------v------+
+                                  |  sidealsad  |
+                                  | HW RT loop  |
+                                  | HW timeline |
+                                  +-------------+
+                                         |
+                         +---------------+---------------+
+                         |                               |
+                  exclusive PRO                  buffered SHARED
+                         |                               |
+           +-------------+-------------+                 |
+           |             |             |                 |
+      native client  Wine ASIO   ALSA ioplug       ALSA ioplug
+                                     |                   |
+                                ALSA PRO app          PipeWire
+                                                  desktop applications
 ```
 
-Only `sidealsad` opens the physical ALSA device. Audio data does not travel
-through the control socket. Clients use shared memory for audio and eventfd for
-cycle notifications.
+Control and handshakes use a Unix socket. Audio uses fixed shared-memory rings
+with sequence numbers and eventfd notifications; audio is not sent through the
+socket. The real-time hardware worker uses preallocated storage and never waits
+indefinitely for a client.
+
+A missing PRO block becomes one exact-sequence silence fallback. A missing
+SHARED contribution becomes silence or the last valid logical period, depending
+on the profile. Neither case requests an ALSA restart. Actual ALSA XRUN recovery
+is counted separately and advances the hardware timeline generation when the
+stream must be rebased.
+
+## Reference Profile
+
+[`profiles/topping-e1x2.toml`](profiles/topping-e1x2.toml) currently configures:
+
+| Setting | Value |
+| --- | --- |
+| Device | Topping E1x2 OTG, `hw:OTG,0` |
+| Sample format and rate | S32_LE, 48 kHz |
+| Physical channels | 8 playback, 10 capture |
+| Native protocol and PRO ALSA period | 64 frames |
+| Physical ALSA period | 32 frames |
+| Physical ALSA buffer | 256 frames |
+| Independent SHARED ring | 512 frames |
+| SHARED ALSA/PipeWire period | 256 frames |
+| SHARED ALSA buffer | 768 playback, 512 capture frames |
+| PRO software output latency reported to clients | 64 frames |
+| SHARED playback lookahead | 7 internal Q64 periods, 448 frames |
+
+The reported PRO latency does not include USB transport, device firmware,
+converters, or analog loopback delay.
+
+The reference logical ports are:
+
+| Direction | Port IDs | Physical channels |
+| --- | --- | --- |
+| Playback | `line1`, `line2`, `line3`, `line4` | 0/1, 2/3, 4/5, 6/7 |
+| Capture | `mic1`, `mic2` | 0, 1 |
+| Capture | `input34`, `input56`, `input78`, `input910` | 2/3, 4/5, 6/7, 8/9 |
+
+Timing and realtime-priority values in this profile were selected for the
+reference host. Review them for a different device or system rather than
+assuming the same USB IRQ and scheduler topology.
 
 ## Requirements
 
-Arch/CachyOS example:
+The Rust workspace uses edition 2024. A normal full installation needs:
+
+- A recent stable Rust toolchain and Cargo.
+- C and C++17 toolchains, `pkg-config`, and ALSA development headers.
+- CMake and Qt 6.5 or newer with Widgets development files for the control
+  panel.
+- polkit and `pkexec` to apply settings from the control panel.
+- systemd for the supplied service installation.
+- PipeWire and WirePlumber for desktop integration.
+- Membership of the desktop user in the `audio` group when that group exists.
+- ALSA utilities such as `aplay`, `arecord`, and `speaker-test` for the examples
+  below.
+- CMake, `winegcc`, and `winebuild` commands whenever the main installer is
+  invoked with `--with-asio`, including `--no-build` due to its current checks.
+- 64-bit Wine development headers when actually building ASIO, plus a host
+  `wine` executable when registering it in prefixes.
+
+Build-system errors report missing general dependencies. The installer performs
+additional explicit checks for selected GUI and ASIO operations.
+
+## Install
+
+Run the installer as the normal desktop user, not with `sudo`:
 
 ```sh
-sudo pacman -S --needed \
-  alsa-lib alsa-utils pipewire pipewire-pulse wireplumber \
-  rust cmake gcc pkgconf qt6-base polkit wine wine-tools
+./scripts/install.sh
 ```
 
-Build requirements:
+It builds the Rust workspace and Qt control panel as that user, requests `sudo`
+only for protected paths and systemd operations, installs the reference profile,
+starts `sidealsad`, and installs the ALSA and PipeWire adapter configuration.
 
-- Rust toolchain with Cargo.
-- ALSA development headers and `pkg-config`.
-- CMake, GCC, and GNU make or Ninja.
-- Qt 6 Widgets and polkit for the control panel.
-- Wine SDK headers, `winegcc`, and `winebuild` for ASIO.
-- A 64-bit Wine executable for prefix registration.
+Important defaults are:
 
-Package names differ by distribution. Install equivalent ALSA, PipeWire, Rust,
-CMake, and Wine development packages there.
+| Item | Path |
+| --- | --- |
+| Binaries | `/usr/local/bin` |
+| Device profile | `/etc/sidealsa/profiles/topping-e1x2.toml` |
+| Control socket | `/tmp/sidealsad.sock` |
+| ALSA definitions | `/etc/alsa/conf.d/99-sidealsa.conf` |
+| PipeWire definitions | `/etc/pipewire/pipewire.conf.d/99-sidealsa.conf` |
+| systemd service | `sidealsad.service` |
 
-## Build Core
+When the `audio` group exists, the service creates the socket as `root:audio`
+with mode `0770`; the desktop user, PipeWire, and Wine clients therefore need
+that group in their active supplementary groups. Log out and back in after
+adding membership. If no `audio` group exists, the installer warns and uses a
+world-accessible socket instead.
 
-From repository root:
+The supplied PipeWire fragments do more than create SideALSA nodes. They set
+PipeWire and PipeWire Pulse to nice level `-11`, realtime priority `10`, disable
+the RT portal, and set WirePlumber's loop priority to `10`. These are process-wide
+scheduling settings; review the files under `configs/` before installing them on
+a differently configured host.
+
+Common variants:
+
+```sh
+# Rust daemon, tools, and ALSA/PipeWire integration without the Qt GUI
+./scripts/install.sh --no-gui
+
+# Also build and install the experimental Wine ASIO binaries
+./scripts/install.sh --with-asio
+
+# Install and enable without starting or restarting the daemon
+./scripts/install.sh --no-start
+
+# Skip or remove installer-managed PipeWire integration
+./scripts/install.sh --no-pipewire
+
+# Deliberately replace the existing installed profile
+./scripts/install.sh --replace-profile
+```
+
+An existing installed profile is preserved by default, including during an
+upgrade or `--force` install. Review repository profile changes and use
+`--replace-profile` only when replacement is intended.
+
+Each installer invocation describes the desired complete optional feature set.
+On a later upgrade, omitting `--with-asio` removes installer-managed system ASIO
+files, `--no-gui` removes the managed GUI/helper files, and `--no-pipewire`
+removes the managed PipeWire fragments. Repeat the desired feature flags.
+`--no-start` leaves an already running daemon and user PipeWire session running;
+it is not a safe substitute for cycling components during a protocol upgrade.
+`--no-pipewire` also leaves active user services running after removing their
+fragments, so restart PipeWire and WirePlumber manually to unload stale nodes.
+
+### Prebuilt Installation
+
+`--no-build` requires every selected artifact to exist already. Cargo does not
+build the Qt control panel. For a Rust-only installation, use:
 
 ```sh
 cargo build --release --workspace
+./scripts/install.sh --no-build --no-gui
 ```
 
-Run static profile validation without taking hardware:
+A full `--no-build` installation additionally requires
+`build-gui/sidealsa-control`. `--with-asio --no-build` also requires the
+artifacts under `build-asio/`, but the current installer still checks for CMake,
+`winegcc`, and `winebuild` when that flag combination is used.
+
+### Upgrade Compatibility
+
+The daemon, client library, ALSA plugin, CLI tools, and ASIO frontend must come
+from a compatible build. The current control protocol is version **16** and the
+shared-memory layout is version **9**; both are checked exactly rather than
+negotiated across incompatible versions.
+
+The normal installer replaces its managed files, then stops active user audio
+immediately before restarting the daemon. It waits for the new daemon socket
+before restoring user audio. Installation is not transactional: a file-copy or
+daemon-readiness failure does not restore previously installed binaries or a
+profile explicitly replaced with `--replace-profile`. `--preserve-pipewire`
+leaves the current PipeWire processes and installed adapter fragments untouched,
+although it still replaces the ALSA plugin binary. Use that option only when
+this is deliberate.
+
+In particular, a running PipeWire process may still have an old
+`libasound_module_pcm_sidealsa.so` mapped after the file is replaced. If the
+plugin or protocol changed, restart the user audio services before testing:
 
 ```sh
-target/release/sidealsa-hw-test \
-  --profile profiles/topping-e1x2.toml \
-  --list-ports
+systemctl --user restart \
+  pipewire.service pipewire-pulse.service wireplumber.service
 ```
 
-## Install Core
+A stale plugin commonly surfaces as `Protocol error` on every SideALSA PCM even
+though `sidealsad` itself is healthy. Direct native clients must reconnect after
+a daemon restart as well.
 
-Install the daemon, control panel, ALSA plugin, initial profile, PipeWire
-adapters, and systemd service:
+### Uninstall
 
 ```sh
-./scripts/install.sh --no-build
+./scripts/uninstall.sh
 ```
 
-The installer creates the selected profile only when it does not exist. Later
-installs preserve `/etc/sidealsa/profiles/*.toml`, including with `--force`.
-After reviewing local changes, use `--replace-profile` to adopt a new reference
-profile. The current Q64/Q32 reference uses
-`linked_playback_guard_frames = 48`, `linked_phase_max_attempts = 8`, and
-`pro_latency_periods = 0`. It also enables
-`shared_playback_repeat_on_underrun = true`. The daemon qualifies one second of
-linked silence before exposing its control socket.
+The uninstaller removes files recorded in the install manifest and preserves
+files modified after installation. It also preserves the device profile. Use
+`--force` only when changed managed files should be removed. It prints, but does
+not execute, the user PipeWire restart command. User-local Wine files, prefix
+DLL copies, and registry entries created by `install-asio.sh` are outside the
+main install manifest and remain installed.
 
-Use `--no-gui` when Qt or polkit integration is not wanted. The privileged
-helper is always installed at `/usr/libexec/sidealsa-admin`, outside a custom
-binary prefix, and may only update root-owned profiles directly under
-`/etc/sidealsa/profiles`.
+See [Installation](docs/installation.md) for additional package-staging,
+profile-replacement, timing, and control-panel lifecycle details. The canonical
+option list is always available from `./scripts/install.sh --help`.
 
-Installer defaults:
+## Verify an Installation
+
+Check the service, protocol, advertised PRO PCM, and PipeWire nodes:
+
+```sh
+systemctl status --no-pager sidealsad.service
+sidealsa-stats --samples 1
+aplay -L | grep sidealsa_pro
+wpctl status
+```
+
+The installed reference ALSA PCMs are:
+
+| PCM | Direction and scope |
+| --- | --- |
+| `sidealsa_pro` | Exclusive raw 8-output/10-input PRO interface |
+| `sidealsa_line1` through `sidealsa_line4` | SHARED stereo playback |
+| `sidealsa_mic1`, `sidealsa_mic2` | SHARED mono capture |
+| `sidealsa_input34` through `sidealsa_input910` | SHARED stereo capture |
+
+Only `sidealsa_pro` carries an ALSA discovery hint. The SHARED PCMs are valid
+named definitions but do not appear in `aplay -L` or `arecord -L`; verify them by
+opening the names directly.
+
+Basic SHARED tests:
+
+```sh
+speaker-test -D sidealsa_line1 -c 2 -r 48000 -F S32_LE -t sine
+arecord -D sidealsa_mic1 -f S32_LE -c 1 -r 48000 -d 5 /tmp/sidealsa-mic1.wav
+```
+
+The native smoke clients default to silence and do not require ALSA plugin
+discovery:
+
+```sh
+sidealsa-pro-client-test --periods 3000
+sidealsa-shared-test --port line1 --periods 3000
+```
+
+Only one PRO owner may exist. Close a native PRO client, `sidealsa_pro` user, or
+ASIO application before opening another. The current ALSA plugin opens each PCM
+direction as a separate SideALSA stream, so two-handle full-duplex PRO through
+`sidealsa_pro` is not supported; use the native client API or ASIO for a single
+duplex PRO session.
+
+Each SHARED logical port also has one backend owner at a time. Different ports
+can operate concurrently, and PipeWire can mix multiple desktop applications
+above the one PipeWire owner for a port. A second direct opener of the same port
+receives `BUSY`.
+
+PipeWire creates these reference nodes:
 
 ```text
-daemon:       /usr/local/bin/sidealsad
-profile:      /etc/sidealsa/profiles/topping-e1x2.toml
-ALSA config:  /etc/alsa/conf.d/99-sidealsa.conf
-PipeWire:     /etc/pipewire/pipewire.conf.d/99-sidealsa.conf
-ALSA plugin:  /usr/lib/alsa-lib/libasound_module_pcm_sidealsa.so
-socket:       /tmp/sidealsad.sock
-control UI:   /usr/local/bin/sidealsa-control
-admin helper: /usr/libexec/sidealsa-admin
+sidealsa-line1 .. sidealsa-line4
+sidealsa-mic1
+sidealsa-mic2
+sidealsa-input34 .. sidealsa-input910
 ```
 
-Restart user audio after installation:
+PipeWire graph status alone is not sufficient to diagnose the complete path.
+Inspect SideALSA's SHARED counters as well because silence fallback and capture
+loss can occur without a PipeWire graph XRUN.
+
+## Diagnostics
+
+Read live daemon counters without entering the real-time thread:
 
 ```sh
-systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service
+sidealsa-stats --samples 100 --interval-ms 100
+journalctl -u sidealsad.service -f
 ```
 
-Verify daemon and hardware parameters:
+The main counter groups are:
 
-```sh
-systemctl status sidealsad.service
-target/release/sidealsa-stats --samples 3
-cat /proc/asound/card*/pcm0p/sub0/hw_params
-```
+| Counter | Meaning |
+| --- | --- |
+| `hw_playback_xruns`, `hw_capture_xruns` | Actual ALSA hardware XRUNs |
+| `pro_deadline_misses` | PRO fallback periods |
+| `pro_client_deadline_misses` | Playback not supplied by the client in time |
+| `pro_core_deadline_misses` | Core could not complete the period in time |
+| `shared_underruns`, `shared_overruns` | Isolated SHARED data loss |
+| `timeline_resets`, `generation` | Hardware stream restart or rebase |
+| `periods_processed`, `sample_position` | Published hardware timeline progress |
 
-Expected physical playback parameters:
-
-```text
-format: S32_LE
-channels: 8
-rate: 48000
-period_size: 32
-buffer_size: 256
-```
-
-The reference profile exposes a separate `shared_buffer_size = 512`. The ioplug
-keeps daemon transfers and that ring at Q64/B512, while PipeWire playback
-negotiates Q256/B768. The third external period provides startup capacity for a
-Q256 PipeWire start delay; the steady buffer target remains Q256. Playback uses
-seven internal periods (`448` frames) of SHARED lookahead. This does not change
-the physical B256 queue or Q64 PRO block size.
+`sidealsa-stats` also prints delays, handoff timing, per-port SHARED playback
+diagnostics, global SHARED capture overruns, and duplex pointer-phase
+observations. `duplex_pointer_phase_nanos` compares separately timestamped ALSA
+pointer observations. It is useful for debugging but is not a USB-link,
+converter, or analog phase measurement.
 
 ## Control Panel
 
-Launch **SideALSA Control** from the desktop application menu or run:
+The default installation provides:
 
 ```sh
 sidealsa-control
 ```
 
-The Qt control panel edits the complete hardware timing set: sample rate,
-logical and physical periods, hardware and SHARED buffers, playback queue,
-duplex/link controls, PRO and SHARED lead, handoff budget, and realtime
-priorities. Buffer, duplex, and scheduling settings use separate tabs while the
-daemon state and actions remain visible in a fixed footer. Numeric fields use
-direct entry instead of detached step buttons, ignore accidental wheel changes
-until focused, and enable Apply only after a value changes or a daemon restart
-is required. Reloading or closing asks before discarding edits, and a failed
-apply keeps the pending values available for correction or retry.
+The Qt 6 application edits timing and scheduling fields through a small polkit
+helper. Apply validates and atomically replaces the root-owned profile, restarts
+the fixed system service, verifies the daemon and loaded profile fingerprint,
+and rolls back on failure. It then restarts active user PipeWire services so the
+static adapters reopen against the new daemon. Native and ASIO clients still
+need to reconnect.
 
-Apply is transactional:
+## Wine ASIO
 
-```text
-validate candidate -> atomically save -> restart sidealsad -> verify new PID
-       failure      -> restore original -> restart -> verify rollback
-```
-
-Authentication is handled by polkit. The helper verifies that the socket peer is
-root-owned and matches the `sidealsad.service` MainPID, then compares the full
-loaded profile fingerprint. Concurrent edits are rejected by revision rather
-than overwritten. Comments and unrelated profile sections are preserved.
-
-Applying timing restarts the physical stream. After a successful restart or a
-reported failure that may have restarted the daemon, including a verified
-rollback, the control panel restarts active user PipeWire services so their
-static SideALSA adapters are recreated; desktop audio pauses briefly. Direct PRO
-and SHARED clients must reconnect. If `systemctl --user` cannot restart
-PipeWire, the control panel reports the manual recovery command without treating
-an otherwise successful daemon configuration as failed. Unsupported sample
-rates or ALSA geometries are rolled back automatically. The E1x2 has only been
-exercised at `48 kHz`; other rates remain hardware-dependent.
-
-An unexpected `sidealsad` restart disconnects existing ioplug handles. Restart
-the user PipeWire services with the command above to recreate static adapters;
-automatic ioplug reconnection is not implemented yet.
-
-The card number can differ. Find it with:
+The experimental x86_64 ASIO frontend connects directly to the exclusive PRO
+path; it does not pass through ALSA or PipeWire. Install its system artifacts
+with:
 
 ```sh
-aplay -l
-arecord -l
+./scripts/install.sh --with-asio
 ```
 
-## Test ALSA
-
-List logical PCMs:
+The prefix helper performs a second, user-local deployment under
+`$HOME/.local/lib/wine`, copies the PE DLL into each selected prefix, registers
+it, and prints the required `WINEDLLPATH` launch setting. For one prefix:
 
 ```sh
-aplay -L | grep sidealsa
+./scripts/install-asio.sh --no-build --wine-prefix "$WINEPREFIX"
 ```
 
-Direct playback test:
-
-```sh
-speaker-test -D sidealsa_line1 -c 2 -r 48000 -F S32_LE -t sine
-```
-
-Direct capture test:
-
-```sh
-arecord -D sidealsa_mic1 -f S32_LE -c 1 -r 48000 -d 5 /tmp/sidealsa-capture.wav
-```
-
-Watch counters while testing:
-
-```sh
-target/release/sidealsa-stats --samples 100 --interval-ms 100
-```
-
-Expected hardware counters stay at zero. Shared startup is armed by its first
-consumed block, so startup silence does not count as an underrun. The first
-missing block after arming increments `shared_underruns` and disarms that
-episode; the next valid block rearms it. A paused client therefore does not add
-one underrun per hardware period. With
-`shared_playback_repeat_on_underrun = true`, the daemon keeps mixing that port's
-last valid logical block until a new exact block arrives. With the setting
-omitted or `false`, its missing contribution is silence. Stop, close, restart,
-and hardware-generation changes invalidate the cache. Long outages can produce
-a repeating tone when concealment is enabled. `sidealsa-stats` also reports
-persistent diagnostics for each SHARED playback port:
-
-- `underruns` identifies the affected port and records the last missing
-  sequence, monotonic timestamp, and current/maximum sequence lag.
-- `expired_playback_periods` counts stale client periods discarded by the ALSA
-  ioplug. SHARED playback realigns after discarding them instead of forcing an
-  ALSA XRUN; PRO keeps its strict `EPIPE` behavior.
-- `submit_failures` counts publications rejected because no shared-memory slot
-  was available.
-- `xruns` counts SHARED playback `EPIPE` results that reached the ALSA plugin,
-  including pointer drift and genuine stream discontinuities.
-
-These per-port counters survive client close and reopen for the lifetime of the
-daemon. They reset when `sidealsad` restarts.
-
-### osu! Exclusive ALSA
-
-`sidealsa_pro` is advertised directly to ALSA device enumerators as
-`SideALSA PRO`. Select that device in osu! to open the raw 8-channel PRO PCM.
-This claims the exclusive PRO slot; ASIO, DAWs, and other PRO clients will
-receive `BUSY` until osu! releases it. No ALSA plug, route, dmix, or resampler
-is inserted.
-
-## Test PipeWire
-
-Check adapters:
-
-```sh
-wpctl status
-pw-top
-```
-
-Play raw S32_LE data into a logical port:
-
-```sh
-pw-cat --playback \
-  --target sidealsa-line1 \
-  --raw --format s32 --rate 48000 --channels 2 \
-  /path/to/stereo-s32le.raw
-```
-
-Record a logical input:
-
-```sh
-pw-cat --record \
-  --target sidealsa-mic1 \
-  --raw --format s32 --rate 48000 --channels 1 \
-  /tmp/sidealsa-mic1.raw
-```
-
-PipeWire `ERR=0` is not sufficient proof by itself. Also inspect SideALSA
-`shared_underruns` and `shared_overruns`, because a client can receive silence
-or lose capture blocks without a PipeWire graph xrun.
-
-## Build ASIO
-
-SideALSA ASIO uses PRO directly. It does not use the ALSA ioplug.
-
-Build 64-bit Wine ASIO artifacts:
-
-```sh
-cmake -S crates/sidealsa-asio \
-  -B build-asio \
-  -DCMAKE_BUILD_TYPE=Release
-cmake --build build-asio --target \
-  sidealsa-asio sidealsa-asio-probe sidealsa-asio-loopback-test
-```
-
-Artifacts:
-
-```text
-build-asio/sidealsa-asio64.dll
-build-asio/sidealsa-asio64.dll.so
-build-asio/sidealsa-asio-probe.exe
-build-asio/sidealsa-asio-probe.exe.so
-build-asio/sidealsa-asio-loopback-test.exe
-build-asio/sidealsa-asio-loopback-test.exe.so
-```
-
-The runtime layout also provides Wine 10+ `sidealsa-asio.dll` aliases.
-
-The ASIO frontend expects `64`-frame ASIO buffers, `48 kHz`, 10 inputs, and 8
-outputs. It reports 64 input frames and 64 output frames in the zero-lead
-reference profile. Only one PRO owner is allowed. Close any other PRO client
-before starting a DAW or ASIO probe.
-
-## Install ASIO Into Steam Prefixes
-
-PipeASIO uses a user-local Wine library root, copies the PE DLL into each Wine
-prefix, registers it with `regsvr32`, and sets `WINEDLLPATH` for Proton. SideALSA
-uses the same deployment pattern. Reference:
-
-<https://github.com/M0n7y5/pipeasio>
-
-Install and register in every discovered Steam compatdata prefix:
-
-```sh
-./scripts/install-asio.sh --all-steam
-```
-
-Register one game by AppID:
-
-```sh
-./scripts/install-asio.sh --all-steam --appid APPID
-```
-
-Register an explicit prefix:
-
-```sh
-./scripts/install-asio.sh \
-  --steam-prefix "$HOME/.local/share/Steam/steamapps/compatdata/APPID/pfx"
-```
-
-The helper installs files under:
-
-```text
-$HOME/.local/lib/wine/x86_64-windows/sidealsa-asio64.dll
-$HOME/.local/lib/wine/x86_64-unix/sidealsa-asio64.dll.so
-```
-
-It copies the PE half into each prefix's `system32` directory and registers
-`HKLM\Software\ASIO\SideALSA` plus the SideALSA CLSID. It does not modify
-Steam files or install anything system-wide.
-
-Reuse an existing ASIO build:
+Other registration selections include:
 
 ```sh
 ./scripts/install-asio.sh --no-build --all-steam
+./scripts/install-asio.sh --no-build --all-steam --appid APPID
+./scripts/install-asio.sh --no-build --steam-prefix /path/to/pfx
 ```
 
-When the daemon protocol changes, rebuild the Rust workspace and ASIO artifacts
-before using `--no-build`. Replace both system and user-local Wine copies, then
-restart `wineserver` so it does not retain an old Unix DLL.
+If `sidealsad` was installed with a non-default `--socket`, launch Wine with the
+same path in `SIDEALSA_SOCKET`; the ASIO frontend otherwise uses
+`/tmp/sidealsad.sock` and cannot discover the installer's custom setting.
 
-Use a different user-local install root:
+The runtime reads rate, period, channels, and latency from the daemon. Current
+acceptance and probe coverage is limited to the reference 48 kHz/Q64 geometry.
+Detailed build, lifecycle, probe, and analog loopback procedures are in
+[ASIO Frontend](docs/milestone-asio.md); use
+`./scripts/install-asio.sh --help` for deployment options.
+
+## Configuration
+
+Profiles are parsed, validated, and compiled before hardware streaming starts.
+Validation covers channel ranges, IDs, mappings, timing geometry, formats, and
+realtime settings. The real-time worker does not parse TOML or inspect port
+strings.
+
+Physical channels and logical ports remain separate. Every logical port is a
+channel view into one physical playback or capture stream; SideALSA does not
+create a hardware stream or real-time audio thread per port. The control plane
+does use a thread for each connected client.
+
+The core accepts profile-defined devices, but the installed ALSA and PipeWire
+fragments currently assume the E1x2 reference IDs, directions, and channel
+widths. `scripts/install.sh` performs only a literal text check for assignments
+such as `id = "line1"`; it does not semantically verify that a custom profile is
+compatible with those fragments. Equivalent TOML formatting may also fail that
+text check. Automatic fragment generation and semantic adapter compatibility
+validation are future work.
+
+## Build and Test
+
+Build the Rust workspace:
 
 ```sh
-./scripts/install-asio.sh \
-  --install-root "$HOME/.local/share/sidealsa" \
-  --all-steam
-```
-
-The helper needs a host `wine` executable for registration. Override it when
-needed:
-
-```sh
-./scripts/install-asio.sh \
-  --wine /opt/wine-staging/bin/wine \
-  --steam-prefix "$HOME/.local/share/Steam/steamapps/compatdata/APPID/pfx"
-```
-
-## Steam Launch Options
-
-For a default user-local install, set this per-game Steam launch option:
-
-```text
-SIDEALSA_SOCKET=/tmp/sidealsad.sock WINEDLLPATH=/home/USER/.local/lib/wine %command%
-```
-
-Use an absolute path. Replace `USER`. `~` and `$HOME` are not reliably expanded
-inside Steam launch options.
-
-Start the daemon before launching the game:
-
-```sh
-systemctl is-active sidealsad.service
-test -S /tmp/sidealsad.sock
-```
-
-After registration, select **SideALSA** in the DAW's ASIO device list.
-
-For native Wine, use the same helper with a normal Wine prefix:
-
-```sh
-./scripts/install-asio.sh --wine-prefix "$HOME/.wine"
-```
-
-For Proton prefixes, host `wine` registration is normally enough because the
-registry is stored inside the selected prefix. If registration fails because
-host Wine and Proton use incompatible prefix formats, run `regsvr32` through
-the matching Proton/Wine runtime while preserving `WINEDLLPATH`.
-
-## ASIO Probe
-
-Run the built probe against the running daemon:
-
-```sh
-SIDEALSA_SOCKET=/tmp/sidealsad.sock \
-WINEDLLPATH="$HOME/.local/lib/wine" \
-WINEPREFIX="$HOME/.wine" \
-wine build-asio/sidealsa-asio-probe.exe.so
-```
-
-Run the `.exe.so` host directly through Wine. The generated `.exe` wrapper
-prepends its invocation directory to `WINEDLLPATH`; invoking that wrapper by a
-relative path can make COM lookup fail on current Wine releases.
-
-The probe checks COM activation, channel counts, `64`-frame buffer negotiation,
-64-frame output latency, sample rate, buffer pointers, callback quiescence after
-`Stop`, and reuse of the same Wine callback thread after the next `Start`.
-
-With playback channel 0 physically looped to capture channel 4, run strict
-latency and abrupt-reacquisition checks:
-
-```sh
-WINEDLLPATH="$PWD/build-asio" wine \
-  build-asio/sidealsa-asio-loopback-test.exe.so
-scripts/test-asio-reacquire.sh
-```
-
-The first command rejects pulse loss or frame variation across two Start legs.
-The harness records a baseline, kills a streaming process without `Stop`, then
-requires stable reacquisition, parity with an immediately following native PRO
-loopback, and unchanged hardware timeline counters. Absolute analog phase may
-move between processes on explicit-feedback USB hardware. The harness derives
-the serving daemon PID from `SO_PEERCRED` on the tested socket.
-`SIDEALSA_DAEMON_PID` may be set as an additional assertion.
-
-The harness analyzes `raw loopback = common SideALSA/hardware path + ASIO
-frontend residual`. It prints raw ASIO and paired native values separately and
-accepts only the `ASIO - native` residual. A baseline-to-reacquisition shift in
-the common path is reported separately and is not misclassified as either an
-ASIO regression or a hardware-only event. The native reference runs at the same
-default realtime priority (`46`) as the ASIO worker.
-
-Probe result `77` means daemon or Wine driver unavailable. Check:
-
-```sh
-systemctl status sidealsad.service
-test -S /tmp/sidealsad.sock
-ls -l "$HOME/.local/lib/wine/x86_64-windows/sidealsa-asio64.dll"
-ls -l "$HOME/.local/lib/wine/x86_64-unix/sidealsa-asio64.dll.so"
-```
-
-## Troubleshooting
-
-### ASIO driver missing in DAW
-
-Check prefix registration and launch environment:
-
-```sh
-WINEPREFIX=/path/to/pfx wine reg query 'HKLM\Software\ASIO\SideALSA'
-```
-
-Confirm Steam launch options contain absolute `WINEDLLPATH` and
-`SIDEALSA_SOCKET`.
-
-### `regsvr32` fails with `c0000135`
-
-Wine cannot load the Unix half. Check that `WINEDLLPATH` points to the directory
-containing `x86_64-unix/sidealsa-asio64.dll.so`, not to the `x86_64-unix`
-directory itself.
-
-### ASIO reports busy
-
-PRO is exclusive. Stop another DAW, `sidealsa-pro-client-test`, or ASIO host
-before starting the new host.
-
-### No sound but ASIO callbacks run
-
-Check daemon socket, hardware counters, and current PRO ownership:
-
-```sh
-target/release/sidealsa-stats --samples 10
-ps -ef | grep sidealsad
-```
-
-ASIO output is raw physical multichannel output. SideALSA ASIO does not pass
-through PipeWire or logical shared ports.
-
-### ASIO glitches while Discord or OBS is active
-
-First distinguish a client miss from a hardware failure:
-
-```sh
-sidealsa-stats --samples 20 --interval-ms 100
-```
-
-- Rising `client` with stable `core`, `hw_playback`, and `hw_capture` means the
-  ASIO callback missed the bounded PRO handoff; the hardware timeline stayed
-  intact.
-- Rising `core` with stable hardware counters means a delayed hardware wake
-  shortened the client handoff to preserve one playback period. The current
-  sequence may fall back to silence, but ALSA continues.
-- Rising `callback_overruns` means the host callback exceeded the full Q64
-  period.
-- Rising `rt_failures` means Wine could not promote the ASIO worker to the
-  configured `pro_realtime_priority`.
-
-The reference Q64/Q32 profile uses `pro_handoff_us = 500`. This leaves the
-validated physical-write reserve while covering callback durations above the
-old `250 us` budget. The hardware loop clamps that budget against current ALSA
-delay and keeps one Q64 period reserved for an emergency write. Larger values
-are not automatically safer: the profile validator rejects a handoff that would
-consume the Q32 write deadline. For more margin, increase
-`pro_latency_periods` to `1` in the control panel at the cost of one additional
-client period.
-
-## Development Checks
-
-```sh
-cargo fmt --all
-cargo test --release --workspace --all-targets
-cargo clippy --release --workspace --all-targets -- -D warnings
 cargo build --release --workspace
 ```
 
-Qt control-panel build check:
+Run the non-hardware verification suite:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Build the GUI separately because it is not a Cargo workspace member:
 
 ```sh
 cmake -S crates/sidealsa-gui -B build-gui -DCMAKE_BUILD_TYPE=Release
 cmake --build build-gui
 ```
 
-ASIO build check:
+Hardware, loopback, PipeWire, and ASIO acceptance tests require the reference
+device and, for latency tests, a physical cable from playback channel 0 to the
+selected capture channel. Do not run direct hardware tools while `sidealsad`
+owns the device. See the milestone documents for each test setup and its current
+acceptance criteria.
 
-```sh
-cmake -S crates/sidealsa-asio -B build-asio -DCMAKE_BUILD_TYPE=Release
-cmake --build build-asio --target \
-  sidealsa-asio sidealsa-asio-probe sidealsa-asio-loopback-test
-```
+## Workspace
+
+| Path | Responsibility |
+| --- | --- |
+| `crates/sidealsa-core` | ALSA hardware engine, routing, timeline, recovery |
+| `crates/sidealsa-config` | TOML profile parsing, validation, fingerprinting |
+| `crates/sidealsa-protocol` | Control and shared-memory protocol definitions |
+| `crates/sidealsa-client` | Reusable native client library |
+| `crates/sidealsa-daemon` | `sidealsad` process and client ownership |
+| `crates/sidealsa-alsa` | ALSA external ioplug |
+| `crates/sidealsa-asio` | Rust runtime and Wine ASIO build |
+| `crates/sidealsa-cli` | Diagnostics and test clients |
+| `crates/sidealsa-admin` | Restricted profile-apply helper |
+| `crates/sidealsa-gui` | Qt 6 control panel, built with CMake |
+
+## Known Limitations
+
+- The E1x2 OTG is the only fully exercised device profile.
+- The installed ALSA and PipeWire objects are static for the reference port IDs.
+- Every SHARED port has one backend owner; multi-application desktop mixing
+  occurs in PipeWire rather than inside SideALSA.
+- The ALSA ioplug supports S32_LE, RW-interleaved access, and the profile sample
+  rate. It does not provide mmap, resampling, or format conversion.
+- ALSA `sidealsa_pro` does not currently provide a conventional two-handle
+  full-duplex open because the second handle encounters exclusive PRO ownership.
+- PipeWire integration uses static ALSA adapters. There is no custom PipeWire
+  client, automatic node generation, or automatic reconnection after a daemon
+  restart.
+- The ASIO frontend is x86_64-only and experimental; non-reference stream
+  geometry has not received acceptance coverage.
+- Device hotplug, resampling, dynamic DSP, an arbitrary routing graph, and a GUI
+  mixer are out of scope for the current implementation.
+- Fixed analog loopback phase is not guaranteed across runtime load transitions
+  or PRO release/reacquisition. Strict reference-device tests have observed a
+  loopback move from 372 to 409 frames without a hardware XRUN, timeline reset,
+  generation change, or core deadline miss. ALSA pointer diagnostics did not
+  reliably predict that movement. The hardware timeline remained continuous,
+  but the stricter analog-phase invariant is unresolved.
+
+Current ASIO timing evidence and rejected phase-control experiments are recorded
+in [ASIO Frontend](docs/milestone-asio.md). Earlier subsystem acceptance results
+remain in the milestone documents and should be read with their stated profile
+and test conditions.
+
+## Documentation
+
+- [Installation and lifecycle](docs/installation.md)
+- [Direct ALSA engine](docs/milestone-1.md)
+- [Profiles and channel splitting](docs/milestone-2.md)
+- [Local PRO path](docs/milestone-3.md)
+- [Daemon and protocol](docs/milestone-4.md)
+- [SHARED path](docs/milestone-5.md)
+- [Client library](docs/milestone-6.md)
+- [ALSA ioplug](docs/milestone-7.md)
+- [PipeWire integration](docs/milestone-8.md)
+- [Wine ASIO frontend](docs/milestone-asio.md)
 
 ## License
 
-SideALSA is licensed under GPL-3.0-or-later. See [`LICENSE`](LICENSE).
+SideALSA is licensed under [GPL-3.0-or-later](LICENSE).
