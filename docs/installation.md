@@ -58,25 +58,25 @@ any of those IDs instead of installing adapters that cannot open their ports.
 Automatic adapter generation for arbitrary validated profiles is not yet
 implemented.
 
-The Q64/Q32 E1x2 packet pipeline uses `pro_latency_periods = 0`,
-`linked_playback_guard_frames = 48`, `linked_phase_max_attempts = 8`, and
-`pro_handoff_us = 500`. Capture block N
-is returned as playback block N after the bounded client handoff, so native PRO
-and ASIO use the same callback timeline. The profile reports 64 frames of PRO
-output latency. The 500-us handoff covers observed Wine callback overhead under
-desktop capture load. A delayed hardware wake shortens that handoff when needed
-to retain one Q64 period for the next ALSA write. Linked startup primes 232
-frames: one Q64 capture interval, a 48-frame guard, three Q32 refill-headroom
-periods, and the 24 frames consumed by the handoff.
+The E1x2 PRO pipeline uses identical Q64 client and physical ALSA periods with a
+B256 hardware ring. `pro_latency_periods = 0`, timer scheduling is disabled, and
+`linked_phase_max_attempts = 0`. Linked startup primes the ALSA playback ring
+with Q128 of silence selected by `playback_queue_periods = 2` and starts
+playback and capture together. Capture block N is returned as playback target
+N, so native PRO and ASIO use the same callback timeline.
 
-Before the control socket opens, each startup attempt runs 750 silence cycles,
-one second at 48 kHz/Q64, using the normal handoff and playback-write cadence.
-Any capture-to-playback write interval shorter than the configured handoff less
-one eighth of a physical period rejects that start. A rejected attempt restarts
-the linked hardware before clients exist; eight failed attempts fail daemon
-startup instead of exposing an unqualified stream. These maintenance transfers
-do not advance the published hardware timeline. Runtime client misses and
-normal XRUN recovery never invoke the startup qualifier.
+ALSA playback and capture poll readiness jointly start each cycle. The
+playback-ready eventfd ends the client wait early; `pro_handoff_us = 1000`
+bounds that wait. The engine uses the post-poll `snd_pcm_avail_update()` value
+and reserves Q16 for fallback selection, mixing, and the ALSA write, shortening
+the deadline further after a late hardware wake. It does not call the deprecated
+`snd_pcm_hwsync()` in this period-driven path.
+The reference path does not use live-delay budgeting,
+`linked_playback_guard_frames`, or a userspace queue-target sleep. If exact PRO
+playback is unavailable, the daemon
+repeats the last valid PRO period without moving the sequence. It uses silence
+before the first valid block and after lifecycle or hardware-generation changes.
+Current SHARED playback is mixed after the PRO selection.
 
 The ALSA ioplug keeps SideALSA SHARED transfers at Q64 and uses the independent
 B512 daemon ring. It aggregates four internal blocks per Q256 external period.

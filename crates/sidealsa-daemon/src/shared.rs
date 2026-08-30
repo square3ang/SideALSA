@@ -1,6 +1,16 @@
-use std::{io, mem::size_of, os::fd::RawFd};
+use std::{io, mem::size_of, os::fd::RawFd, ptr, time::Duration};
 
 pub use sidealsa_client::{SharedError, SharedRegion};
+
+const EVENTFD_IO_ATTEMPTS: usize = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaybackReadyWait {
+    Ready,
+    Timeout,
+    Interrupted,
+    Failed,
+}
 
 pub struct SharedEvents {
     capture: RawFd,
@@ -59,6 +69,40 @@ impl SharedEvents {
         drain(self.playback_ready);
     }
 
+    pub fn notify_playback_ready(&self) {
+        notify(self.playback_ready);
+    }
+
+    pub fn wait_playback_ready(&self, timeout: Duration) -> PlaybackReadyWait {
+        let mut descriptor = libc::pollfd {
+            fd: self.playback_ready,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout = libc::timespec {
+            tv_sec: timeout.as_secs().try_into().unwrap_or(libc::time_t::MAX),
+            tv_nsec: timeout.subsec_nanos().into(),
+        };
+        let result = unsafe { libc::ppoll(&mut descriptor, 1, &timeout, ptr::null()) };
+        if result == 0 {
+            return PlaybackReadyWait::Timeout;
+        }
+        if result < 0 {
+            return if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                PlaybackReadyWait::Interrupted
+            } else {
+                PlaybackReadyWait::Failed
+            };
+        }
+        if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            PlaybackReadyWait::Failed
+        } else if descriptor.revents & libc::POLLIN != 0 {
+            PlaybackReadyWait::Ready
+        } else {
+            PlaybackReadyWait::Failed
+        }
+    }
+
     pub fn drain(&self) {
         drain(self.capture);
         drain(self.playback);
@@ -78,15 +122,58 @@ impl Drop for SharedEvents {
 
 fn notify(fd: RawFd) {
     let value = 1_u64;
-    let result = unsafe { libc::write(fd, (&value as *const u64).cast(), size_of::<u64>()) };
-    if result < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN) {
-        let _ = result;
+    for _ in 0..EVENTFD_IO_ATTEMPTS {
+        let result = unsafe { libc::write(fd, (&value as *const u64).cast(), size_of::<u64>()) };
+        if result >= 0 {
+            return;
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) | None => return,
+            Some(_) => return,
+        }
     }
 }
 
 fn drain(fd: RawFd) {
     let mut value = 0_u64;
-    unsafe {
-        libc::read(fd, (&mut value as *mut u64).cast(), size_of::<u64>());
+    for _ in 0..EVENTFD_IO_ATTEMPTS {
+        let result = unsafe { libc::read(fd, (&mut value as *mut u64).cast(), size_of::<u64>()) };
+        if result >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PlaybackReadyWait, SharedEvents};
+    use std::time::Duration;
+
+    #[test]
+    fn playback_ready_wait_distinguishes_timeout_and_notification() {
+        let events = SharedEvents::new().expect("events should create");
+
+        assert_eq!(
+            events.wait_playback_ready(Duration::ZERO),
+            PlaybackReadyWait::Timeout
+        );
+        events.notify_playback_ready();
+        assert_eq!(
+            events.wait_playback_ready(Duration::from_millis(10)),
+            PlaybackReadyWait::Ready
+        );
+    }
+
+    #[test]
+    fn playback_ready_wait_reports_descriptor_failure() {
+        let mut events = SharedEvents::new().expect("events should create");
+        unsafe {
+            libc::close(events.playback_ready);
+        }
+        let result = events.wait_playback_ready(Duration::ZERO);
+        events.playback_ready = -1;
+
+        assert_eq!(result, PlaybackReadyWait::Failed);
     }
 }

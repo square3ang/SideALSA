@@ -6,11 +6,10 @@ sequence handling, and callback dispatch. The C shim supplies the Wine COM,
 registration, DLL ABI, and `CreateThread` bridge required for Wine TEB setup.
 
 The adapter expects the daemon profile to expose a `64`-frame logical period.
-The reference E1x2 profile uses physical ALSA Q32, aggregates transfers into
-Q64 client cycles, and keeps `buffer_size = 256`. Linked startup primes 232
-frames: one Q64 capture interval, a 48-frame physical write reserve, three Q32
-refill-headroom periods, and the 24 frames consumed by the 500 us client
-handoff.
+The reference E1x2 profile uses the same Q64 physical ALSA period and keeps
+`buffer_size = 256`. Linked startup primes the playback ring with silence before
+starting playback and capture together. Capacity is B256; the queued startup
+audio is Q128.
 
 ASIO reports 64 input frames and 64 output frames for the reference profile.
 These values do not include USB, firmware, converter, or analog device-loopback
@@ -19,24 +18,22 @@ latency.
 
 PRO duplex clients use a zero-lead pipeline. Hardware capture sequence N is
 published as playback target N while SHARED capture retains hardware sequence
-N. The current block is consumed after an absolute `pro_handoff_us` deadline
-that starts when PRO capture publication completes. SHARED capture routing is
-deferred until after that handoff. The hardware loop writes the complete Q64
-block with the configured linked playback guard. Missing playback gets one
-zero-filled fallback period; stale playback cannot affect later sequences. PRO
-session starts and deadline misses never request a hardware restart.
-After capture, the daemon also bounds the handoff by current ALSA playback delay.
-A late RT wake therefore shortens or skips the client wait before it consumes
-the Q64 emergency write reserve.
+N. ALSA playback and capture poll readiness jointly start the cycle, and the
+playback-ready eventfd ends the client wait early. The profile's 1.0 ms handoff
+deadline is dynamically shortened to retain a fixed playback write reserve.
+The reference mode does not use live-delay budgeting, a linked playback guard,
+or a queue-target sleep. Missing
+playback repeats the last valid PRO period without moving the sequence; silence
+is used before the first valid block and after lifecycle or hardware-generation
+changes. Current SHARED playback is mixed after the PRO selection. PRO session
+starts and misses never request a hardware restart.
 
 Protocol v16 carries the playback-ready eventfd, timing diagnostics, physical
 hardware period, effective PRO output latency, linked-start phase calibration
 result, independent SHARED buffer size, per-port SHARED playback diagnostics,
 the loaded profile fingerprint, and a recent 128-sample duplex pointer-phase
-window. The pointer phase uses ALSA's default audio timestamp to normalize the
-playback and capture hardware-pointer observations by their separate status
-query times. It is an observational diagnostic, not a USB-link or analog
-timestamp. Shared-memory v9 carries the
+window. Direct whole-period mode avoids per-cycle ALSA status queries, so that
+legacy diagnostic remains empty there. Shared-memory v9 carries the
 daemon's authoritative playback and activation watermarks plus the
 shared-capture discontinuity counter, playback publication timestamps, client
 playback diagnostics, and hardware timeline generation.
@@ -46,8 +43,8 @@ The client chooses the oldest capture target not older than that watermark, so
 a newly published future block cannot displace an exact block the daemon still
 needs. Sequence gaps advance sample position and double-buffer parity before
 callback dispatch.
-Playback keeps its original sequence; the daemon discards it if its exact
-deadline has already passed.
+Playback keeps its original sequence; stale sequence slots cannot affect later
+cycles.
 
 ASIO `Stop` gates host callbacks without stopping the SideALSA stream. The Wine
 worker continues consuming capture and publishes exact-sequence silence. Stop
@@ -66,31 +63,15 @@ permanently poisoning the worker. Daemon disconnects and other stream failures
 remain terminal and request a host reset. A host callback that blocks forever
 cannot be recovered internally because that callback owns the worker thread.
 
-`device.linked_phase_max_attempts` optionally calibrates linked zero-lead
-startup before the control socket opens. Each attempt runs one second of silence
-at the production capture, handoff, playback-target, and write cadence. The
-minimum observed capture-to-playback write interval must reach the configured
-handoff less one eighth of a physical period. A shorter cycle
-drops, prepares, primes, relinks, dithers, and restarts the hardware before any
-client exists. Intentional retries increment generation, timeline-reset, and
-phase-rebase counters, but not hardware-XRUN counters. Exhausting the configured
-attempts fails daemon startup instead of exposing an unqualified final stream.
-Maintenance transfers do not advance `sample_position`, playback/capture
-positions, or `periods_processed`. `linked_phase_score_nanos` reports the final
-attempt's minimum write interval; analog loopback remains the latency authority.
+Direct whole-period PRO requires `linked_phase_max_attempts = 0`; it does not
+dither or restart a healthy linked stream during startup. Legacy split-period
+profiles can still use the startup qualifier. Earlier occupancy-prediction,
+Q32 qualification, and client-triggered runtime-rebase experiments are retained
+in the verification history below because they produced useful negative
+evidence, including genuine capture XRUNs and repeated timeline resets.
 
-The E1x2 reference profile enables eight startup attempts. Runtime recovery does
-not rerun the qualifier, and a recoverable error between qualification and first
-readiness fails that startup instead of publishing an unqualified restart. An
-earlier occupancy-prediction qualifier and a client-triggered runtime rebase
-experiment were rejected after producing genuine capture XRUNs and repeated
-timeline resets. An armed deadline miss writes one
-exact-sequence silence fallback, discards any stale late block, and resumes with
-the next exact sequence while hardware remains continuous.
-
-The reference profile keeps ALSA hardware `buffer_size = 256`, a 48-frame linked
-playback guard, and an independent `shared_buffer_size = 512`. SHARED capacity
-does not alter the physical queue.
+The reference profile keeps ALSA hardware `buffer_size = 256` and an independent
+`shared_buffer_size = 512`. SHARED capacity does not alter the physical queue.
 
 ## Build
 
@@ -186,10 +167,10 @@ hardware/phase isolation from a fully clean client-scheduling pass.
 
 ASIO begins with the first playback-clock target and publishes playback under
 that exact sequence. The E1x2 profile keeps zero process-ahead blocks. It uses a
-Q32 packet cadence, a 48-frame playback guard, and a real 500 us client handoff.
-The daemon never waits past that bounded cutoff. It samples the exact
-shared-memory sequence once, substitutes silence when absent, and resumes only
-with the next exact sequence.
+Q64 physical cadence, a Q128 playback queue, and a 1.0 ms event-driven client
+deadline. It consumes only the exact shared-memory sequence. When
+absent, the daemon repeats the last valid PRO period and resumes with the next
+exact sequence.
 
 The ASIO frontend owns its callback thread and attempts to raise it to the
 profile's `device.pro_realtime_priority`. When omitted, it defaults to two below
@@ -500,6 +481,23 @@ cargo run --release -p sidealsa-cli --bin sidealsa-stats -- --socket /tmp/sideal
   before hardware deployment. Its cadence would free-run against the
   asynchronous USB feedback clock and consume the 500 us handoff under normal
   oscillator error. Per-cycle ALSA availability remains the clock authority.
+- A per-cycle `snd_pcm_avail()` experiment was also rejected. That call performs
+  the deprecated hardware-sync operation internally before updating ALSA's
+  application pointer. The synced direct test varied from 367 to 391 frames in
+  one open, and the daemon showed the same range. Restoring the poll-driven
+  `snd_pcm_avail_update()` path held a 30000-period direct run at 361 frames.
+  Poll readiness remains the hardware clock and no explicit `snd_pcm_hwsync()`
+  is used in the current path.
+- The Q192/1.0-ms revision ran two 15-second Wine ASIO legs concurrently with a
+  clean release workspace build. Both ASIO legs held 451 frames with no lost
+  pulse, callback overrun, PRO miss, hardware XRUN, generation change, or
+  timeline reset. A separate 24-worker, 512 MiB, 350-us callback-work run also
+  held both legs at 475 frames with all failure counters unchanged.
+- The current Q128/1.0-ms revision passed normal Wine ASIO plus a clean release
+  workspace build with no failure-counter change. ASIO held 403 frames in both
+  legs. The same installed daemon then completed simultaneous 100000-period RT
+  PRO and delayed SHARED runs at 403 frames; after 208232 hardware periods all
+  PRO, SHARED, hardware-XRUN, reset, and generation counters remained zero.
 
 ## Limitations
 

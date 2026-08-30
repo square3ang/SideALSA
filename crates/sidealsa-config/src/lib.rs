@@ -11,6 +11,8 @@ pub const MAX_REALTIME_PRIORITY: u32 = 99;
 pub const MAX_LINKED_PHASE_ATTEMPTS: u32 = 64;
 pub const DEFAULT_PRO_HANDOFF_US: u32 = 250;
 pub const LINKED_PHASE_OVERHEAD_DIVISOR: u32 = 8;
+pub const DIRECT_MIN_PLAYBACK_QUEUE_PERIODS: u32 = 2;
+pub const DIRECT_WRITE_RESERVE_DIVISOR: u32 = 4;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -482,6 +484,11 @@ impl HardwareConfig {
                     "playback_queue_periods must be non-zero".into(),
                 ));
             }
+            if self.uses_event_driven_linked_pro() && periods < DIRECT_MIN_PLAYBACK_QUEUE_PERIODS {
+                return Err(ProfileError::Invalid(format!(
+                    "direct whole-period PRO requires playback_queue_periods >= {DIRECT_MIN_PLAYBACK_QUEUE_PERIODS}"
+                )));
+            }
             let queue_frames = self.period_size.checked_mul(periods).ok_or_else(|| {
                 ProfileError::Invalid("playback_queue_periods is too large".into())
             })?;
@@ -492,6 +499,12 @@ impl HardwareConfig {
             }
         }
         if let Some(guard_frames) = self.linked_playback_guard_frames {
+            if self.uses_event_driven_linked_pro() {
+                return Err(ProfileError::Invalid(
+                    "linked_playback_guard_frames is incompatible with direct whole-period PRO"
+                        .into(),
+                ));
+            }
             if !self.effective_duplex_link() {
                 return Err(ProfileError::Invalid(
                     "linked_playback_guard_frames requires duplex_link = true".into(),
@@ -549,11 +562,27 @@ impl HardwareConfig {
             .saturating_mul(u64::from(self.rate))
             .div_ceil(1_000_000_000);
         if self.effective_duplex_link() && self.pro_latency_periods <= 1 {
-            let hardware_period_nanos = u64::from(hardware_period_size)
-                .saturating_mul(1_000_000_000)
-                / u64::from(self.rate);
-            let overhead_nanos = hardware_period_nanos / u64::from(LINKED_PHASE_OVERHEAD_DIVISOR);
-            if self.pro_handoff_nanos().saturating_add(overhead_nanos) > hardware_period_nanos {
+            let available_handoff_nanos = if self.uses_event_driven_linked_pro() {
+                let queue_periods = self
+                    .playback_queue_periods
+                    .unwrap_or(DIRECT_MIN_PLAYBACK_QUEUE_PERIODS);
+                let queued_after_wake = u64::from(self.period_size)
+                    .saturating_mul(u64::from(queue_periods.saturating_sub(1)));
+                let reserve_frames =
+                    u64::from(self.period_size).div_ceil(u64::from(DIRECT_WRITE_RESERVE_DIVISOR));
+                queued_after_wake
+                    .saturating_sub(reserve_frames)
+                    .saturating_mul(1_000_000_000)
+                    / u64::from(self.rate)
+            } else {
+                let hardware_period_nanos = u64::from(hardware_period_size)
+                    .saturating_mul(1_000_000_000)
+                    / u64::from(self.rate);
+                hardware_period_nanos.saturating_sub(
+                    hardware_period_nanos / u64::from(LINKED_PHASE_OVERHEAD_DIVISOR),
+                )
+            };
+            if self.pro_handoff_nanos() > available_handoff_nanos {
                 return Err(ProfileError::Invalid(
                     "pro_handoff_us leaves no physical-period write reserve".into(),
                 ));
@@ -565,9 +594,10 @@ impl HardwareConfig {
                     "pro_latency_periods = 0 requires duplex_link = true".into(),
                 ));
             }
-            if !self.playback_timer_scheduling {
+            if !self.playback_timer_scheduling && !self.uses_event_driven_linked_pro() {
                 return Err(ProfileError::Invalid(
-                    "pro_latency_periods = 0 requires playback_timer_scheduling = true".into(),
+                    "pro_latency_periods = 0 without direct whole-period mode requires playback_timer_scheduling = true"
+                        .into(),
                 ));
             }
             if self.buffer_size < self.period_size.saturating_mul(2) {
@@ -575,15 +605,19 @@ impl HardwareConfig {
                     "pro_latency_periods = 0 requires at least two logical periods".into(),
                 ));
             }
-            let safety_frames = handoff_frames
-                .div_ceil(u64::from(hardware_period_size))
-                .saturating_mul(u64::from(hardware_period_size));
-            let required_buffer = u64::from(self.period_size)
-                .saturating_add(u64::from(hardware_period_size))
-                .saturating_add(safety_frames);
+            let required_buffer = if self.uses_event_driven_linked_pro() {
+                u64::from(self.period_size).saturating_mul(3)
+            } else {
+                let safety_frames = handoff_frames
+                    .div_ceil(u64::from(hardware_period_size))
+                    .saturating_mul(u64::from(hardware_period_size));
+                u64::from(self.period_size)
+                    .saturating_add(u64::from(hardware_period_size))
+                    .saturating_add(safety_frames)
+            };
             if u64::from(self.buffer_size) < required_buffer {
                 return Err(ProfileError::Invalid(format!(
-                    "pro_latency_periods = 0 requires buffer_size >= {required_buffer} for linked handoff"
+                    "pro_latency_periods = 0 requires buffer_size >= {required_buffer}"
                 )));
             }
         }
@@ -597,6 +631,11 @@ impl HardwareConfig {
         {
             return Err(ProfileError::Invalid(
                 "linked_phase_max_attempts requires linked zero-lead PRO".into(),
+            ));
+        }
+        if self.uses_event_driven_linked_pro() && self.linked_phase_max_attempts > 0 {
+            return Err(ProfileError::Invalid(
+                "linked_phase_max_attempts is incompatible with direct whole-period PRO".into(),
             ));
         }
         if self.shared_latency_periods > MAX_SHARED_LATENCY_PERIODS {
@@ -646,6 +685,13 @@ impl HardwareConfig {
 
     pub fn effective_hardware_period_size(&self) -> u32 {
         self.hardware_period_size.unwrap_or(self.period_size)
+    }
+
+    pub fn uses_event_driven_linked_pro(&self) -> bool {
+        self.effective_duplex_link()
+            && self.pro_latency_periods == 0
+            && self.effective_hardware_period_size() == self.period_size
+            && !self.playback_timer_scheduling
     }
 
     pub fn effective_linked_playback_guard_frames(&self) -> u32 {
@@ -864,18 +910,22 @@ mod tests {
     }
 
     #[test]
-    fn parses_reference_profile_handoff() {
+    fn parses_reference_direct_pro_profile() {
         let profile = Profile::from_toml(E1X2_PROFILE).expect("reference profile should parse");
 
         assert_eq!(profile.device.buffer_size, 256);
-        assert_eq!(profile.device.pro_handoff_us, 500);
-        assert_eq!(profile.device.pro_handoff_nanos(), 500_000);
+        assert_eq!(profile.device.period_size, 64);
+        assert_eq!(profile.device.effective_hardware_period_size(), 64);
+        assert_eq!(profile.device.playback_queue_periods, Some(2));
+        assert_eq!(profile.device.pro_handoff_us, 1000);
         assert_eq!(profile.device.pro_latency_periods, 0);
-        assert_eq!(profile.device.linked_playback_guard_frames, Some(48));
-        assert_eq!(profile.device.effective_linked_playback_guard_frames(), 48);
+        assert!(!profile.device.playback_timer_scheduling);
+        assert!(profile.device.uses_event_driven_linked_pro());
+        assert_eq!(profile.device.linked_playback_guard_frames, None);
+        assert_eq!(profile.device.effective_linked_playback_guard_frames(), 64);
         assert!(!profile.device.uses_staged_pro_packets());
         assert_eq!(profile.device.effective_pro_output_latency_frames(), 64);
-        assert_eq!(profile.device.linked_phase_max_attempts, 8);
+        assert_eq!(profile.device.linked_phase_max_attempts, 0);
         assert_eq!(profile.device.effective_shared_buffer_size(), 512);
         assert_eq!(profile.device.shared_latency_periods, 7);
         assert!(profile.device.shared_playback_repeat_on_underrun);
@@ -883,15 +933,10 @@ mod tests {
 
     #[test]
     fn whole_period_link_does_not_report_packet_staging() {
-        let text = E1X2_PROFILE
-            .replace("hardware_period_size = 32", "hardware_period_size = 64")
-            .replace(
-                "linked_playback_guard_frames = 48",
-                "linked_playback_guard_frames = 64",
-            );
-        let profile = Profile::from_toml(&text).expect("whole-period profile should parse");
+        let profile = Profile::from_toml(E1X2_PROFILE).expect("whole-period profile should parse");
 
         assert!(!profile.device.uses_staged_pro_packets());
+        assert!(profile.device.uses_event_driven_linked_pro());
         assert_eq!(profile.device.effective_pro_output_latency_frames(), 64);
     }
 
@@ -1021,9 +1066,9 @@ mod tests {
     }
 
     #[test]
-    fn accepts_reference_guard_with_zero_lead() {
+    fn reference_direct_pro_does_not_use_a_queue_guard() {
         let profile = Profile::from_toml(E1X2_PROFILE).expect("profile should parse");
-        assert_eq!(profile.device.linked_playback_guard_frames, Some(48));
+        assert_eq!(profile.device.linked_playback_guard_frames, None);
     }
 
     #[test]
@@ -1057,14 +1102,53 @@ mod tests {
     }
 
     #[test]
-    fn zero_lead_guard_leaves_a_full_client_write() {
+    fn rejects_queue_guard_in_direct_whole_period_mode() {
         let text = E1X2_PROFILE.replace(
-            "linked_playback_guard_frames = 48",
-            "linked_playback_guard_frames = 224",
+            "duplex_link = true",
+            "duplex_link = true\nlinked_playback_guard_frames = 224",
         );
 
         let error = Profile::from_toml(&text).expect_err("profile should fail");
-        assert!(error.to_string().contains("leave one linked write"));
+        assert!(
+            error
+                .to_string()
+                .contains("incompatible with direct whole-period PRO")
+        );
+    }
+
+    #[test]
+    fn rejects_shallow_playback_queue_in_direct_whole_period_mode() {
+        let text = E1X2_PROFILE.replace("playback_queue_periods = 2", "playback_queue_periods = 1");
+
+        let error = Profile::from_toml(&text).expect_err("profile should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("requires playback_queue_periods >= 2")
+        );
+    }
+
+    #[test]
+    fn direct_whole_period_mode_requires_three_periods_of_capacity() {
+        let text = E1X2_PROFILE.replace(
+            "buffer_size = 256\nplayback_queue_periods = 2",
+            "buffer_size = 128",
+        );
+
+        let error = Profile::from_toml(&text).expect_err("profile should fail");
+        assert!(error.to_string().contains("requires buffer_size >= 192"));
+    }
+
+    #[test]
+    fn direct_whole_period_handoff_keeps_write_reserve() {
+        let text = E1X2_PROFILE.replace("pro_handoff_us = 1000", "pro_handoff_us = 1100");
+
+        let error = Profile::from_toml(&text).expect_err("profile should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("leaves no physical-period write reserve")
+        );
     }
 
     #[test]
@@ -1177,6 +1261,11 @@ mod tests {
     #[test]
     fn rejects_zero_pro_latency_without_timer_scheduling() {
         let text = PROFILE
+            .replace("buffer_size = 64", "buffer_size = 96")
+            .replace(
+                "period_size = 32",
+                "period_size = 32\n        hardware_period_size = 16",
+            )
             .replace("pro_latency_periods = 1", "pro_latency_periods = 0")
             .replace(
                 "playback_timer_scheduling = true",
@@ -1187,7 +1276,22 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("requires playback_timer_scheduling = true")
+                .contains("without direct whole-period mode requires playback_timer_scheduling")
+        );
+    }
+
+    #[test]
+    fn rejects_phase_calibration_in_direct_whole_period_mode() {
+        let text = E1X2_PROFILE.replace(
+            "pro_latency_periods = 0",
+            "pro_latency_periods = 0\nlinked_phase_max_attempts = 1",
+        );
+
+        let error = Profile::from_toml(&text).expect_err("profile should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("incompatible with direct whole-period PRO")
         );
     }
 

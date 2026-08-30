@@ -24,8 +24,20 @@ pub trait ProPlaybackSource: Send {
     /// Publishes the next sequence watermark before the hardware wait.
     fn prepare_playback(&mut self, _sequence: u64) {}
 
-    /// Prepares non-PRO output before the hardware wait.
+    /// Prepares non-PRO output for the current hardware write.
     fn prepare_playback_mix(&mut self, _sequence: u64) {}
+
+    /// Waits for an exact client block until the hardware-derived cutoff.
+    fn wait_for_playback_before(&mut self, _sequence: u64, _cutoff_nanos: u64) {}
+
+    /// Marks a sequence whose ALSA queue had no safe client wait budget.
+    fn mark_playback_budget_exhausted(&mut self, _sequence: u64) {}
+
+    /// Prevents playback lifecycle teardown from completing until this hardware write finishes.
+    fn begin_playback_commit(&mut self) {}
+
+    /// Releases the playback lifecycle barrier acquired by `begin_playback_commit`.
+    fn end_playback_commit(&mut self) {}
 
     /// Takes one already-ready exact-sequence block without waiting.
     fn process_playback(&mut self, sequence: u64, playback: &mut [i32]);

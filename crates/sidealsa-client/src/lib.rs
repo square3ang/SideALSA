@@ -18,6 +18,8 @@ use sidealsa_protocol::{
 };
 use thiserror::Error;
 
+const EVENTFD_NOTIFY_ATTEMPTS: usize = 2;
+
 #[derive(Debug, Error)]
 pub enum ClientError {
     #[error("client I/O error: {0}")]
@@ -737,7 +739,7 @@ impl EventFd {
 
     fn notify(&self) -> Result<(), ClientError> {
         let value = 1_u64;
-        loop {
+        for _ in 0..EVENTFD_NOTIFY_ATTEMPTS {
             let bytes = unsafe {
                 libc::write(
                     self.as_raw_fd(),
@@ -752,8 +754,13 @@ impl EventFd {
             if error.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
+            if error.raw_os_error() == Some(libc::EAGAIN) {
+                return Ok(());
+            }
             return Err(error.into());
         }
+        // The shared-memory ready state is authoritative; eventfd is only a wake hint.
+        Ok(())
     }
 
     fn drain(&self) {

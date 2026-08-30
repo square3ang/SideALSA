@@ -430,9 +430,7 @@ impl SharedRegion {
             samples,
             true,
         );
-        if published {
-            self.set_client_state(sidealsa_protocol::SHARED_CLIENT_RUNNING);
-        } else {
+        if !published {
             self.header()
                 .client_playback_submit_failures
                 .fetch_add(1, Ordering::Relaxed);
@@ -491,6 +489,7 @@ impl SharedRegion {
                 self.header()
                     .client_playback_sequence
                     .store(sequence, Ordering::Release);
+                self.set_client_state(sidealsa_protocol::SHARED_CLIENT_RUNNING);
             }
             slot.state.store(SHARED_SLOT_READY, Ordering::Release);
             *producer_index = next_index(index, slot_count);
@@ -507,6 +506,17 @@ impl SharedRegion {
             None,
             samples,
         ) == PlaybackConsume::Ready
+    }
+
+    pub fn has_ready_playback(&self, sequence: u64) -> bool {
+        if self.playback_samples == 0 {
+            return false;
+        }
+        (0..self.layout.slot_count()).any(|index| {
+            let slot = unsafe { self.slot(self.layout.playback_offset(), index) };
+            slot.state.load(Ordering::Acquire) == SHARED_SLOT_READY
+                && slot.sequence.load(Ordering::Relaxed) == sequence
+        })
     }
 
     pub fn try_consume_playback_before(
@@ -943,7 +953,10 @@ mod tests {
         let mut producer_index = 0;
         let before = monotonic_nanos().expect("monotonic clock should be available");
 
+        assert!(!region.has_ready_playback(7));
         assert!(region.try_client_publish_playback(&mut producer_index, 7, &[7]));
+        assert!(region.has_ready_playback(7));
+        assert!(!region.has_ready_playback(8));
 
         let after = monotonic_nanos().expect("monotonic clock should be available");
         let slot = unsafe { region.slot(region.layout.playback_offset(), 0) };

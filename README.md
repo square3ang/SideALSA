@@ -71,11 +71,14 @@ with sequence numbers and eventfd notifications; audio is not sent through the
 socket. The real-time hardware worker uses preallocated storage and never waits
 indefinitely for a client.
 
-A missing PRO block becomes one exact-sequence silence fallback. A missing
-SHARED contribution becomes silence or the last valid logical period, depending
-on the profile. Neither case requests an ALSA restart. Actual ALSA XRUN recovery
-is counted separately and advances the hardware timeline generation when the
-stream must be rebased.
+A missing PRO block repeats the last valid PRO period without changing its
+sequence; silence is used before the first valid block and after lifecycle or
+hardware-generation changes. The current SHARED contribution is mixed after
+that PRO decision, so stale SHARED audio is never part of the PRO repeat cache.
+A missing SHARED contribution becomes silence or its own last valid logical
+period, depending on the profile. Neither case requests an ALSA restart. Actual
+ALSA XRUN recovery is counted separately and advances the hardware timeline
+generation when the stream must be rebased.
 
 ## Reference Profile
 
@@ -87,8 +90,9 @@ stream must be rebased.
 | Sample format and rate | S32_LE, 48 kHz |
 | Physical channels | 8 playback, 10 capture |
 | Native protocol and PRO ALSA period | 64 frames |
-| Physical ALSA period | 32 frames |
+| Physical ALSA period | 64 frames |
 | Physical ALSA buffer | 256 frames |
+| Direct PRO startup queue | 128 frames |
 | Independent SHARED ring | 512 frames |
 | SHARED ALSA/PipeWire period | 256 frames |
 | SHARED ALSA buffer | 768 playback, 512 capture frames |
@@ -97,6 +101,21 @@ stream must be rebased.
 
 The reported PRO latency does not include USB transport, device firmware,
 converters, or analog loopback delay.
+
+The reference PRO loop primes the linked ALSA ring, then lets capture
+and playback poll readiness jointly drive each Q64 transfer. The B256 ring is
+capacity; Q128 is queued. Client playback completion wakes the daemon
+through eventfd. There is no playback queue target, phase calibration, or live
+delay calculation in this mode. Exact PRO playback has a bounded 1.0 ms handoff
+deadline that is dynamically shortened from the post-poll ALSA availability so
+fallback selection and the ALSA write retain a Q16 queue reserve.
+
+The PRO latency acceptance target is zero frames added relative to an otherwise
+identical direct ALSA capture-to-playback loop. This is a differential target:
+USB transport, converter delay, the stable ALSA startup queue, and the device's
+duplex phase remain in both measurements. `pro_latency_periods = 0` means the
+client block for capture sequence N is committed to playback sequence N; no
+extra process-ahead period is inserted by SideALSA.
 
 The reference logical ports are:
 
@@ -344,7 +363,7 @@ The main counter groups are:
 | `timeline_resets`, `generation` | Hardware stream restart or rebase |
 | `periods_processed`, `sample_position` | Published hardware timeline progress |
 
-`sidealsa-stats` also prints delays, handoff timing, per-port SHARED playback
+`sidealsa-stats` also prints delays, client-wait timing, per-port SHARED playback
 diagnostics, global SHARED capture overruns, and duplex pointer-phase
 observations. `duplex_pointer_phase_nanos` compares separately timestamped ALSA
 pointer observations. It is useful for debugging but is not a USB-link,
@@ -450,6 +469,35 @@ selected capture channel. Do not run direct hardware tools while `sidealsad`
 owns the device. See the milestone documents for each test setup and its current
 acceptance criteria.
 
+The system `alsa_delay` utility provides an independent canonical Q64/B128
+reference. On the E1x2 it measures 375 frames, or 7.813 ms:
+
+```sh
+alsa_delay hw:OTG,0 hw:OTG,0 48000 64 2 5 1
+```
+
+Measure the same Q128 queue while retaining SideALSA's B256 capacity:
+
+```sh
+cargo build --release -p sidealsa-core --bin sidealsa-direct-loopback-test
+chrt --fifo 48 target/release/sidealsa-direct-loopback-test \
+  --profile profiles/topping-e1x2.toml \
+  --periods 10000 \
+  --buffer-frames 256 \
+  --start-frames 128
+```
+
+`direct_min_frames` and `direct_max_frames` use the same app-visible coordinate
+as `sidealsa-loopback-test`. `direct_physical_*` removes Q128 and reports the
+device/USB/analog component. Separate hardware opens can select different
+duplex phases, so parity means matching the direct distribution without a
+SideALSA-only Q64 displacement, not equality between arbitrary paired opens.
+The current Q128 verification measured 361 frames in a direct open and 373
+frames in the final installed SideALSA smoke test; every pulse within each open
+was exact, and there was no SideALSA-only Q64 displacement. A continuous
+SideALSA session held 403 frames for 100000 RT PRO periods under delayed SHARED
+load.
+
 ## Workspace
 
 | Path | Responsibility |
@@ -488,6 +536,9 @@ acceptance criteria.
   generation change, or core deadline miss. ALSA pointer diagnostics did not
   reliably predict that movement. The hardware timeline remained continuous,
   but the stricter analog-phase invariant is unresolved.
+- The Q128 direct PRO path has native, delayed-PRO, simultaneous-SHARED, Wine
+  ASIO, and release-build stress coverage. The complete Discord playback,
+  microphone, and screen-sharing soak has not been repeated after this revision.
 
 Current ASIO timing evidence and rejected phase-control experiments are recorded
 in [ASIO Frontend](docs/milestone-asio.md). Earlier subsystem acceptance results
