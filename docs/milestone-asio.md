@@ -126,7 +126,7 @@ reacquisition harness records a baseline, terminates a streaming process without
 `Stop` or buffer disposal, requires stable playback after reconnect, compares it
 with an immediately following native PRO loopback, and checks that the daemon
 PID, hardware XRUN, generation, and timeline-reset counters did not change.
-This avoids treating an explicit-feedback hardware phase change between
+This avoids treating an implicit-feedback USB/hardware phase change between
 processes as ASIO process-ahead. The harness verifies the socket peer with
 `SO_PEERCRED`; `SIDEALSA_DAEMON_PID` is an optional additional assertion.
 It models each measurement as `raw loopback = common SideALSA/hardware path +
@@ -285,10 +285,11 @@ cargo run --release -p sidealsa-cli --bin sidealsa-stats -- --socket /tmp/sideal
   guard and a 232-frame startup prime. Its reserve covered ALSA availability
   granularity, USB-driver transfer advancement, and one delayed-wakeup Q32.
 - USB descriptors put playback and capture on the same internal UAC2 clock
-  source, but playback uses an asynchronous explicit-feedback endpoint with
-  125-us packets. Earlier xHCI traces showed that endpoint reseeding without an
-  ALSA XRUN. The observed 24, 30, 36, 37, and 54-frame movements are sub-Q64 and
-  cannot be produced by SideALSA's whole-period slot or sequence mapping.
+  source. Playback is an asynchronous OUT endpoint driven by capture IN
+  endpoint `0x82` as its generic implicit-feedback source; both use 125-us
+  packets. Earlier xHCI traces showed endpoint reseeding without an ALSA XRUN.
+  The observed 24, 30, 36, 37, and 54-frame movements are sub-Q64 and cannot be
+  produced by SideALSA's whole-period slot or sequence mapping.
 - Earlier Discord/PipeWire and delayed-PRO/SHARED tests predate the zero-lead
   revision. They established miss isolation but are not latency acceptance data
   for the current revision. The rejected 64-frame/two-Q32 startup prime remains
@@ -498,6 +499,26 @@ cargo run --release -p sidealsa-cli --bin sidealsa-stats -- --socket /tmp/sideal
   legs. The same installed daemon then completed simultaneous 100000-period RT
   PRO and delayed SHARED runs at 403 frames; after 208232 hardware periods all
   PRO, SHARED, hardware-XRUN, reset, and generation counters remained zero.
+- Static analysis of the exact `linux-cachyos 7.2.2-1` snd-usb and xHCI source
+  established the applicable implicit-feedback geometry. Capture source
+  `0x82` and playback sink `0x01` each have 12 URB contexts with four 125-us
+  packets per context. The sink starts with all contexts ready and no OUT URB
+  submitted; source completions supply packet geometry and submit ready OUT
+  contexts. Ordinary IN/OUT completion-order inversion cannot lose a group
+  because the driver retains each unmatched side. An all-empty source URB is
+  skipped without a packet token or ALSA XRUN, however, and an implicit OUT
+  queue reaching zero is also not reported as an ALSA XRUN.
+- The active Intel xHCI controller advertises Contiguous Frame ID support. A
+  nonempty transfer ring continues from `next_frame_id`; an empty ring instead
+  reseeds at least 10 microframes plus the controller scheduling threshold into
+  the future and rounds to an eight-microframe boundary. A true drain therefore
+  does not directly prove an isolated four-microframe/24-frame gap. For a
+  four-packet URB chain, the discarded continuation and rounded reseed can
+  differ by four microframes modulo eight, which matches the recurring
+  24-frame class but does not prove its on-wire or device-internal effect. The
+  source supports implicit-feedback starvation/reseed as a counter-invisible
+  mechanism; attributing the exact analog phase change to it still requires a
+  trace of the transition.
 
 ## Limitations
 
