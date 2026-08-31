@@ -611,6 +611,7 @@ impl AsioDriver {
                 usize::try_from(shared.playback_channels).map_err(|_| AsioError::NoMemory)?,
             )
             .ok_or(AsioError::NoMemory)?;
+        let sample_kernels = SampleKernels::detect(&active);
         let stream = inner.stream.take().ok_or(AsioError::NoIo)?;
         let context = Box::new(WorkerContext {
             ready: AtomicBool::new(false),
@@ -627,6 +628,7 @@ impl AsioDriver {
                 period_frames,
                 capture_samples,
                 playback_samples,
+                sample_kernels,
                 position,
             },
             error: Mutex::new(None),
@@ -964,6 +966,7 @@ struct WorkerInput {
     period_frames: usize,
     capture_samples: usize,
     playback_samples: usize,
+    sample_kernels: SampleKernels,
     position: Arc<PositionSnapshot>,
 }
 
@@ -1048,9 +1051,14 @@ struct ActiveChannels {
     output: Box<[bool]>,
 }
 
+#[repr(C, align(32))]
+#[derive(Clone, Copy)]
+struct AlignedSampleBlock([f32; 8]);
+
 struct ChannelBuffer {
-    data: std::cell::UnsafeCell<Box<[f32]>>,
+    data: std::cell::UnsafeCell<Box<[AlignedSampleBlock]>>,
     period: usize,
+    half_stride: usize,
 }
 
 // Host owns one half while worker owns other half; callback ordering provides synchronization.
@@ -1059,31 +1067,38 @@ unsafe impl Sync for ChannelBuffer {}
 
 impl ChannelBuffer {
     fn new(period: usize) -> Result<Self, AsioError> {
-        let samples = period.checked_mul(2).ok_or(AsioError::NoMemory)?;
+        let half_stride = period.checked_add(7).ok_or(AsioError::NoMemory)? / 8 * 8;
+        let blocks = half_stride.checked_mul(2).ok_or(AsioError::NoMemory)? / 8;
         let mut data = Vec::new();
-        data.try_reserve_exact(samples)
+        data.try_reserve_exact(blocks)
             .map_err(|_| AsioError::NoMemory)?;
-        data.resize(samples, 0.0);
+        data.resize(blocks, AlignedSampleBlock([0.0; 8]));
         Ok(Self {
             data: std::cell::UnsafeCell::new(data.into_boxed_slice()),
             period,
+            half_stride,
         })
     }
 
     fn pointers(&self) -> [*mut c_void; 2] {
         unsafe {
             let data = &mut *self.data.get();
-            [
-                data.as_mut_ptr().cast(),
-                data.as_mut_ptr().add(self.period).cast(),
-            ]
+            let samples = data.as_mut_ptr().cast::<f32>();
+            [samples.cast(), samples.add(self.half_stride).cast()]
         }
     }
 
     fn half(&self, index: usize) -> &[f32] {
         unsafe {
             let data = &*self.data.get();
-            &data[index * self.period..(index + 1) * self.period]
+            let samples = std::slice::from_raw_parts(data.as_ptr().cast::<f32>(), data.len() * 8);
+            let start = index
+                .checked_mul(self.half_stride)
+                .expect("channel buffer index overflow");
+            let end = start
+                .checked_add(self.period)
+                .expect("channel buffer index overflow");
+            &samples[start..end]
         }
     }
 
@@ -1091,7 +1106,15 @@ impl ChannelBuffer {
     fn half_mut(&self, index: usize) -> &mut [f32] {
         unsafe {
             let data = &mut *self.data.get();
-            &mut data[index * self.period..(index + 1) * self.period]
+            let sample_count = data.len() * 8;
+            let samples = std::slice::from_raw_parts_mut(data.as_mut_ptr().cast(), sample_count);
+            let start = index
+                .checked_mul(self.half_stride)
+                .expect("channel buffer index overflow");
+            let end = start
+                .checked_add(self.period)
+                .expect("channel buffer index overflow");
+            &mut samples[start..end]
         }
     }
 }
@@ -1355,6 +1378,7 @@ fn run_worker(stream: &mut AudioStream, input: &WorkerInput) -> Result<(), AsioE
                 input.period_frames,
                 &mut capture,
                 &mut playback,
+                input.sample_kernels,
                 &input.position,
             )
         }))
@@ -1384,6 +1408,7 @@ fn worker_loop(
     period_frames: usize,
     capture: &mut [i32],
     playback: &mut [i32],
+    sample_kernels: SampleKernels,
     position: &PositionSnapshot,
 ) -> Result<(), AsioError> {
     let mut buffer_index = 0_usize;
@@ -1501,7 +1526,16 @@ fn worker_loop(
             .saturating_mul(1_000_000_000)
             / u64::from(rate);
         stream.record_callback_timing(callback_duration, period_nanos);
-        copy_host_to_playback(buffers, active, buffer_index, playback, period_frames);
+        // Kernel selection proved its target features and buffer geometry before worker startup.
+        unsafe {
+            (sample_kernels.copy_host_to_playback)(
+                buffers,
+                active,
+                buffer_index,
+                playback,
+                period_frames,
+            )
+        };
         if !recover_discontinuity!(stream.submit_playback(block_sequence, playback)) {
             continue;
         }
@@ -1804,7 +1838,36 @@ fn copy_capture_to_host(
     }
 }
 
-fn copy_host_to_playback(
+type CopyHostToPlayback = unsafe fn(&HostBuffers, &ActiveChannels, usize, &mut [i32], usize);
+
+#[derive(Clone, Copy)]
+struct SampleKernels {
+    copy_host_to_playback: CopyHostToPlayback,
+}
+
+impl SampleKernels {
+    const fn scalar() -> Self {
+        Self {
+            copy_host_to_playback: copy_host_to_playback_scalar,
+        }
+    }
+
+    fn detect(active: &ActiveChannels) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        if active.output.len() == 8
+            && active.output.iter().all(|active| *active)
+            && std::arch::is_x86_feature_detected!("avx2")
+        {
+            unsafe { prewarm_avx2() };
+            return Self {
+                copy_host_to_playback: copy_host_to_playback_avx2,
+            };
+        }
+        Self::scalar()
+    }
+}
+
+fn copy_host_to_playback_scalar(
     buffers: &HostBuffers,
     active: &ActiveChannels,
     index: usize,
@@ -1822,6 +1885,156 @@ fn copy_host_to_playback(
             playback[frame * channels + channel] = f32_to_s32(source[frame]);
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn copy_host_to_playback_avx2(
+    buffers: &HostBuffers,
+    active: &ActiveChannels,
+    index: usize,
+    playback: &mut [i32],
+    period_frames: usize,
+) {
+    unsafe {
+        copy_host_to_playback_avx2_inner(buffers, active, index, playback, period_frames);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn copy_host_to_playback_avx2_inner(
+    buffers: &HostBuffers,
+    active: &ActiveChannels,
+    index: usize,
+    playback: &mut [i32],
+    period_frames: usize,
+) {
+    use std::arch::x86_64::*;
+
+    debug_assert_eq!(active.output.len(), 8);
+    debug_assert!(active.output.iter().all(|active| *active));
+    debug_assert!(playback.len() >= period_frames * 8);
+    let vector_frames = period_frames / 8 * 8;
+    for frame in (0..vector_frames).step_by(8) {
+        let rows = std::array::from_fn(|channel| unsafe {
+            convert_f32x8_to_s32(buffers.output[channel].half(index).as_ptr().add(frame))
+        });
+        let frames = unsafe { transpose_8x8_i32(rows) };
+        for (lane, values) in frames.into_iter().enumerate() {
+            unsafe {
+                _mm256_storeu_si256(playback.as_mut_ptr().add((frame + lane) * 8).cast(), values);
+            }
+        }
+    }
+    for frame in vector_frames..period_frames {
+        for channel in 0..8 {
+            playback[frame * 8 + channel] = f32_to_s32(buffers.output[channel].half(index)[frame]);
+        }
+    }
+    _mm256_zeroupper();
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn convert_f32x8_to_s32(source: *const f32) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let samples = _mm256_loadu_ps(source);
+        let zero = _mm256_setzero_ps();
+        let one = _mm256_set1_ps(1.0);
+        let negative_one = _mm256_set1_ps(-1.0);
+        let ordered = _mm256_cmp_ps(samples, samples, _CMP_ORD_Q);
+        let above_min = _mm256_cmp_ps(samples, negative_one, _CMP_GT_OQ);
+        let below_max = _mm256_cmp_ps(samples, one, _CMP_LT_OQ);
+        let interior = _mm256_and_ps(ordered, _mm256_and_ps(above_min, below_max));
+        let safe_samples = _mm256_blendv_ps(zero, samples, interior);
+
+        let low = _mm256_cvtps_pd(_mm256_castps256_ps128(safe_samples));
+        let high = _mm256_cvtps_pd(_mm256_extractf128_ps(safe_samples, 1));
+        let scale = _mm256_set1_pd(2_147_483_648.0);
+        let half = _mm256_set1_pd(0.5);
+        let negative_half = _mm256_set1_pd(-0.5);
+        let zero_pd = _mm256_setzero_pd();
+
+        let low_scaled = _mm256_mul_pd(low, scale);
+        let high_scaled = _mm256_mul_pd(high, scale);
+        let low_adjustment = _mm256_blendv_pd(
+            half,
+            negative_half,
+            _mm256_cmp_pd(low_scaled, zero_pd, _CMP_LT_OQ),
+        );
+        let high_adjustment = _mm256_blendv_pd(
+            half,
+            negative_half,
+            _mm256_cmp_pd(high_scaled, zero_pd, _CMP_LT_OQ),
+        );
+        let low_i32 = _mm256_cvttpd_epi32(_mm256_add_pd(low_scaled, low_adjustment));
+        let high_i32 = _mm256_cvttpd_epi32(_mm256_add_pd(high_scaled, high_adjustment));
+        let interior_i32 = _mm256_inserti128_si256(_mm256_castsi128_si256(low_i32), high_i32, 1);
+
+        let minimum_mask = _mm256_castps_si256(_mm256_cmp_ps(samples, negative_one, _CMP_LE_OQ));
+        let maximum_mask = _mm256_castps_si256(_mm256_cmp_ps(samples, one, _CMP_GE_OQ));
+        let nan_mask = _mm256_castps_si256(_mm256_cmp_ps(samples, samples, _CMP_UNORD_Q));
+        let with_minimum =
+            _mm256_blendv_epi8(interior_i32, _mm256_set1_epi32(i32::MIN), minimum_mask);
+        let with_maximum =
+            _mm256_blendv_epi8(with_minimum, _mm256_set1_epi32(i32::MAX), maximum_mask);
+        _mm256_blendv_epi8(with_maximum, _mm256_setzero_si256(), nan_mask)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn transpose_8x8_i32(
+    rows: [std::arch::x86_64::__m256i; 8],
+) -> [std::arch::x86_64::__m256i; 8] {
+    use std::arch::x86_64::*;
+
+    let [r0, r1, r2, r3, r4, r5, r6, r7] = rows;
+    let a0 = _mm256_unpacklo_epi32(r0, r1);
+    let a1 = _mm256_unpackhi_epi32(r0, r1);
+    let a2 = _mm256_unpacklo_epi32(r2, r3);
+    let a3 = _mm256_unpackhi_epi32(r2, r3);
+    let a4 = _mm256_unpacklo_epi32(r4, r5);
+    let a5 = _mm256_unpackhi_epi32(r4, r5);
+    let a6 = _mm256_unpacklo_epi32(r6, r7);
+    let a7 = _mm256_unpackhi_epi32(r6, r7);
+
+    let b0 = _mm256_unpacklo_epi64(a0, a2);
+    let b1 = _mm256_unpackhi_epi64(a0, a2);
+    let b2 = _mm256_unpacklo_epi64(a1, a3);
+    let b3 = _mm256_unpackhi_epi64(a1, a3);
+    let b4 = _mm256_unpacklo_epi64(a4, a6);
+    let b5 = _mm256_unpackhi_epi64(a4, a6);
+    let b6 = _mm256_unpacklo_epi64(a5, a7);
+    let b7 = _mm256_unpackhi_epi64(a5, a7);
+
+    [
+        _mm256_permute2x128_si256(b0, b4, 0x20),
+        _mm256_permute2x128_si256(b1, b5, 0x20),
+        _mm256_permute2x128_si256(b2, b6, 0x20),
+        _mm256_permute2x128_si256(b3, b7, 0x20),
+        _mm256_permute2x128_si256(b0, b4, 0x31),
+        _mm256_permute2x128_si256(b1, b5, 0x31),
+        _mm256_permute2x128_si256(b2, b6, 0x31),
+        _mm256_permute2x128_si256(b3, b7, 0x31),
+    ]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn prewarm_avx2() {
+    use std::arch::x86_64::*;
+
+    let source = [0.0_f32; 8];
+    let mut destination = [0_i32; 8];
+    unsafe {
+        let converted = convert_f32x8_to_s32(source.as_ptr());
+        _mm256_storeu_si256(destination.as_mut_ptr().cast(), converted);
+        _mm256_zeroupper();
+    }
+    std::hint::black_box(destination);
 }
 
 fn invoke_callback(
@@ -1882,9 +2095,9 @@ fn f32_to_s32(sample: f32) -> i32 {
     if sample >= 1.0 {
         return i32::MAX;
     }
-    (f64::from(sample) * 2_147_483_648.0)
-        .round()
-        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+    let scaled = f64::from(sample) * 2_147_483_648.0;
+    let adjustment = if scaled.is_sign_negative() { -0.5 } else { 0.5 };
+    (scaled + adjustment) as i32
 }
 
 fn split_i64(value: u64) -> AsioInt64 {
@@ -2546,15 +2759,205 @@ mod tests {
         assert_eq!(f32_to_s32(1.0), i32::MAX);
         assert_eq!(f32_to_s32(f32::NAN), 0);
         assert_eq!(f32_to_s32(0.5), 1_073_741_824);
+        assert_eq!(f32_to_s32(f32::from_bits(0x2f80_0000)), 1);
+        assert_eq!(f32_to_s32(f32::from_bits(0xaf80_0000)), -1);
+    }
+
+    fn f32_to_s32_reference(sample: f32) -> i32 {
+        if sample.is_nan() {
+            return 0;
+        }
+        if sample <= -1.0 {
+            return i32::MIN;
+        }
+        if sample >= 1.0 {
+            return i32::MAX;
+        }
+        (f64::from(sample) * 2_147_483_648.0)
+            .round()
+            .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+    }
+
+    fn conversion_test_samples(count: usize) -> Vec<f32> {
+        let mut samples = vec![
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -1.0,
+            1.0,
+            -0.0,
+            0.0,
+            -0.5,
+            0.5,
+            f32::from_bits((-1.0_f32).to_bits() - 1),
+            f32::from_bits(1.0_f32.to_bits() - 1),
+            f32::from_bits(1),
+            f32::from_bits(0x8000_0001),
+            f32::from_bits(0x2f80_0000),
+            f32::from_bits(0xaf80_0000),
+        ];
+        let mut state = 0x9e37_79b9_u32;
+        while samples.len() < count {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            samples.push(f32::from_bits(state));
+        }
+        samples
+    }
+
+    fn populated_output_buffers(period: usize, channels: usize) -> HostBuffers {
+        let buffers = HostBuffers::new(0, channels, period).expect("buffers should allocate");
+        let samples = conversion_test_samples(period * channels * 2);
+        for index in 0..2 {
+            for channel in 0..channels {
+                for frame in 0..period {
+                    let source = (index * period + frame) * channels + channel;
+                    buffers.output[channel].half_mut(index)[frame] = samples[source];
+                }
+            }
+        }
+        buffers
+    }
+
+    fn reference_copy_host_to_playback(
+        buffers: &HostBuffers,
+        active: &ActiveChannels,
+        index: usize,
+        playback: &mut [i32],
+        period_frames: usize,
+    ) {
+        playback.fill(0);
+        let channels = active.output.len();
+        for (channel, is_active) in active.output.iter().copied().enumerate() {
+            if !is_active {
+                continue;
+            }
+            let source = buffers.output[channel].half(index);
+            for frame in 0..period_frames {
+                playback[frame * channels + channel] = f32_to_s32_reference(source[frame]);
+            }
+        }
+    }
+
+    #[test]
+    fn optimized_scalar_conversion_matches_reference() {
+        for sample in conversion_test_samples(65_536) {
+            assert_eq!(f32_to_s32(sample), f32_to_s32_reference(sample));
+        }
+    }
+
+    #[test]
+    fn sparse_output_uses_scalar_kernel() {
+        let active = ActiveChannels {
+            input: Box::new([]),
+            output: vec![true, false, true, false, true, false, true, false].into_boxed_slice(),
+        };
+        let kernels = SampleKernels::detect(&active);
+        assert!(std::ptr::fn_addr_eq(
+            kernels.copy_host_to_playback,
+            copy_host_to_playback_scalar as CopyHostToPlayback,
+        ));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_playback_conversion_matches_scalar_for_full_channels_and_tails() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let channels = 8;
+        for period in [64, 65] {
+            let buffers = populated_output_buffers(period, channels);
+            let active = ActiveChannels {
+                input: Box::new([]),
+                output: vec![true; channels].into_boxed_slice(),
+            };
+            for index in 0..2 {
+                let mut scalar = vec![0_i32; period * channels];
+                let mut simd = vec![0_i32; period * channels];
+                copy_host_to_playback_scalar(&buffers, &active, index, &mut scalar, period);
+                unsafe { copy_host_to_playback_avx2(&buffers, &active, index, &mut simd, period) };
+                assert_eq!(simd, scalar);
+            }
+        }
+
+        let source = conversion_test_samples(65_536);
+        let (chunks, remainder) = source.as_chunks::<8>();
+        assert!(remainder.is_empty());
+        for chunk in chunks {
+            let mut simd = [0_i32; 8];
+            unsafe {
+                use std::arch::x86_64::*;
+                let converted = convert_f32x8_to_s32(chunk.as_ptr());
+                _mm256_storeu_si256(simd.as_mut_ptr().cast(), converted);
+                _mm256_zeroupper();
+            }
+            for (sample, converted) in chunk.iter().copied().zip(simd) {
+                assert_eq!(converted, f32_to_s32_reference(sample));
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "release-mode conversion microbenchmark"]
+    fn benchmark_asio_playback_conversion() {
+        use std::{hint::black_box, time::Instant};
+
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            eprintln!("AVX2 unavailable");
+            return;
+        }
+        let period = 64;
+        let channels = 8;
+        let iterations = 100_000_u128;
+        let buffers = populated_output_buffers(period, channels);
+        let active = ActiveChannels {
+            input: Box::new([]),
+            output: vec![true; channels].into_boxed_slice(),
+        };
+
+        let measure = |kernel: CopyHostToPlayback| {
+            let mut playback = vec![0_i32; period * channels];
+            let start = Instant::now();
+            for _ in 0..iterations {
+                unsafe {
+                    black_box(kernel)(
+                        black_box(&buffers),
+                        black_box(&active),
+                        0,
+                        black_box(&mut playback),
+                        period,
+                    )
+                };
+            }
+            black_box(playback);
+            start.elapsed().as_nanos() / iterations
+        };
+
+        let reference = measure(reference_copy_host_to_playback);
+        let scalar = measure(copy_host_to_playback_scalar);
+        let avx2 = measure(copy_host_to_playback_avx2);
+        eprintln!(
+            "ASIO Q64 8ch playback: reference={reference} ns, scalar={scalar} ns, avx2={avx2} ns, avx2/reference={:.2}x, avx2/scalar={:.2}x",
+            reference as f64 / avx2 as f64,
+            scalar as f64 / avx2 as f64,
+        );
     }
 
     #[test]
     fn host_buffers_have_two_period_pointers() {
-        let buffers = HostBuffers::new(1, 1, 64).expect("buffers should allocate");
-        let pointers = buffers.input[0].pointers();
-        assert!(!pointers[0].is_null());
-        assert!(!pointers[1].is_null());
-        assert_ne!(pointers[0], pointers[1]);
+        for period in [7, 8, 9, 64, 65] {
+            let buffers = HostBuffers::new(1, 1, period).expect("buffers should allocate");
+            let pointers = buffers.input[0].pointers();
+            assert!(!pointers[0].is_null());
+            assert!(!pointers[1].is_null());
+            assert_ne!(pointers[0], pointers[1]);
+            assert_eq!(pointers[0] as usize % 32, 0);
+            assert_eq!(pointers[1] as usize % 32, 0);
+            assert!(pointers[1] as usize - pointers[0] as usize >= period * size_of::<f32>());
+        }
     }
 
     #[test]

@@ -557,6 +557,7 @@ and test conditions.
 - [ALSA ioplug](docs/milestone-7.md)
 - [PipeWire integration](docs/milestone-8.md)
 - [Wine ASIO frontend](docs/milestone-asio.md)
+- [Performance and SIMD](docs/performance.md)
 
 ## License
 

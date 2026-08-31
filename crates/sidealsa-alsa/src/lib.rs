@@ -1044,10 +1044,48 @@ unsafe fn copy_from_area(
     let base = area.addr.cast::<u8>();
     let first = usize::try_from(area.first / 8).map_err(|_| libc::EINVAL)?;
     let step = usize::try_from(area.step / 8).map_err(|_| libc::EINVAL)?;
+    let sample_count = frames.checked_mul(channels).ok_or(libc::EOVERFLOW)?;
+    let destination = destination.get_mut(..sample_count).ok_or(libc::EINVAL)?;
+    if cfg!(target_endian = "little")
+        && step == channels.checked_mul(size_of_i32()).ok_or(libc::EOVERFLOW)?
+    {
+        let byte_offset = first
+            .checked_add(offset.checked_mul(step).ok_or(libc::EOVERFLOW)?)
+            .ok_or(libc::EOVERFLOW)?;
+        let byte_count = sample_count
+            .checked_mul(size_of_i32())
+            .ok_or(libc::EOVERFLOW)?;
+        // The ALSA channel area and the plugin's preallocated scratch buffer are disjoint.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                base.add(byte_offset),
+                destination.as_mut_ptr().cast(),
+                byte_count,
+            )
+        };
+        return Ok(());
+    }
+    unsafe { copy_from_area_scalar(base, first, step, offset, frames, channels, destination) }
+}
+
+unsafe fn copy_from_area_scalar(
+    base: *const u8,
+    first: usize,
+    step: usize,
+    offset: usize,
+    frames: usize,
+    channels: usize,
+    destination: &mut [i32],
+) -> Result<(), c_int> {
     for frame in 0..frames {
         for channel in 0..channels {
             let byte_offset = first
-                .checked_add((offset + frame).checked_mul(step).ok_or(libc::EOVERFLOW)?)
+                .checked_add(
+                    offset
+                        .checked_add(frame)
+                        .and_then(|value| value.checked_mul(step))
+                        .ok_or(libc::EOVERFLOW)?,
+                )
                 .and_then(|value| value.checked_add(channel.checked_mul(size_of_i32())?))
                 .ok_or(libc::EOVERFLOW)?;
             let source = unsafe { base.add(byte_offset) };
@@ -1070,10 +1108,44 @@ unsafe fn copy_to_area(
     let base = area.addr.cast::<u8>();
     let first = usize::try_from(area.first / 8).map_err(|_| libc::EINVAL)?;
     let step = usize::try_from(area.step / 8).map_err(|_| libc::EINVAL)?;
+    let sample_count = frames.checked_mul(channels).ok_or(libc::EOVERFLOW)?;
+    let source = source.get(..sample_count).ok_or(libc::EINVAL)?;
+    if cfg!(target_endian = "little")
+        && step == channels.checked_mul(size_of_i32()).ok_or(libc::EOVERFLOW)?
+    {
+        let byte_offset = first
+            .checked_add(offset.checked_mul(step).ok_or(libc::EOVERFLOW)?)
+            .ok_or(libc::EOVERFLOW)?;
+        let byte_count = sample_count
+            .checked_mul(size_of_i32())
+            .ok_or(libc::EOVERFLOW)?;
+        // The plugin scratch buffer and ALSA's channel area are disjoint.
+        unsafe {
+            ptr::copy_nonoverlapping(source.as_ptr().cast(), base.add(byte_offset), byte_count)
+        };
+        return Ok(());
+    }
+    unsafe { copy_to_area_scalar(base, first, step, offset, frames, channels, source) }
+}
+
+unsafe fn copy_to_area_scalar(
+    base: *mut u8,
+    first: usize,
+    step: usize,
+    offset: usize,
+    frames: usize,
+    channels: usize,
+    source: &[i32],
+) -> Result<(), c_int> {
     for frame in 0..frames {
         for channel in 0..channels {
             let byte_offset = first
-                .checked_add((offset + frame).checked_mul(step).ok_or(libc::EOVERFLOW)?)
+                .checked_add(
+                    offset
+                        .checked_add(frame)
+                        .and_then(|value| value.checked_mul(step))
+                        .ok_or(libc::EOVERFLOW)?,
+                )
                 .and_then(|value| value.checked_add(channel.checked_mul(size_of_i32())?))
                 .ok_or(libc::EOVERFLOW)?;
             let destination = unsafe { base.add(byte_offset) };
@@ -1220,6 +1292,125 @@ mod tests {
                 .expect("interleaved output should encode");
         }
         assert_eq!(destination, source);
+    }
+
+    #[test]
+    fn packed_interleaved_area_honors_nonzero_frame_offset() {
+        let source = [10_i32, 11, 20, 21, 30, 31, 40, 41, 50, 51, 60, 61];
+        let channels = 2;
+        let frames = 4;
+        let area = SideAlsaChannelArea {
+            addr: source.as_ptr().cast_mut().cast(),
+            first: 0,
+            step: (channels * 32) as c_uint,
+        };
+        let mut decoded = [0_i32; 8];
+        unsafe {
+            copy_from_area(&area, 1, frames, channels, &mut decoded)
+                .expect("offset input should decode");
+        }
+        assert_eq!(decoded, source[2..10]);
+
+        let mut destination = [0_i32; 12];
+        let destination_area = SideAlsaChannelArea {
+            addr: destination.as_mut_ptr().cast(),
+            first: 0,
+            step: (channels * 32) as c_uint,
+        };
+        unsafe {
+            copy_to_area(&destination_area, 1, frames, channels, &decoded)
+                .expect("offset output should encode");
+        }
+        assert_eq!(destination[2..10], decoded);
+        assert_eq!(destination[..2], [0, 0]);
+        assert_eq!(destination[10..], [0, 0]);
+    }
+
+    #[test]
+    fn padded_unaligned_area_uses_scalar_fallback() {
+        let channels = 2;
+        let frames = 3;
+        let first = 1_usize;
+        let step = 12_usize;
+        let source = [1_i32, -2, 3, -4, 5, -6];
+        let mut storage = vec![0xa5_u8; first + frames * step];
+        let area = SideAlsaChannelArea {
+            addr: storage.as_mut_ptr().cast(),
+            first: (first * 8) as c_uint,
+            step: (step * 8) as c_uint,
+        };
+        unsafe {
+            copy_to_area(&area, 0, frames, channels, &source).expect("padded output should encode");
+        }
+        let mut decoded = [0_i32; 6];
+        unsafe {
+            copy_from_area(&area, 0, frames, channels, &mut decoded)
+                .expect("padded input should decode");
+        }
+        assert_eq!(decoded, source);
+        for frame in 0..frames {
+            assert_eq!(
+                &storage[first + frame * step + 8..first + (frame + 1) * step],
+                &[0xa5; 4]
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "release-mode area-copy microbenchmark"]
+    fn benchmark_packed_interleaved_area_copy() {
+        use std::{hint::black_box, time::Instant};
+
+        let channels = 2;
+        let frames = 256;
+        let iterations = 200_000_u128;
+        let source = (0..frames * channels)
+            .map(|sample| sample as i32)
+            .collect::<Vec<_>>();
+        let area = SideAlsaChannelArea {
+            addr: source.as_ptr().cast_mut().cast(),
+            first: 0,
+            step: (channels * 32) as c_uint,
+        };
+        let mut destination = vec![0_i32; frames * channels];
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            unsafe {
+                copy_from_area_scalar(
+                    source.as_ptr().cast(),
+                    0,
+                    channels * size_of_i32(),
+                    0,
+                    frames,
+                    channels,
+                    black_box(&mut destination),
+                )
+                .expect("scalar copy should work");
+            }
+        }
+        black_box(&destination);
+        let scalar = start.elapsed().as_nanos() / iterations;
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            unsafe {
+                copy_from_area(
+                    black_box(&area),
+                    0,
+                    frames,
+                    channels,
+                    black_box(&mut destination),
+                )
+                .expect("bulk copy should work");
+            }
+        }
+        black_box(destination);
+        let bulk = start.elapsed().as_nanos() / iterations;
+        eprintln!(
+            "ALSA Q256 stereo input copy: scalar={scalar} ns, bulk={bulk} ns, speedup={:.2}x",
+            scalar as f64 / bulk as f64,
+        );
     }
 
     #[test]
