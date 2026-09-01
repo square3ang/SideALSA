@@ -407,14 +407,17 @@ cargo run --release -p sidealsa-cli --bin sidealsa-stats -- --socket /tmp/sideal
   `SIGSTOP`/`SIGCONT` stalls during a 7500-period RT86 run retained all 118
   pulses at the same 388-frame phase with zero PRO miss, hardware XRUN, or
   timeline reset.
-- PipeWire-facing SHARED playback now exposes Q256/B768 and primes one Q256
-  start-delay period while retaining the internal Q64/B512 ring. This corrected
-  a startup buffer deficit that made PipeWire's ALSA DLL accelerate from
+- PipeWire-facing SHARED playback exposes Q256/B768 and originally primed one
+  Q256 start-delay period while retaining the internal Q64/B512 ring. This
+  corrected a startup buffer deficit that made PipeWire's ALSA DLL accelerate from
   `1.007716` past `1.02` and periodically skip input samples despite exact Q256
   ioplug writes. A controlled 721152-frame sine run recorded zero discontinuity,
   source-matching maximum sample delta, PipeWire correction near `1.0`, and zero
-  SideALSA or PipeWire error delta. The extra external period is startup
-  capacity; it does not change PRO timing or the steady Q256 PipeWire target.
+  SideALSA or PipeWire error delta. A later browser session recorded six
+  isolated one-Q64 SHARED misses with every PRO and hardware counter still zero.
+  Playback now adds 128 frames of PipeWire headroom, raising the SHARED steady
+  target to Q384 while preserving Q256 graph cadence and leaving PRO timing
+  unchanged.
 - On the reference PREEMPT_RT host, the xHCI IRQ thread runs as FIFO `50`.
   Running the SideALSA hardware and PRO workers at `88` and `86` inverted that
   ordering. During one 1080p60 USB-video transition run, analog loopback moved

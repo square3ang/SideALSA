@@ -32,9 +32,10 @@ daemon's internal Q64 notifications. The E1x2 hardware profile uses physical
 B256 while exposing an independent eight-Q64-period `shared_buffer_size = 512`.
 The ioplug aggregates four internal blocks per Q256 external period. Playback
 offers three periods and PipeWire negotiates B768; `api.alsa.start-delay = 256`
-uses the extra period only to keep startup primed while the first graph block
-arrives. The steady target remains Q256. Transfers remain Q64 at the daemon
-boundary and use the preallocated B512 SHARED ring.
+keeps startup primed while the first graph block arrives. Playback headroom of
+`128` frames raises the steady target from Q256 to Q384 without changing the
+Q256 graph cadence. Transfers remain Q64 at the daemon boundary and use the
+preallocated B512 SHARED ring.
 The reference shared path consumes playback after seven logical periods
 (`448` frames), absorbing desktop scheduling jitter without changing hardware
 or PRO timing.
@@ -174,6 +175,13 @@ current zero-lead acceptance is documented in `milestone-asio.md`:
   correction remained within `0.999891..1.000133`. The production plugin then
   repeated playback with PipeWire `ERR=0` and no SHARED, hardware-XRUN,
   generation, or timeline-reset delta.
+- A later browser session exposed six isolated line4 SHARED misses, each one
+  Q64 sequence late, while PRO, hardware-XRUN, PipeWire graph-error, generation,
+  and reset counters remained zero. The installed packed-area bulk-copy path
+  then completed a 10-second Q256 run, a 24-worker CPU-saturation run, and 40
+  Q256 start/stop transitions without another miss. Playback headroom was raised
+  from `0` to `128` frames to retain two Q64 periods of steady scheduling margin;
+  this does not alter the hardware or PRO timeline.
 
 ## Limitations
 
