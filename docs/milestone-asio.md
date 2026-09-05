@@ -5,11 +5,18 @@ SideALSA PRO client, double-buffered float32 host buffers, worker lifecycle,
 sequence handling, and callback dispatch. The C shim supplies the Wine COM,
 registration, DLL ABI, and `CreateThread` bridge required for Wine TEB setup.
 
+The reference output-0/input-4 route is the E1x2's internal digital loopback,
+confirmed by the user and USB sample inspection. Historical "analog" labels
+for this route below do not establish DAC/ADC converter latency. The reference
+supports optional [startup loopback normalization](startup-loopback.md), which
+appends actual silence for a verified target before clients start. It was not
+retained as a default after a later runtime shift invalidated the startup target.
+
 The adapter expects the daemon profile to expose a `64`-frame logical period.
-The reference E1x2 profile uses the same Q64 physical ALSA period and keeps
+The reference E1x2 profile uses P32 physical ALSA periods and keeps
 `buffer_size = 256`. Linked startup primes the playback ring with silence before
 starting playback and capture together. Capacity is B256; the queued startup
-audio is Q128.
+audio begins with Q128; optional normalization may append up to Q64 of additional silence.
 
 ASIO reports 64 input frames and 64 output frames for the reference profile.
 These values do not include USB, firmware, converter, or analog device-loopback
@@ -18,7 +25,8 @@ latency.
 
 PRO duplex clients use a zero-lead pipeline. Hardware capture sequence N is
 published as playback target N while SHARED capture retains hardware sequence
-N. ALSA playback and capture poll readiness jointly start the cycle, and the
+N. ALSA playback and capture poll readiness jointly start each whole-Q64 cycle
+with `avail_min = 64` despite the P32 transport, and the
 playback-ready eventfd ends the client wait early. The profile's 1.0 ms handoff
 deadline is dynamically shortened to retain a fixed playback write reserve.
 The reference mode does not use live-delay budgeting, a linked playback guard,
@@ -64,7 +72,7 @@ remain terminal and request a host reset. A host callback that blocks forever
 cannot be recovered internally because that callback owns the worker thread.
 
 Direct whole-period PRO requires `linked_phase_max_attempts = 0`; it does not
-dither or restart a healthy linked stream during startup. Legacy split-period
+dither or restart a healthy linked stream during startup. Legacy timer-scheduled
 profiles can still use the startup qualifier. Earlier occupancy-prediction,
 Q32 qualification, and client-triggered runtime-rebase experiments are retained
 in the verification history below because they produced useful negative
@@ -167,8 +175,8 @@ hardware/phase isolation from a fully clean client-scheduling pass.
 
 ASIO begins with the first playback-clock target and publishes playback under
 that exact sequence. The E1x2 profile keeps zero process-ahead blocks. It uses a
-Q64 physical cadence, a Q128 playback queue, and a 1.0 ms event-driven client
-deadline. It consumes only the exact shared-memory sequence. When
+P32 transport with whole-Q64 transfers, a Q128 playback queue, and a 1.0 ms
+event-driven client deadline. It consumes only the exact shared-memory sequence. When
 absent, the daemon repeats the last valid PRO period and resumes with the next
 exact sequence.
 
@@ -522,6 +530,176 @@ cargo run --release -p sidealsa-cli --bin sidealsa-stats -- --socket /tmp/sideal
   source supports implicit-feedback starvation/reseed as a counter-invisible
   mechanism; attributing the exact analog phase change to it still requires a
   trace of the transition.
+
+### Live phase investigation (2026-09-05)
+
+The requested target is measured output-0/input-4 loopback in the high 7 ms
+range, approximately 374-383 frames at 48 kHz, not the ASIO-reported latency.
+On the existing Q64/B256/Q128-start daemon (PID 812, generation 3), native PRO
+and ASIO instead measured 425 frames (8.854 ms). Hardware playback/capture XRUN
+counters and timeline resets were already 3 before these tests and did not
+increase. The daemon and physical PCMs were not restarted or reconfigured.
+
+| Test | Measured result |
+| --- | --- |
+| Native PRO, 45000 periods, 24 CPU workers | 703/703 pulses at 425 frames; no PRO/HW/reset delta |
+| ASIO, two 20-second legs, 24 host workers, 512 MiB, 350 us callback work | 247 + 249 pulses at 425 frames; no pulse loss or callback-period overrun |
+| Native PRO, 2 ms delay every 17th sequence, CPU load and SHARED line4 | 1035 detected pulses at 425 frames; 112 lost pulses and 1439 expected PRO misses; no HW/reset delta |
+| ASIO plus clean release build, followed by two idle-build/reacquisition rounds | Native before/after and both idle references at 425 frames; all checked miss/HW/reset deltas zero |
+| Native PRO, CPU load, eight 1080p60 YUYV USB-video start/stop rounds | 1405/1405 pulses at 425 frames; no PRO/HW/reset delta |
+| Intentional ASIO process crash, then native reacquisition | Crash probe reached playback; subsequent 47/47 native pulses at 425 frames |
+
+The build-stress logs are under `target/phase-stress/20260905-101237/` on the
+test host. The crash added one PRO miss, not a hardware restart. Initial Wine
+launches hit harness timeouts before probe initialization and are not passing
+ASIO tests; subsequent direct launches and the build-stress harness completed.
+
+A separate tracefs instance recorded filtered xHCI URB enqueue/giveback/dequeue
+events during the USB-video test. Its 30.000607-second capture retained all
+240000 events with zero overwrite, dropped events, or commit overruns. After
+the initial unknown-URB window, observed OUT queue depth remained 8-9 and IN
+depth 11-12. Neither direction had a zero-length giveback or dequeue. The worst
+OUT giveback interval was 656 us; none reached 1 ms. These are tracepoint-level
+queue measurements, not direct controller TD or analog-phase measurements.
+The earlier trace during delayed PRO playback overwrote its prefix; only its
+last 12.34 seconds were available and it must not be treated as a full capture.
+Temporary trace instances were removed and the video format restored afterward.
+
+The native loopback test now records the first observed phase and subsequent
+changes in 128 fixed entries, printing only after streaming stops. Each entry
+contains the capture sequence, current observation's `CLOCK_MONOTONIC` time,
+previous successful observation time, and measured delay. A dropped-entry
+counter exposes truncation. With `--pulse-interval-frames 1025`, observations
+are nominally 21.35 ms apart. These are client observation times, not exact
+physical transition timestamps; lost pulses and capture buffering widen the
+interval to examine in a kernel trace. Clock-query failure is represented by 0.
+
+No random phase transition was reproduced in these runs, and the 7 ms target
+was not achieved. They do not establish that the reported intermittent problem
+is fixed. PipeWire through SideALSA SHARED still uses the same daemon-owned
+physical stream, so it is not a direct-hardware PipeWire control experiment.
+Comparing startup distributions or PipeWire's direct ALSA behavior requires
+releasing daemon ownership and reopening hardware, which has not been done in
+this investigation. No production timing or buffer change is justified by
+these negative-reproduction results alone.
+
+### Transport and startup follow-up (2026-09-05)
+
+Subsequent hardware reopen tests were explicitly approved. All temporary test
+daemons were stopped afterward and the original installed daemon and user
+PipeWire services restored. At that point the reference profile remained
+physical P64.
+
+The direct test's accounting is `logical_roundtrip = startup_frames + residual`.
+For the original uninterrupted 425-frame measurement, the known startup offset
+was 128 frames, leaving 297 frames of common duplex/USB/device offset. The
+residual is not a measurement of converter latency alone. Neither ASIO's
+reported 64+64 nor the maximum 1 ms handoff is an additional independent term.
+The handoff ends early when the exact client block is ready.
+
+Upstream Linux v7.2.2 `sound/usb/pcm.c` excludes implicit-feedback playback from
+the ordinary low-latency mode and starts its endpoints during PCM prepare.
+Before PCM START installs the data callbacks, completed IN transfers can drive
+silent OUT transfers without consuming the application's startup prime.
+alsa-lib `snd_pcm_hw_params()` also prepares the PCM automatically. Thus linked
+prepare/start resets PCM accounting but need not establish simultaneous physical
+ADC/DAC stream origins. This explains why stream-start history matters, but no
+packet-level trace of the original generation-3 startup proves its exact 425.
+
+The engine now permits a smaller physical ALSA period under the whole-Q64
+poll-driven algorithm, independently of timer-scheduled packet staging. Both
+directions wait for a full logical block (`avail_min=64`); playback still writes
+Q64, primes Q128, reserves Q16 for writing, and caps the client handoff at 1 ms.
+Direct-mode buffer capacity must be a multiple of the logical period, avoiding
+partial-ring-wrap waits at the logical notification threshold. This is an
+optional transport configuration; reference adoption was deferred during these
+experiments.
+
+| Experiment, all B256/Q128-start | P64 results (frames) | P32 results (frames) |
+| --- | --- | --- |
+| Direct ALSA, three alternating opens each | 395, 366, 353 | 348, 323, 360 |
+| Daemon, first three alternating opens each | 395, 347, 347 | 323, 371, 354 |
+| Daemon, ten additional alternating opens each | 353-383, mean 367.1 | 335-372, mean 359.4 |
+| Initial start followed by three confirmed XRUN recoveries | 365, 347, 389, 372 | 342, 323, 371, 372 |
+
+Every short leg was internally fixed with all scheduled pulses detected. The
+XRUN experiment deliberately suspended only the isolated test daemon for 20 ms
+between client sessions: each fault incremented generation and both hardware
+XRUN counters once. The following loopbacks had no further miss or reset. This
+tests actual recovery, not normal scheduler load, and shows offset reselection
+in both directions rather than a fixed accumulated delay per generation.
+
+P32 trace verification retained all 240032 events over 15.0023 seconds without
+overwrites or drops. Nominal completed payloads were 12 frames per URB at 250 us,
+versus P64's 24 frames at 500 us, consistent with two versus four 125-us packets.
+OUT outstanding depth was 9-10, IN 11-12, with no empty giveback or dequeue.
+These counts are not additive analog latency terms: queued receive URBs cover
+future input, and submitted output can be partially executed before giveback.
+
+P32 load testing held 329 frames for 1405 native pulses under CPU/video/SHARED
+load and 248+246 ASIO pulses under 24 host workers, 512 MiB, and 350 us callback
+work. That first harness stopped after Wine printed PASS but exited with status
+3; it was not a complete passing qualification. A second harness completed with
+Wine status 0: 1405 native load pulses held 353 frames, but both subsequent ASIO
+legs and native reacquisition held 347. PID 77737 and generation 0 were unchanged,
+with no hardware or PRO miss during that transition window. Deliberate 2 ms PRO
+delays afterward produced 530 misses and seven lost pulses while detected pulses
+remained at 347. Therefore the smaller transport still does not ensure phase
+continuity across client transitions and has not been installed as a fix.
+
+A P64 startup-dwell control used five opens per arm and two clean restarts of
+the same PCM handles per open. Waiting 50 ms after linked prepare and before
+prime/start did not narrow phase spread: 0 ms gave 347-396 frames, 50 ms gave
+347-402, each individual leg fixed. No production startup sleep was added.
+
+The direct diagnostic accepts `--hardware-period-frames`, `--prepare-wait-ms`,
+and `--restarts` for these controls; it verifies negotiated geometry and fails
+if phase changes within a leg. Restarted legs have fresh measurement origins,
+so their reported delays can legitimately differ. Host-local evidence is in
+`/tmp/opencode/period-comparison.VOyxmshW`,
+`/tmp/opencode/daemon-period-comparison.iq6Sw17O`,
+`/tmp/opencode/period32-qualification.Ly7QjGdg`, and
+`/tmp/opencode/period-comparison.YhMtqZY5`. Repeated-open distributions overlap;
+it would be misleading to attribute all of 425-to-329 to P32 rather than the
+new hardware start. A guaranteed high-7-ms bound and constant physical phase
+remain unproven.
+The restored original P64 service finally measured 47/47 pulses at 408 frames
+(8.500 ms) with no miss or hardware-reset delta during measurement. Its change
+from the original 425 is a hardware-restart observation, not an installed fix.
+
+### P32 reference adoption (2026-09-05)
+
+The user subsequently requested adopting the lower-latency transport rather
+than retaining the above-8-ms P64 configuration. The reference now selects
+`hardware_period_size = 32`, while logical/ASIO Q64, B256 capacity, Q128 startup,
+zero process-ahead, and the maximum 1 ms handoff remain unchanged. Both PCM
+directions wait for Q64 before a transfer, so P32 does not select the legacy
+timer-scheduled or split-write path. P32 and P64 direct-mode tests both remain.
+
+The engine, validation helper, and reference profile were installed; the ASIO
+DLL contents and PipeWire adapter files were retained. On installed daemon PID
+92494, generation 0, the following checks all measured exactly 324 frames
+(6.750 ms), without another hardware start between tests:
+
+- Initial native run: 6000 periods, 94/94 pulses, no miss or reset delta.
+- Native with 24 CPU workers and concurrent SHARED line4 playback: 30000
+  periods, 1874/1874 pulses, no PRO, SHARED, HW-XRUN, or reset delta. Observed
+  PipeWire adapter and playback-client graph error counters stayed zero.
+- ASIO with 24 host workers, 512 MiB memory pressure, 350 us callback work, and
+  concurrent SHARED playback: two 20-second legs, 248+248 pulses, no loss,
+  callback-period overrun, PRO miss, HW-XRUN, or reset. The probe explicitly
+  required 324 frames and exited successfully.
+- Native 2 ms delay every 17th sequence: 12000 callbacks, 706 intentional PRO
+  misses and 12 lost pulses, with all 176 detected pulses still at 324 frames.
+  Hardware XRUNs, generation changes, and timeline resets stayed zero.
+
+Logs are in `/tmp/opencode/deployed-p32.kbj4A3Qe` on the test host; the previous
+engine/profile pair is backed up in
+`/tmp/opencode/pre-period32-install.nooVEZVe`. This deployment meets the requested
+sub-8-ms latency in the measured session, not a universal latency guarantee.
+The earlier common-path phase shifts and overlapping startup distributions
+remain valid findings. In particular, the entire 408-to-324 difference must not
+be attributed to P32 alone because installation also restarted the hardware.
 
 ## Limitations
 

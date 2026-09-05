@@ -57,8 +57,18 @@ pub struct HardwareConfig {
     pub realtime: bool,
     #[serde(default = "default_realtime_priority")]
     pub realtime_priority: u32,
+    #[serde(default)]
+    pub startup_loopback: Option<StartupLoopbackConfig>,
     pub playback: PcmConfig,
     pub capture: PcmConfig,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StartupLoopbackConfig {
+    pub playback_channel: u32,
+    pub capture_channel: u32,
+    pub target_frames: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,6 +180,13 @@ impl Profile {
         hash_pcm(&mut hash, &self.device.capture);
         hash_ports(&mut hash, &self.ports.playback);
         hash_ports(&mut hash, &self.ports.capture);
+        // Preserve existing fingerprints when the optional calibration is absent.
+        if let Some(loopback) = self.device.startup_loopback {
+            hash_string(&mut hash, "startup_loopback");
+            hash_u32(&mut hash, loopback.playback_channel);
+            hash_u32(&mut hash, loopback.capture_channel);
+            hash_u32(&mut hash, loopback.target_frames);
+        }
         hash
     }
 }
@@ -461,6 +478,13 @@ impl HardwareConfig {
                 "buffer_size must not be smaller than period_size".into(),
             ));
         }
+        if self.uses_event_driven_linked_pro() && !self.buffer_size.is_multiple_of(self.period_size)
+        {
+            return Err(ProfileError::Invalid(
+                "direct whole-period PRO requires buffer_size to be a multiple of period_size"
+                    .into(),
+            ));
+        }
         if let Some(shared_buffer_size) = self.shared_buffer_size {
             if shared_buffer_size < self.period_size.saturating_mul(2) {
                 return Err(ProfileError::Invalid(
@@ -594,12 +618,6 @@ impl HardwareConfig {
                     "pro_latency_periods = 0 requires duplex_link = true".into(),
                 ));
             }
-            if !self.playback_timer_scheduling && !self.uses_event_driven_linked_pro() {
-                return Err(ProfileError::Invalid(
-                    "pro_latency_periods = 0 without direct whole-period mode requires playback_timer_scheduling = true"
-                        .into(),
-                ));
-            }
             if self.buffer_size < self.period_size.saturating_mul(2) {
                 return Err(ProfileError::Invalid(
                     "pro_latency_periods = 0 requires at least two logical periods".into(),
@@ -662,6 +680,25 @@ impl HardwareConfig {
         }
         self.playback.validate("playback")?;
         self.capture.validate("capture")?;
+        if let Some(loopback) = self.startup_loopback {
+            if !self.uses_event_driven_linked_pro() {
+                return Err(ProfileError::Invalid(
+                    "startup_loopback requires direct linked zero-lead PRO".into(),
+                ));
+            }
+            if loopback.playback_channel >= self.playback.channels
+                || loopback.capture_channel >= self.capture.channels
+            {
+                return Err(ProfileError::Invalid(
+                    "startup_loopback channel is out of range".into(),
+                ));
+            }
+            if loopback.target_frames == 0 || loopback.target_frames > self.rate / 10 {
+                return Err(ProfileError::Invalid(
+                    "startup_loopback target_frames must be non-zero and at most 100 ms".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -690,7 +727,6 @@ impl HardwareConfig {
     pub fn uses_event_driven_linked_pro(&self) -> bool {
         self.effective_duplex_link()
             && self.pro_latency_periods == 0
-            && self.effective_hardware_period_size() == self.period_size
             && !self.playback_timer_scheduling
     }
 
@@ -915,29 +951,111 @@ mod tests {
 
         assert_eq!(profile.device.buffer_size, 256);
         assert_eq!(profile.device.period_size, 64);
-        assert_eq!(profile.device.effective_hardware_period_size(), 64);
+        assert_eq!(profile.device.effective_hardware_period_size(), 32);
         assert_eq!(profile.device.playback_queue_periods, Some(2));
         assert_eq!(profile.device.pro_handoff_us, 1000);
         assert_eq!(profile.device.pro_latency_periods, 0);
         assert!(!profile.device.playback_timer_scheduling);
         assert!(profile.device.uses_event_driven_linked_pro());
         assert_eq!(profile.device.linked_playback_guard_frames, None);
-        assert_eq!(profile.device.effective_linked_playback_guard_frames(), 64);
+        assert_eq!(profile.device.effective_linked_playback_guard_frames(), 32);
         assert!(!profile.device.uses_staged_pro_packets());
         assert_eq!(profile.device.effective_pro_output_latency_frames(), 64);
         assert_eq!(profile.device.linked_phase_max_attempts, 0);
         assert_eq!(profile.device.effective_shared_buffer_size(), 512);
         assert_eq!(profile.device.shared_latency_periods, 7);
         assert!(profile.device.shared_playback_repeat_on_underrun);
+        assert_eq!(profile.device.startup_loopback, None);
+    }
+
+    #[test]
+    fn timing_edits_preserve_startup_loopback_table() {
+        let text = format!(
+            "{E1X2_PROFILE}\n[device.startup_loopback]\nplayback_channel = 0\ncapture_channel = 4\ntarget_frames = 376\n"
+        );
+        let mut document = ProfileDocument::from_toml(&text).unwrap();
+        let expected = document.profile().device.startup_loopback;
+        let mut timing = document.timing();
+        timing.shared_latency_periods = 6;
+        document.apply_timing(&timing).unwrap();
+        let reparsed = Profile::from_toml(&document.to_toml()).unwrap();
+        assert_eq!(reparsed.device.startup_loopback, expected);
+        assert_eq!(reparsed.device.shared_latency_periods, 6);
+    }
+
+    #[test]
+    fn startup_loopback_is_explicit_validated_and_fingerprinted() {
+        let mut profile = Profile::from_toml(E1X2_PROFILE).unwrap();
+        profile.device.startup_loopback = None;
+        let baseline_hash = profile.fingerprint();
+        let settings = StartupLoopbackConfig {
+            playback_channel: 0,
+            capture_channel: 4,
+            target_frames: 376,
+        };
+        profile.device.startup_loopback = Some(settings);
+        profile.validate().unwrap();
+        let calibrated_hash = profile.fingerprint();
+        assert_ne!(baseline_hash, calibrated_hash);
+        for changed in [
+            StartupLoopbackConfig {
+                playback_channel: 1,
+                ..settings
+            },
+            StartupLoopbackConfig {
+                capture_channel: 5,
+                ..settings
+            },
+            StartupLoopbackConfig {
+                target_frames: 377,
+                ..settings
+            },
+        ] {
+            profile.device.startup_loopback = Some(changed);
+            assert_ne!(profile.fingerprint(), calibrated_hash);
+        }
+        for invalid in [
+            StartupLoopbackConfig {
+                playback_channel: 8,
+                ..settings
+            },
+            StartupLoopbackConfig {
+                capture_channel: 10,
+                ..settings
+            },
+            StartupLoopbackConfig {
+                target_frames: 0,
+                ..settings
+            },
+            StartupLoopbackConfig {
+                target_frames: 4801,
+                ..settings
+            },
+        ] {
+            profile.device.startup_loopback = Some(invalid);
+            assert!(profile.validate().is_err());
+        }
+        profile.device.startup_loopback = Some(settings);
+        profile.device.pro_latency_periods = 1;
+        assert!(profile.validate().is_err());
     }
 
     #[test]
     fn whole_period_link_does_not_report_packet_staging() {
-        let profile = Profile::from_toml(E1X2_PROFILE).expect("whole-period profile should parse");
-
-        assert!(!profile.device.uses_staged_pro_packets());
-        assert!(profile.device.uses_event_driven_linked_pro());
-        assert_eq!(profile.device.effective_pro_output_latency_frames(), 64);
+        for physical_period in [32, 64] {
+            let text = E1X2_PROFILE.replace(
+                "hardware_period_size = 32",
+                &format!("hardware_period_size = {physical_period}"),
+            );
+            let profile = Profile::from_toml(&text).expect("whole-period profile should parse");
+            assert_eq!(
+                profile.device.effective_hardware_period_size(),
+                physical_period
+            );
+            assert!(!profile.device.uses_staged_pro_packets());
+            assert!(profile.device.uses_event_driven_linked_pro());
+            assert_eq!(profile.device.effective_pro_output_latency_frames(), 64);
+        }
     }
 
     #[test]
@@ -1259,9 +1377,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_pro_latency_without_timer_scheduling() {
+    fn direct_whole_period_mode_accepts_smaller_physical_periods() {
         let text = PROFILE
             .replace("buffer_size = 64", "buffer_size = 96")
+            .replace("playback_queue_periods = 1", "playback_queue_periods = 2")
             .replace(
                 "period_size = 32",
                 "period_size = 32\n        hardware_period_size = 16",
@@ -1272,11 +1391,35 @@ mod tests {
                 "playback_timer_scheduling = false",
             );
 
-        let error = Profile::from_toml(&text).expect_err("profile should fail");
+        let profile = Profile::from_toml(&text).expect("divided physical period should parse");
+        assert!(profile.device.uses_event_driven_linked_pro());
+        assert!(!profile.device.uses_staged_pro_packets());
+        assert_eq!(profile.device.effective_pro_output_latency_frames(), 32);
+    }
+
+    #[test]
+    fn direct_transport_period_does_not_reduce_handoff_reserve() {
+        let text = E1X2_PROFILE;
+        let profile = Profile::from_toml(text).expect("Q64 client with P32 transport should parse");
+        assert!(profile.device.uses_event_driven_linked_pro());
+        assert_eq!(profile.device.period_size, 64);
+        assert_eq!(profile.device.effective_hardware_period_size(), 32);
+        assert_eq!(profile.device.pro_handoff_us, 1000);
+        assert_eq!(profile.device.playback_queue_periods, Some(2));
+        assert_eq!(profile.device.effective_pro_output_latency_frames(), 64);
+        assert!(!profile.device.uses_staged_pro_packets());
         assert!(
-            error
-                .to_string()
-                .contains("without direct whole-period mode requires playback_timer_scheduling")
+            Profile::from_toml(&text.replace("pro_handoff_us = 1000", "pro_handoff_us = 1100"))
+                .is_err()
+        );
+        let error = Profile::from_toml(&text.replace("buffer_size = 256", "buffer_size = 224"))
+            .expect_err("ring wraps must remain aligned to full client blocks");
+        assert!(error.to_string().contains("multiple of period_size"));
+        assert!(
+            Profile::from_toml(
+                &text.replace("playback_queue_periods = 2", "playback_queue_periods = 1")
+            )
+            .is_err()
         );
     }
 

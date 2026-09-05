@@ -1,11 +1,14 @@
 # Milestone 3: Local Fake PRO Client
 
 `DuplexEngine::run_pro` adds an in-process PRO path without changing physical
-ALSA ownership. The reference linked implementation uses the same Q64 period for
-the client and physical ALSA PCM. Capture sequence N is published as playback
+ALSA ownership. The reference linked implementation uses Q64 client blocks over
+P32 physical ALSA transport. Capture sequence N is published as playback
 target N. ALSA capture availability and playback queue depth drive the cycle;
 playback and capture poll readiness must both reach Q64 before transfer. There
-is no playback queue-target sleep or phase calibration.
+is no steady-state playback queue-target sleep or pointer-based phase calibration.
+An optional internal digital loopback can be normalized before clients start
+and after genuine hardware recovery; it is not enabled by default. See
+[startup normalization](startup-loopback.md).
 
 Each audio block carries a sequence number. Playback consumes only its exact
 sequence. Client completion wakes the daemon through eventfd. The E1x2 profile
@@ -24,8 +27,8 @@ the oldest target that remains valid. SHARED capture clients retain ordered FIFO
 delivery.
 
 `device.pro_latency_periods` configures PRO output lookahead. The E1x2 reference
-profile uses zero lead, Q64/B256 physical ALSA geometry, and a 128-frame silence
-prime before the linked start. The one-Q64 latency reported to host APIs
+profile uses zero lead, Q64 logical blocks, P32/B256 physical ALSA geometry, and
+a 128-frame silence prime before the linked start. The one-Q64 latency reported to host APIs
 describes their callback buffer; SideALSA inserts zero additional process-ahead
 frames in the direct linked path. Higher values use the legacy lookahead paths
 and trade whole periods of latency for more client margin. Maximum value is `7`,
@@ -78,7 +81,7 @@ pro_latency_periods = 2
 
 ## Direct ALSA Parity
 
-With `sidealsad` stopped and the analog loopback cable connected, run the direct
+With `sidealsad` stopped and the configured device-loopback route available, run the direct
 capture-to-playback loop with B256 capacity and the same Q128 startup queue:
 
 ```text
@@ -88,7 +91,10 @@ target/release/sidealsa-direct-loopback-test \
 ```
 
 The acceptance target is no SideALSA-only whole-period displacement, not a fixed
-absolute analog number. An earlier Q128 revision accumulated 523 linked hardware
+absolute unnormalized number. Output 0/input 4 on the reference is an internal
+digital return, not an established analog converter test. The direct test can
+use `--target-loopback-frames 376` for the silence-padding experiment; see
+[startup normalization](startup-loopback.md). An earlier Q128 revision accumulated 523 linked hardware
 XRUNs and was temporarily replaced by a diagnostic Q192 queue. After linked
 startup/recovery and interrupted-poll fixes, the Q128 path completed an installed
 208232-period session with all PRO, SHARED, hardware-XRUN, reset, and generation

@@ -9,6 +9,7 @@ Before=pipewire.service
 Type=simple
 ExecStart=@PREFIX@/bin/sidealsad --profile @PROFILE@ --socket @SOCKET@
 Restart=on-failure
+RestartPreventExitStatus=78
 RestartSec=2
 @GROUP_DIRECTIVE@
 UMask=@SOCKET_UMASK@

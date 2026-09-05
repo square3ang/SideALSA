@@ -91,13 +91,23 @@ fn main() {
     }
     if !state.hardware_ready() || hardware_handle.is_finished() {
         stop.store(true, std::sync::atomic::Ordering::Release);
+        let mut exit_code = 1;
         match hardware_handle.join() {
-            Ok((Err(error), _)) => eprintln!("hardware stopped before ready: {error}"),
+            Ok((Err(error), _)) => {
+                exit_code = hardware_error_exit_code(&error);
+                eprintln!("hardware stopped before ready: {error}");
+            }
             Ok((_, Err(error))) => eprintln!("hardware cleanup failed before ready: {error}"),
             Ok((Ok(()), Ok(()))) => eprintln!("hardware stopped before ready"),
             Err(_) => eprintln!("sidealsad hardware thread panicked before ready"),
         }
-        std::process::exit(1);
+        std::process::exit(exit_code);
+    }
+    if let Some(loopback) = profile.device.startup_loopback {
+        eprintln!(
+            "startup digital loopback verified: target={} frames, playback_channel={}, capture_channel={}",
+            loopback.target_frames, loopback.playback_channel, loopback.capture_channel
+        );
     }
 
     let control_state = Arc::clone(&state);
@@ -124,7 +134,7 @@ fn main() {
 
     if let Err(error) = run_result {
         eprintln!("hardware stopped: {error}");
-        std::process::exit(1);
+        std::process::exit(hardware_error_exit_code(&error));
     }
     if let Err(error) = stop_result {
         eprintln!("hardware cleanup failed: {error}");
@@ -194,6 +204,14 @@ fn main() {
     }
 }
 
+fn hardware_error_exit_code(error: &sidealsa_core::EngineError) -> i32 {
+    if matches!(error, sidealsa_core::EngineError::StartupLoopback(_)) {
+        78 // EX_CONFIG: don't let systemd retry hardware starts until one happens to fit.
+    } else {
+        1
+    }
+}
+
 fn lock_process_memory() -> io::Result<()> {
     if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } == 0 {
         Ok(())
@@ -250,4 +268,25 @@ fn print_help() {
     println!("sidealsad [--profile PATH] [--socket PATH]");
     println!("default profile: profiles/topping-e1x2.toml");
     println!("default socket: /tmp/sidealsad.sock");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unqualified_loopback_prevents_service_restart() {
+        assert_eq!(
+            super::hardware_error_exit_code(&sidealsa_core::EngineError::StartupLoopback(
+                "missing digital route"
+            )),
+            78
+        );
+        assert_eq!(
+            super::hardware_error_exit_code(&sidealsa_core::EngineError::Stopped),
+            1
+        );
+        assert!(
+            include_str!("../../../packaging/sidealsad.service.in")
+                .contains("RestartPreventExitStatus=78")
+        );
+    }
 }

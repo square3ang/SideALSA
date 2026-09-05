@@ -2,12 +2,13 @@
 name = "Topping E1x2 OTG"
 rate = 48000
 period_size = 64
-hardware_period_size = 64
-# Capacity is B256; direct linked startup queues two Q64 periods.
+# Smaller transport periods reduce USB batching; PRO still transfers whole Q64 blocks.
+hardware_period_size = 32
+# B256 capacity; direct linked startup queues two Q64 periods.
 buffer_size = 256
 playback_queue_periods = 2
 shared_buffer_size = 512
-# PRO follows the physical ALSA period instead of a userspace timer.
+# ALSA poll drives Q64 client cycles over P32 transport, without a userspace timer.
 playback_timer_scheduling = false
 duplex_link = true
 pro_latency_periods = 0

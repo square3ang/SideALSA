@@ -13,6 +13,7 @@ use alsa::{
     pcm::{Access, AudioTstampType, Format, HwParams, PCM, State, Status, StatusBuilder},
     poll::{self, Descriptors, pollfd},
 };
+use sidealsa_config::StartupLoopbackConfig;
 use thiserror::Error;
 
 use crate::pro::{ProCaptureSink, ProPlaybackSource};
@@ -96,6 +97,8 @@ pub enum EngineError {
     },
     #[error("linked startup was interrupted before hardware readiness")]
     LinkedStartupInterrupted,
+    #[error("startup digital loopback normalization failed: {0}")]
+    StartupLoopback(&'static str),
 }
 
 pub struct DuplexEngine {
@@ -206,7 +209,12 @@ impl DuplexEngine {
             } else {
                 buffer
             },
-            i64::from(config.effective_hardware_period_size()),
+            // Direct duplex waits for a full client block, even with smaller USB periods.
+            if config.uses_event_driven_linked_pro() {
+                period
+            } else {
+                i64::from(config.effective_hardware_period_size())
+            },
             StreamDirection::Capture,
         )?;
 
@@ -905,9 +913,10 @@ impl DuplexEngine {
             handoff_nanos: self.config.pro_handoff_nanos(),
             sequence_lead,
             event_driven: self.config.uses_event_driven_linked_pro(),
+            startup_loopback: self.config.startup_loopback,
         };
         let startup = if config.event_driven {
-            Ok(())
+            normalize_startup_loopback(&playback_pcm, &capture_pcm, config, control)
         } else {
             calibrate_linked_phase(
                 &playback_pcm,
@@ -1210,6 +1219,354 @@ struct LinkedProConfig<'a> {
     handoff_nanos: u64,
     sequence_lead: u64,
     event_driven: bool,
+    startup_loopback: Option<StartupLoopbackConfig>,
+}
+
+// Multiples of 32 24-bit LSBs distinguish 1 dB mixer steps while peaking below -98 dBFS.
+const STARTUP_LOOPBACK_MARKERS: [[i32; 3]; 2] = [[8192, -8192, 16384], [-16384, 24576, -24576]];
+
+struct StartupLoopbackProbe {
+    markers: [i32; 3],
+    interval: u64,
+    delays: [Option<u64>; 3],
+}
+
+impl StartupLoopbackProbe {
+    fn emit(&self, position: u64, mapped: &mut [i32], channels: usize, channel: usize) {
+        mapped.fill(0);
+        let end = position + (mapped.len() / channels) as u64;
+        for (index, &marker) in self.markers.iter().enumerate() {
+            let output_frame = (index as u64 + 1) * self.interval;
+            if (position..end).contains(&output_frame) {
+                mapped[(output_frame - position) as usize * channels + channel] = marker;
+            }
+        }
+    }
+
+    fn observe(
+        &mut self,
+        position: u64,
+        output_end: u64,
+        mapped: &[i32],
+        channels: usize,
+        channel: usize,
+    ) -> Result<(), EngineError> {
+        for (frame, samples) in mapped.chunks_exact(channels).enumerate() {
+            let Some(index) = self
+                .markers
+                .iter()
+                .position(|&marker| marker == samples[channel])
+            else {
+                continue;
+            };
+            let output_frame = (index as u64 + 1) * self.interval;
+            if output_frame >= output_end {
+                continue; // This marker has not been committed to playback yet.
+            }
+            let delay = (position + frame as u64).checked_sub(output_frame).ok_or(
+                EngineError::StartupLoopback("probe arrived before its logical output frame"),
+            )?;
+            if self.delays[index].replace(delay).is_some() {
+                return Err(EngineError::StartupLoopback("ambiguous repeated probe"));
+            }
+        }
+        Ok(())
+    }
+
+    fn measured_delay(&self, expected: Option<u64>) -> Result<Option<u64>, EngineError> {
+        if let Some(expected) = expected
+            && self.delays.iter().flatten().any(|&delay| delay != expected)
+        {
+            return Err(EngineError::StartupLoopback(
+                "padded delay does not match target",
+            ));
+        }
+        let Some(first) = self.delays[0] else {
+            return Ok(None);
+        };
+        if self.delays.iter().flatten().any(|&delay| delay != first) {
+            return Err(EngineError::StartupLoopback("unstable loopback delay"));
+        }
+        Ok(self.delays.iter().all(Option::is_some).then_some(first))
+    }
+}
+
+fn startup_loopback_padding(
+    measured: u64,
+    target: u32,
+    start_frames: alsa::pcm::Frames,
+    buffer: alsa::pcm::Frames,
+    period: alsa::pcm::Frames,
+) -> Result<usize, EngineError> {
+    let padding = u64::from(target)
+        .checked_sub(measured)
+        .ok_or(EngineError::StartupLoopback(
+            "unpadded loopback delay already exceeds target",
+        ))?;
+    let capacity = buffer
+        .checked_sub(start_frames)
+        .and_then(|frames| frames.checked_sub(period))
+        .and_then(|frames| u64::try_from(frames).ok())
+        .ok_or(EngineError::StartupLoopback(
+            "no full client block reserve in playback buffer",
+        ))?;
+    if padding > capacity {
+        return Err(EngineError::StartupLoopback(
+            "padding would consume the client block reserve",
+        ));
+    }
+    usize::try_from(padding)
+        .map_err(|_| EngineError::StartupLoopback("padding frame count overflow"))
+}
+
+/// Discard startup capture before the client timeline origin, but preserve queued
+/// playback zeros: padding advances the real ALSA app pointer, not logical output
+/// ordinals. Exact, distinct quiet markers survive 24-bit S32_LE digital paths;
+/// this intentionally cannot qualify an analog, scaled, or noisy loopback.
+fn normalize_startup_loopback(
+    playback_pcm: &PCM,
+    capture_pcm: &PCM,
+    config: LinkedProConfig<'_>,
+    control: WorkerControl<'_>,
+) -> Result<(), EngineError> {
+    let Some(loopback) = config.startup_loopback else {
+        return Ok(());
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    if let Some(ready) = control.hardware_ready {
+        ready.store(false, Ordering::Release);
+    }
+    let result = (|| {
+        let period = config.period as usize;
+        let interval = (u64::from(loopback.target_frames) + 2 * period as u64)
+            .max(u64::from(config.rate) / 12 + 1);
+        for (phase, markers) in STARTUP_LOOPBACK_MARKERS.into_iter().enumerate() {
+            let mut probe = StartupLoopbackProbe {
+                markers,
+                interval,
+                delays: [None; 3],
+            };
+            let mut position = 0;
+            let measured = loop {
+                wait_for_startup_loopback(
+                    &[
+                        (playback_pcm, StreamDirection::Playback, period),
+                        (capture_pcm, StreamDirection::Capture, period),
+                    ],
+                    control,
+                    deadline,
+                )?;
+                transfer_startup_loopback(
+                    capture_pcm,
+                    StreamDirection::Capture,
+                    config.capture_channels,
+                    period,
+                    control,
+                    deadline,
+                    |offset, mapped| {
+                        probe.observe(
+                            position + offset as u64,
+                            position,
+                            mapped,
+                            config.capture_channels,
+                            loopback.capture_channel as usize,
+                        )
+                    },
+                )?;
+                transfer_startup_loopback(
+                    playback_pcm,
+                    StreamDirection::Playback,
+                    config.playback_channels,
+                    period,
+                    control,
+                    deadline,
+                    |offset, mapped| {
+                        probe.emit(
+                            position + offset as u64,
+                            mapped,
+                            config.playback_channels,
+                            loopback.playback_channel as usize,
+                        );
+                        Ok(())
+                    },
+                )?;
+                position += period as u64;
+                let expected = (phase == 1).then_some(u64::from(loopback.target_frames));
+                if let Some(delay) = probe.measured_delay(expected)? {
+                    break delay;
+                }
+                if position >= 4 * interval {
+                    return Err(EngineError::StartupLoopback(
+                        "missing digital loopback probe",
+                    ));
+                }
+            };
+            if phase == 0 {
+                let padding = startup_loopback_padding(
+                    measured,
+                    loopback.target_frames,
+                    config.start_frames,
+                    config.buffer,
+                    config.period,
+                )?;
+                transfer_startup_loopback(
+                    playback_pcm,
+                    StreamDirection::Playback,
+                    config.playback_channels,
+                    padding,
+                    control,
+                    deadline,
+                    |_, mapped| {
+                        mapped.fill(0);
+                        Ok(())
+                    },
+                )?;
+                // Reset both measurement origins together. Do not count padding
+                // as logical output or change the base prime used on recovery.
+            }
+        }
+        check_startup_loopback_deadline(control, deadline)
+    })();
+    result.map_err(|error| {
+        record_linked_hardware_xruns(&error, control);
+        startup_loopback_error(error)
+    })
+}
+
+fn startup_loopback_error(error: EngineError) -> EngineError {
+    if error.is_stopped() || matches!(&error, EngineError::StartupLoopback(_)) {
+        error
+    } else {
+        // Every failed qualification, including a short commit, must suppress service retries.
+        EngineError::StartupLoopback("PCM transfer failed during normalization")
+    }
+}
+
+fn check_startup_loopback_deadline(
+    control: WorkerControl<'_>,
+    deadline: Instant,
+) -> Result<(), EngineError> {
+    control.ensure_running()?;
+    if Instant::now() >= deadline {
+        return Err(EngineError::StartupLoopback("two-second deadline expired"));
+    }
+    Ok(())
+}
+
+fn wait_for_startup_loopback(
+    streams: &[(&PCM, StreamDirection, usize)],
+    control: WorkerControl<'_>,
+    deadline: Instant,
+) -> Result<(), EngineError> {
+    let mut descriptors = [pollfd {
+        fd: 0,
+        events: 0,
+        revents: 0,
+    }; 32];
+    loop {
+        check_startup_loopback_deadline(control, deadline)?;
+        let mut used = 0;
+        for &(pcm, direction, required) in streams {
+            let available = alsa_call(
+                pcm.avail_update(),
+                "update startup loopback availability",
+                direction,
+            )?;
+            if available >= required as i64 {
+                continue;
+            }
+            let count = pcm.count();
+            if count == 0 || count > descriptors.len() - used {
+                return Err(EngineError::StartupLoopback(
+                    "invalid PCM poll descriptor count",
+                ));
+            }
+            let filled = alsa_call(
+                pcm.fill(&mut descriptors[used..used + count]),
+                "fill startup loopback poll descriptors",
+                direction,
+            )?;
+            if filled != count {
+                return Err(EngineError::StartupLoopback(
+                    "incomplete PCM poll descriptors",
+                ));
+            }
+            used += count;
+        }
+        if used == 0 {
+            return check_startup_loopback_deadline(control, deadline);
+        }
+        for descriptor in &mut descriptors[..used] {
+            descriptor.events |= libc::POLLERR;
+            descriptor.revents = 0;
+        }
+        check_startup_loopback_deadline(control, deadline)?;
+        match poll::poll(&mut descriptors[..used], 1) {
+            Err(error) if error.errno() == libc::EINTR => continue,
+            result => {
+                alsa_call(result, "poll startup loopback", streams[0].1)?;
+            }
+        }
+        if descriptors[..used]
+            .iter()
+            .any(|descriptor| descriptor.revents & (libc::POLLHUP | libc::POLLNVAL) != 0)
+        {
+            return Err(EngineError::StartupLoopback(
+                "PCM poll disconnected or invalid",
+            ));
+        }
+        // Recheck availability, including POLLERR, and poll only missing directions.
+    }
+}
+
+fn transfer_startup_loopback(
+    pcm: &PCM,
+    direction: StreamDirection,
+    channels: usize,
+    frames: usize,
+    control: WorkerControl<'_>,
+    deadline: Instant,
+    mut process: impl FnMut(usize, &mut [i32]) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    let io = unsafe { pcm.io_unchecked::<i32>() };
+    let mut offset = 0;
+    while offset < frames {
+        check_startup_loopback_deadline(control, deadline)?;
+        let available = alsa_call(
+            pcm.avail_update(),
+            "update startup loopback transfer availability",
+            direction,
+        )?;
+        if available <= 0 {
+            wait_for_startup_loopback(&[(pcm, direction, 1)], control, deadline)?;
+            continue;
+        }
+        let mut mapped_frames = 0;
+        let mut processed = Ok(());
+        let committed = alsa_call(
+            io.mmap((frames - offset).min(available as usize), |mapped| {
+                mapped_frames = mapped.len() / channels;
+                processed = process(offset, mapped);
+                mapped_frames
+            }),
+            "transfer startup loopback frames",
+            direction,
+        )?;
+        if committed != mapped_frames {
+            return Err(EngineError::ShortCommit {
+                direction,
+                actual: committed as i64,
+                required: mapped_frames as i64,
+            });
+        }
+        processed?;
+        offset += committed;
+        if committed == 0 {
+            wait_for_startup_loopback(&[(pcm, direction, 1)], control, deadline)?;
+        }
+        // Positive partial progress can be ring wrap, not a reason to wait for avail_min.
+    }
+    check_startup_loopback_deadline(control, deadline)
 }
 
 fn calibrate_linked_phase(
@@ -3121,9 +3478,11 @@ fn read_capture_samples(
             continue;
         }
         let requested_frames = remaining_frames.min(available as usize);
+        let mut mapped_frames = 0;
         let processed = alsa_call(
             io.mmap(requested_frames, |mapped| {
                 let frames = mapped.len() / channels;
+                mapped_frames = frames;
                 let samples = frames * channels;
                 scratch[offset_samples..offset_samples + samples]
                     .copy_from_slice(&mapped[..samples]);
@@ -3132,15 +3491,19 @@ fn read_capture_samples(
             "read capture period",
             StreamDirection::Capture,
         )?;
+        if processed != mapped_frames {
+            return Err(EngineError::ShortCommit {
+                direction: StreamDirection::Capture,
+                actual: processed as i64,
+                required: mapped_frames as i64,
+            });
+        }
         if processed == 0 {
             wait_for_transfer(pcm, StreamDirection::Capture, control)?;
             continue;
         }
         offset_samples += processed * channels;
         remaining_frames -= processed;
-        if remaining_frames > 0 {
-            wait_for_transfer(pcm, StreamDirection::Capture, control)?;
-        }
     }
     Ok(required)
 }
@@ -3168,9 +3531,11 @@ fn write_playback_samples(
             continue;
         }
         let requested_frames = remaining_frames.min(available as usize);
+        let mut mapped_frames = 0;
         let processed = alsa_call(
             io.mmap(requested_frames, |mapped| {
                 let frames = mapped.len() / channels;
+                mapped_frames = frames;
                 let sample_count = frames * channels;
                 mapped[..sample_count]
                     .copy_from_slice(&samples[offset_samples..offset_samples + sample_count]);
@@ -3179,15 +3544,20 @@ fn write_playback_samples(
             "write playback period",
             StreamDirection::Playback,
         )?;
+        if processed != mapped_frames {
+            return Err(EngineError::ShortCommit {
+                direction: StreamDirection::Playback,
+                actual: processed as i64,
+                required: mapped_frames as i64,
+            });
+        }
         if processed == 0 {
             wait_for_transfer(pcm, StreamDirection::Playback, control)?;
             continue;
         }
         offset_samples += processed * channels;
         remaining_frames -= processed;
-        if remaining_frames > 0 {
-            wait_for_transfer(pcm, StreamDirection::Playback, control)?;
-        }
+        // Recheck availability immediately across a non-period-aligned ring wrap.
     }
     Ok(required)
 }
@@ -3639,6 +4009,7 @@ fn recover_linked_streams(
         "restart linked duplex streams after stream failure",
         StreamDirection::Playback,
     )?;
+    normalize_startup_loopback(playback_pcm, capture_pcm, config, control)?;
     if error.is_xrun() {
         control.timeline.reset_after_hardware_xrun();
     } else {
@@ -3988,22 +4359,234 @@ impl EngineError {
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectDuplexReadiness, EngineError, PendingProCapture, ProClock, StreamDirection,
-        WorkerControl, align_sequence_forward, alsa_call, announced_output_matches,
-        bounded_pro_handoff_target, direct_linked_start_frames, direct_pro_cutoff_nanos,
-        duplex_pointer_phase_from_timestamps, linked_ahead_start_frames,
-        linked_phase_dither_frames, linked_phase_target_nanos, linked_phase_warmup_cycles,
-        linked_start_frames, linked_zero_lead_playback_floor, observe_pro_capture_target,
-        period_limit_reached, playback_startup_priority, playback_target_sleep,
-        prepared_output_matches, pro_target_sequence, record_linked_hardware_xruns,
-        staged_playback_chunk_before_capture, take_pending_pro_capture, take_pro_capture_sequence,
+        DirectDuplexReadiness, EngineError, PendingProCapture, ProClock, STARTUP_LOOPBACK_MARKERS,
+        StartupLoopbackProbe, StreamDirection, WorkerControl, align_sequence_forward, alsa_call,
+        announced_output_matches, bounded_pro_handoff_target, check_startup_loopback_deadline,
+        direct_linked_start_frames, direct_pro_cutoff_nanos, duplex_pointer_phase_from_timestamps,
+        linked_ahead_start_frames, linked_phase_dither_frames, linked_phase_target_nanos,
+        linked_phase_warmup_cycles, linked_start_frames, linked_zero_lead_playback_floor,
+        observe_pro_capture_target, period_limit_reached, playback_startup_priority,
+        playback_target_sleep, prepared_output_matches, pro_target_sequence,
+        record_linked_hardware_xruns, staged_playback_chunk_before_capture, startup_loopback_error,
+        startup_loopback_padding, take_pending_pro_capture, take_pro_capture_sequence,
         uses_staged_packet_cycle,
     };
     use crate::HardwareTimeline;
     use std::{
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
-        time::Duration,
+        time::{Duration, Instant},
     };
+
+    #[test]
+    fn startup_loopback_padding_never_subtracts_or_relabels_frames() {
+        assert_eq!(
+            startup_loopback_padding(344, 376, 128, 256, 64).unwrap(),
+            32
+        );
+        assert_eq!(startup_loopback_padding(376, 376, 128, 256, 64).unwrap(), 0);
+        assert!(matches!(
+            startup_loopback_padding(377, 376, 128, 256, 64),
+            Err(EngineError::StartupLoopback(
+                "unpadded loopback delay already exceeds target"
+            ))
+        ));
+        assert!(startup_loopback_padding(u64::MAX, 376, 128, 256, 64).is_err());
+    }
+
+    #[test]
+    fn startup_loopback_padding_keeps_one_full_client_block_writable() {
+        let start = direct_linked_start_frames(64, 256, Some(2));
+        assert_eq!(start, 128);
+        assert_eq!(
+            startup_loopback_padding(312, 376, start, 256, 64).unwrap(),
+            64
+        );
+        assert_eq!(
+            startup_loopback_padding(313, 376, start, 256, 64).unwrap(),
+            63
+        );
+        assert!(startup_loopback_padding(311, 376, start, 256, 64).is_err());
+        assert_eq!(
+            startup_loopback_padding(376, 376, start, 192, 64).unwrap(),
+            0
+        );
+        assert!(startup_loopback_padding(375, 376, start, 192, 64).is_err());
+        assert!(startup_loopback_padding(376, 376, start, 191, 64).is_err());
+        assert!(startup_loopback_padding(376, 376, start, 64, 64).is_err());
+        // A later hardware start uses its own measurement and the unchanged base prime.
+        assert_eq!(
+            startup_loopback_padding(352, 376, start, 256, 64).unwrap(),
+            24
+        );
+    }
+
+    #[test]
+    fn startup_loopback_requires_three_stable_delays_and_exact_verification() {
+        let mut probe = StartupLoopbackProbe {
+            markers: STARTUP_LOOPBACK_MARKERS[0],
+            interval: 4001,
+            delays: [None; 3],
+        };
+        assert_eq!(probe.measured_delay(None).unwrap(), None);
+        probe.delays = [Some(344), Some(344), None];
+        assert_eq!(probe.measured_delay(None).unwrap(), None);
+        probe.delays[2] = Some(345);
+        assert!(matches!(
+            probe.measured_delay(None),
+            Err(EngineError::StartupLoopback("unstable loopback delay"))
+        ));
+        probe.delays[2] = Some(344);
+        assert_eq!(probe.measured_delay(None).unwrap(), Some(344));
+        assert!(probe.measured_delay(Some(376)).is_err());
+        probe.delays = [Some(376), Some(376), None];
+        assert_eq!(probe.measured_delay(Some(376)).unwrap(), None);
+        probe.delays[2] = Some(376);
+        assert_eq!(probe.measured_delay(Some(376)).unwrap(), Some(376));
+    }
+
+    #[test]
+    fn startup_loopback_ignores_unsent_inexact_and_other_channel_markers() {
+        let [first, second, third] = STARTUP_LOOPBACK_MARKERS[0];
+        let mut probe = StartupLoopbackProbe {
+            markers: STARTUP_LOOPBACK_MARKERS[0],
+            interval: 4001,
+            delays: [None; 3],
+        };
+        probe.observe(4000, 4000, &[0, first], 2, 1).unwrap();
+        probe
+            .observe(4300, 4288, &[first, first - 1, second, first + 1], 2, 1)
+            .unwrap();
+        assert_eq!(probe.delays, [None; 3]);
+        for (index, marker) in STARTUP_LOOPBACK_MARKERS[0].into_iter().enumerate() {
+            let frame = (index as u64 + 1) * probe.interval + 344;
+            probe
+                .observe(frame, frame / 64 * 64, &[0, marker], 2, 1)
+                .unwrap();
+        }
+        assert_eq!(probe.measured_delay(None).unwrap(), Some(344));
+        assert!(matches!(
+            probe.observe(12_400, 12_352, &[0, third], 2, 1),
+            Err(EngineError::StartupLoopback("ambiguous repeated probe"))
+        ));
+    }
+
+    #[test]
+    fn startup_loopback_constant_input_cannot_qualify() {
+        let mut probe = StartupLoopbackProbe {
+            markers: STARTUP_LOOPBACK_MARKERS[0],
+            interval: 4001,
+            delays: [None; 3],
+        };
+        assert!(
+            probe
+                .observe(4352, 4352, &[STARTUP_LOOPBACK_MARKERS[0][0]; 64], 1, 0)
+                .is_err()
+        );
+        assert_eq!(probe.measured_delay(None).unwrap(), None);
+    }
+
+    #[test]
+    fn startup_loopback_detects_one_db_attenuation_after_24_bit_rounding() {
+        let gain = 10_f64.powf(-1.0 / 20.0);
+        for markers in STARTUP_LOOPBACK_MARKERS {
+            let mut probe = StartupLoopbackProbe {
+                markers,
+                interval: 4001,
+                delays: [None; 3],
+            };
+            for (index, marker) in markers.into_iter().enumerate() {
+                let attenuated = ((f64::from(marker) * gain / 256.0).round() as i32) * 256;
+                assert_ne!(marker, attenuated);
+                let frame = (index as u64 + 1) * probe.interval + 344;
+                probe
+                    .observe(frame, frame / 64 * 64, &[attenuated], 1, 0)
+                    .unwrap();
+            }
+            assert_eq!(probe.measured_delay(None).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn startup_loopback_transfer_failures_are_terminal() {
+        assert!(matches!(
+            startup_loopback_error(EngineError::ShortCommit {
+                direction: StreamDirection::Playback,
+                actual: 8,
+                required: 32,
+            }),
+            EngineError::StartupLoopback(_)
+        ));
+        assert!(matches!(
+            startup_loopback_error(EngineError::Stopped),
+            EngineError::Stopped
+        ));
+    }
+
+    #[test]
+    fn startup_loopback_markers_preserve_ordinals_across_every_period_split() {
+        for markers in STARTUP_LOOPBACK_MARKERS {
+            for split in 1..64 {
+                let mut probe = StartupLoopbackProbe {
+                    markers,
+                    interval: 4001,
+                    delays: [None; 3],
+                };
+                let mut playback = [99; 64 * 2];
+                probe.emit(3968, &mut playback[..split * 2], 2, 1);
+                probe.emit(3968 + split as u64, &mut playback[split * 2..], 2, 1);
+                for (frame, samples) in playback.as_chunks::<2>().0.iter().enumerate() {
+                    assert_eq!(samples[0], 0);
+                    assert_eq!(samples[1], if frame == 33 { markers[0] } else { 0 });
+                }
+
+                let mut capture = [0; 64 * 3];
+                capture[25 * 3 + 2] = playback[33 * 2 + 1];
+                probe
+                    .observe(4352, 4352, &capture[..split * 3], 3, 2)
+                    .unwrap();
+                probe
+                    .observe(4352 + split as u64, 4352, &capture[split * 3..], 3, 2)
+                    .unwrap();
+                assert_eq!(probe.delays, [Some(376), None, None]);
+            }
+        }
+    }
+
+    #[test]
+    fn startup_loopback_deadline_and_shutdown_are_terminal() {
+        let timeline = HardwareTimeline::default();
+        let stop = AtomicBool::new(false);
+        let done = AtomicBool::new(false);
+        let control = WorkerControl {
+            timeline: &timeline,
+            stop: &stop,
+            done: &done,
+            start_gate: None,
+            hardware_ready: None,
+            capture_cycle_generation: None,
+        };
+        let error = check_startup_loopback_deadline(control, Instant::now()).unwrap_err();
+        assert!(matches!(
+            error,
+            EngineError::StartupLoopback("two-second deadline expired")
+        ));
+        assert!(!error.is_recoverable());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        check_startup_loopback_deadline(control, deadline).unwrap();
+        stop.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            check_startup_loopback_deadline(control, deadline),
+            Err(EngineError::Stopped)
+        ));
+        stop.store(false, Ordering::Relaxed);
+        done.store(true, Ordering::Release);
+        assert!(matches!(
+            check_startup_loopback_deadline(control, deadline),
+            Err(EngineError::Stopped)
+        ));
+        assert_eq!(timeline.generation(), 0);
+        assert_eq!(timeline.snapshot().periods_processed, 0);
+    }
 
     #[test]
     fn playback_target_tracks_configured_lead() {

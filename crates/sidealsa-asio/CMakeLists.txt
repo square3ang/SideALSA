@@ -125,9 +125,9 @@ add_dependencies(sidealsa-asio sidealsa-asio-runtime-layout)
 
 add_custom_command(
     OUTPUT "${PROBE_OUTPUT}" "${PROBE_OUTPUT}.so"
-    COMMAND "${WINEGCC_EXECUTABLE}" -m64
+    COMMAND "${WINEGCC_EXECUTABLE}" -m64 -std=gnu11 -O2 -Wall -Wextra
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/asio_probe.c"
-            -lole32 -luuid
+            -lole32 -luuid -lm
             -o "${PROBE_OUTPUT}"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/asio_probe.c"
     VERBATIM
@@ -138,10 +138,10 @@ add_dependencies(sidealsa-asio-probe sidealsa-asio-runtime-layout)
 
 add_custom_command(
     OUTPUT "${LOOPBACK_OUTPUT}" "${LOOPBACK_OUTPUT}.so"
-    COMMAND "${WINEGCC_EXECUTABLE}" -m64
+    COMMAND "${WINEGCC_EXECUTABLE}" -m64 -std=gnu11 -O2 -Wall -Wextra
             -DSIDEALSA_ASIO_LOOPBACK_DEFAULT=1
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/asio_probe.c"
-            -lole32 -luuid
+            -lole32 -luuid -lm
             -o "${LOOPBACK_OUTPUT}"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/asio_probe.c"
     VERBATIM
@@ -152,10 +152,10 @@ add_dependencies(sidealsa-asio-loopback-test sidealsa-asio-runtime-layout)
 
 add_custom_command(
     OUTPUT "${LIFECYCLE_OUTPUT}" "${LIFECYCLE_OUTPUT}.so"
-    COMMAND "${WINEGCC_EXECUTABLE}" -m64
+    COMMAND "${WINEGCC_EXECUTABLE}" -m64 -std=gnu11 -O2 -Wall -Wextra
             -DSIDEALSA_ASIO_LIFECYCLE_DEFAULT=1
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/asio_probe.c"
-            -lole32 -luuid
+            -lole32 -luuid -lm
             -o "${LIFECYCLE_OUTPUT}"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/asio_probe.c"
     VERBATIM
@@ -163,6 +163,21 @@ add_custom_command(
 
 add_custom_target(sidealsa-asio-lifecycle-probe DEPENDS "${LIFECYCLE_OUTPUT}")
 add_dependencies(sidealsa-asio-lifecycle-probe sidealsa-asio-runtime-layout)
+
+include(CTest)
+if(BUILD_TESTING)
+    find_program(WINE_EXECUTABLE NAMES wine wine64)
+    if(WINE_EXECUTABLE)
+        add_test(NAME sidealsa-asio-sine-self-test
+            COMMAND "${CMAKE_COMMAND}"
+                "-DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+                "-DPROBE=${PROBE_OUTPUT}.so"
+                "-DWINE=${WINE_EXECUTABLE}"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/sine_self_test.cmake")
+        set_tests_properties(sidealsa-asio-sine-self-test PROPERTIES
+            TIMEOUT 120)
+    endif()
+endif()
 
 install(FILES "${DLL_OUTPUT}" DESTINATION lib/wine/x86_64-windows)
 install(FILES "${UNIX_OUTPUT}" DESTINATION lib/wine/x86_64-unix)

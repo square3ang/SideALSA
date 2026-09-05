@@ -48,6 +48,13 @@ That is a 3.17x ASIO conversion speedup over the previous implementation and an
 8.05x packed-area copy speedup. These are cache-hot kernel measurements, not
 end-to-end latency claims, and should be rerun on each deployment CPU.
 
+## Audio-load benchmarks
+
+For real synthesis and background load inside one playback process, use the
+[same-process audio-load benchmark](audio-load-benchmark.md). It separates
+callback DSP load from background workers and compares loopback phase and
+deadline counters without restarting hardware.
+
 ## Deliberate exclusions
 
 - An AVX2 gather implementation for the 10-channel ASIO capture layout measured

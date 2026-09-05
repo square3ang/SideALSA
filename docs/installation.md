@@ -39,6 +39,19 @@ otherwise unmodified profile:
 scripts/install.sh --replace-profile
 ```
 
+The current reference uses `hardware_period_size = 32` with logical Q64
+transfers. Existing P64 profiles remain unchanged on upgrade. After installing
+the engine with divided-period direct-mode support, explicitly edit that field
+or use `--replace-profile` to adopt the new reference. This changes transport
+batching, not the ASIO buffer size or the Q128 startup reserve.
+
+Optional [digital loopback startup normalization](startup-loopback.md) was
+tested at 376 frames but is disabled in the reference after a later runtime
+shift exceeded 8 ms. It requires the E1x2's exact internal output-0/input-4 return;
+do not copy that routing to another interface without verifying it. Update the
+daemon, validation helper, service unit, and profile together. Failed
+qualification exits 78 and is not automatically restarted by the installed unit.
+
 Use `--preserve-pipewire` when updating SideALSA binaries or profiles without
 rewriting the installed PipeWire adapter files or restarting the user PipeWire
 services. This mode requires the three adapter files to be present in the
@@ -58,14 +71,17 @@ any of those IDs instead of installing adapters that cannot open their ports.
 Automatic adapter generation for arbitrary validated profiles is not yet
 implemented.
 
-The E1x2 PRO pipeline uses identical Q64 client and physical ALSA periods with a
+The E1x2 PRO pipeline uses Q64 client blocks and P32 physical ALSA periods with a
 B256 hardware ring. `pro_latency_periods = 0`, timer scheduling is disabled, and
 `linked_phase_max_attempts = 0`. Linked startup primes the ALSA playback ring
-with Q128 of silence selected by `playback_queue_periods = 2` and starts
-playback and capture together. Capture block N is returned as playback target
+with a Q128 base of silence selected by `playback_queue_periods = 2` and starts
+playback and capture together. When explicitly enabled, digital loopback
+qualification may append up to Q64 of silence before clients are admitted.
+Capture block N is returned as playback target
 N, so native PRO and ASIO use the same callback timeline.
 
-ALSA playback and capture poll readiness jointly start each cycle. The
+ALSA playback and capture poll readiness jointly start each cycle, with
+`avail_min = 64` in both directions and whole-Q64 transfers. The
 playback-ready eventfd ends the client wait early; `pro_handoff_us = 1000`
 bounds that wait. The engine uses the post-poll `snd_pcm_avail_update()` value
 and reserves Q16 for fallback selection, mixing, and the ALSA write, shortening

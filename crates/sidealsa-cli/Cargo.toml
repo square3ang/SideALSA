@@ -22,5 +22,6 @@ name = "sidealsa-stats"
 path = "src/bin/sidealsa-stats.rs"
 
 [dependencies]
+libc = "0.2"
 sidealsa-client = { path = "../sidealsa-client" }
 sidealsa-protocol = { path = "../sidealsa-protocol" }

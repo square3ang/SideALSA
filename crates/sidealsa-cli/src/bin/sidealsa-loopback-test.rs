@@ -4,6 +4,15 @@ use sidealsa_client::SideAlsaClient;
 
 const PULSE_AMPLITUDE: i32 = 1 << 29;
 const FIRST_PULSE_FRAME: u64 = 65;
+const MAX_PHASE_OBSERVATIONS: usize = 128;
+
+#[derive(Clone, Copy, Default)]
+struct PhaseObservation {
+    sequence: u64,
+    previous_observation_nanos: u64,
+    observed_nanos: u64,
+    delay_frames: u64,
+}
 
 #[derive(Debug)]
 struct Args {
@@ -33,6 +42,11 @@ struct LoopbackTracker {
     maximum_frames: u64,
     total_frames: u128,
     lost_pulses: u64,
+    last_delay_frames: Option<u64>,
+    last_observation_nanos: u64,
+    phase_observations: [PhaseObservation; MAX_PHASE_OBSERVATIONS],
+    phase_observations_count: usize,
+    phase_observations_dropped: u64,
 }
 
 impl LoopbackTracker {
@@ -53,6 +67,11 @@ impl LoopbackTracker {
             maximum_frames: 0,
             total_frames: 0,
             lost_pulses: 0,
+            last_delay_frames: None,
+            last_observation_nanos: 0,
+            phase_observations: [PhaseObservation::default(); MAX_PHASE_OBSERVATIONS],
+            phase_observations_count: 0,
+            phase_observations_dropped: 0,
         }
     }
 
@@ -84,6 +103,20 @@ impl LoopbackTracker {
                 self.minimum_frames = self.minimum_frames.min(delay);
                 self.maximum_frames = self.maximum_frames.max(delay);
                 self.total_frames = self.total_frames.saturating_add(u128::from(delay));
+                let mut time = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                // Match tracefs's mono clock; keep formatting out of the period loop.
+                let observed_nanos =
+                    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } == 0 {
+                        (time.tv_sec as u64)
+                            .saturating_mul(1_000_000_000)
+                            .saturating_add(time.tv_nsec as u64)
+                    } else {
+                        0
+                    };
+                self.record_phase(sequence, delay, observed_nanos);
                 break;
             }
         }
@@ -94,6 +127,27 @@ impl LoopbackTracker {
             self.pending.pop_front();
             self.lost_pulses = self.lost_pulses.saturating_add(1);
         }
+    }
+
+    fn record_phase(&mut self, sequence: u64, delay_frames: u64, observed_nanos: u64) {
+        if self.last_delay_frames != Some(delay_frames) {
+            if let Some(slot) = self
+                .phase_observations
+                .get_mut(self.phase_observations_count)
+            {
+                *slot = PhaseObservation {
+                    sequence,
+                    previous_observation_nanos: self.last_observation_nanos,
+                    observed_nanos,
+                    delay_frames,
+                };
+                self.phase_observations_count += 1;
+            } else {
+                self.phase_observations_dropped = self.phase_observations_dropped.saturating_add(1);
+            }
+            self.last_delay_frames = Some(delay_frames);
+        }
+        self.last_observation_nanos = observed_nanos;
     }
 
     fn prepare_playback(&mut self, sequence: u64, playback: &mut [i32], channels: usize) -> usize {
@@ -141,6 +195,19 @@ impl LoopbackTracker {
     }
 
     fn print_summary(&self) {
+        for observation in &self.phase_observations[..self.phase_observations_count] {
+            println!(
+                "loopback_phase_sequence={} previous_observation_nanos={} observed_nanos={} delay_frames={}",
+                observation.sequence,
+                observation.previous_observation_nanos,
+                observation.observed_nanos,
+                observation.delay_frames,
+            );
+        }
+        println!(
+            "loopback_phase_observations_dropped={}",
+            self.phase_observations_dropped
+        );
         println!("loopback_scheduled_pulses={}", self.scheduled_pulses);
         println!("loopback_measurements={}", self.measurements);
         println!("loopback_lost_pulses={}", self.lost_pulses);
@@ -470,5 +537,36 @@ mod tests {
 
         assert!(tracker.pending.is_empty());
         assert_eq!(tracker.lost_pulses, 1);
+    }
+
+    #[test]
+    fn phase_observations_bound_transitions_without_growing() {
+        let args = Args {
+            socket: PathBuf::new(),
+            periods: 1,
+            output_channel: 0,
+            input_channel: 0,
+            pulse_interval_frames: 4097,
+            delay_ms: 0,
+            delay_every: 1,
+            expect_pro_misses: false,
+        };
+        let mut tracker = LoopbackTracker::new(&args, 64, 0, 48_000);
+        tracker.record_phase(10, 425, 100);
+        tracker.record_phase(11, 425, 200);
+        tracker.record_phase(12, 401, 300);
+        assert_eq!(tracker.phase_observations_count, 2);
+        assert_eq!(tracker.phase_observations[1].sequence, 12);
+        assert_eq!(
+            tracker.phase_observations[1].previous_observation_nanos,
+            200
+        );
+        assert_eq!(tracker.phase_observations[1].observed_nanos, 300);
+        assert_eq!(tracker.phase_observations[1].delay_frames, 401);
+        for index in 0..MAX_PHASE_OBSERVATIONS {
+            tracker.record_phase(index as u64, index as u64, 400 + index as u64);
+        }
+        assert_eq!(tracker.phase_observations_count, MAX_PHASE_OBSERVATIONS);
+        assert_eq!(tracker.phase_observations_dropped, 2);
     }
 }

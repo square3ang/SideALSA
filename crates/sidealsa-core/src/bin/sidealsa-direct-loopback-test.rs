@@ -11,12 +11,25 @@ const PULSE_AMPLITUDE: i32 = 1 << 29;
 const FIRST_PULSE_OFFSET: u64 = 65;
 const PULSE_INTERVAL_FRAMES: u64 = 4097;
 
+#[derive(Clone, Copy, Debug, Default)]
+enum StartOrder {
+    #[default]
+    Linked,
+    CaptureFirst,
+    PlaybackFirst,
+}
+
 #[derive(Debug)]
 struct Args {
     profile: PathBuf,
     periods: u64,
     buffer_frames: Option<u32>,
     start_frames: Option<u32>,
+    hardware_period_frames: Option<u32>,
+    prepare_wait_ms: u64,
+    restarts: u32,
+    start_order: StartOrder,
+    target_loopback_frames: Option<u32>,
     output_channel: usize,
     input_channel: usize,
 }
@@ -205,9 +218,11 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
     let profile = Profile::from_path(&args.profile)?;
     let config = &profile.device;
     let period_frames = config.period_size;
-    let hardware_period_frames = config.effective_hardware_period_size();
-    if period_frames != hardware_period_frames {
-        return Err("direct baseline requires equal logical and hardware periods".into());
+    let hardware_period_frames = args
+        .hardware_period_frames
+        .unwrap_or_else(|| config.effective_hardware_period_size());
+    if hardware_period_frames == 0 || !period_frames.is_multiple_of(hardware_period_frames) {
+        return Err("hardware period must divide the logical period".into());
     }
     let buffer_frames = args.buffer_frames.unwrap_or(config.buffer_size);
     if buffer_frames < period_frames.saturating_mul(2)
@@ -237,14 +252,14 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
     configure_pcm(
         &playback,
         config.rate,
-        period_frames,
+        hardware_period_frames,
         buffer_frames,
         config.playback.channels,
     )?;
     configure_pcm(
         &capture,
         config.rate,
-        period_frames,
+        hardware_period_frames,
         buffer_frames,
         config.capture.channels,
     )?;
@@ -256,98 +271,193 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
     let mut capture_period = vec![0_i32; period * capture_channels];
     let startup = vec![0_i32; usize::try_from(start_frames)? * playback_channels];
 
-    playback.link(&capture)?;
-    playback.prepare()?;
-    write_frames(&playback, &startup, playback_channels)?;
-    playback.start()?;
-    let mut duplex_poll = DuplexPoll::new(&playback, &capture)?;
+    for restart in 0..=args.restarts {
+        match args.start_order {
+            StartOrder::Linked => {
+                playback.link(&capture)?;
+                playback.prepare()?;
+            }
+            StartOrder::CaptureFirst | StartOrder::PlaybackFirst => {
+                // Hold prepare order constant while changing linked trigger traversal.
+                capture.prepare()?;
+                playback.prepare()?;
+                match args.start_order {
+                    StartOrder::CaptureFirst => playback.link(&capture)?,
+                    StartOrder::PlaybackFirst => capture.link(&playback)?,
+                    StartOrder::Linked => unreachable!(),
+                }
+            }
+        }
+        if args.prepare_wait_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(args.prepare_wait_ms));
+        }
+        write_frames(&playback, &startup, playback_channels)?;
+        playback.start()?;
+        let mut duplex_poll = DuplexPoll::new(&playback, &capture)?;
 
-    let mut measurements = Measurements::default();
-    let mut playback_position = 0_u64;
-    let mut capture_position = 0_u64;
-    let mut next_pulse_frame = playback_position.saturating_add(FIRST_PULSE_OFFSET);
-    let drain_periods = PULSE_INTERVAL_FRAMES.div_ceil(u64::from(period_frames)) + 2;
-    let total_periods = args.periods.saturating_add(drain_periods);
-    let mut processed_periods = 0_u64;
-
-    while processed_periods < total_periods {
-        let mut available = duplex_poll.wait(&playback, &capture)?;
-        while available >= period && processed_periods < total_periods {
-            read_frames(&capture, &mut capture_period, capture_channels).map_err(|error| {
-                format!("capture transfer at period {processed_periods} failed: {error}")
-            })?;
-            measurements.observe_capture(
-                capture_position,
-                &capture_period,
-                capture_channels,
-                args.input_channel,
-            );
-            capture_position = capture_position.saturating_add(u64::from(period_frames));
-
-            playback_period.fill(0);
-            if processed_periods < args.periods {
-                measurements.emit_playback(
-                    playback_position,
-                    &mut playback_period,
-                    playback_channels,
-                    args.output_channel,
-                    u64::from(start_frames),
-                    &mut next_pulse_frame,
+        let mut padding_frames = 0;
+        let mut unpadded_delay = None;
+        if let Some(target) = args.target_loopback_frames {
+            let mut calibration = Measurements::default();
+            let mut position = 0;
+            let mut next_pulse = FIRST_PULSE_OFFSET;
+            for _ in 0..256 {
+                if duplex_poll.wait(&playback, &capture)? < period {
+                    continue;
+                }
+                read_frames(&capture, &mut capture_period, capture_channels)?;
+                calibration.observe_capture(
+                    position,
+                    &capture_period,
+                    capture_channels,
+                    args.input_channel,
+                );
+                playback_period.fill(0);
+                if calibration.measured < 3 {
+                    calibration.emit_playback(
+                        position,
+                        &mut playback_period,
+                        playback_channels,
+                        args.output_channel,
+                        u64::from(start_frames),
+                        &mut next_pulse,
+                    );
+                }
+                write_frames(&playback, &playback_period, playback_channels)?;
+                position += u64::from(period_frames);
+                if calibration.measured == 3 {
+                    break;
+                }
+            }
+            if calibration.measured != 3 || calibration.minimum != calibration.maximum {
+                return Err("startup loopback calibration did not find a stable path".into());
+            }
+            unpadded_delay = Some(calibration.minimum);
+            padding_frames = u64::from(target)
+                .checked_sub(calibration.minimum)
+                .ok_or("startup loopback already exceeds target; refusing to relabel samples")?;
+            if padding_frames > u64::from(buffer_frames - start_frames)
+                || padding_frames > u64::from(start_frames)
+            {
+                return Err(
+                    "calibration padding exceeds the available startup reserve buffer".into(),
                 );
             }
-            write_frames(&playback, &playback_period, playback_channels).map_err(|error| {
-                format!("playback transfer at period {processed_periods} failed: {error}")
-            })?;
-            playback_position = playback_position.saturating_add(u64::from(period_frames));
-            processed_periods = processed_periods.saturating_add(1);
-            available -= period;
+            // Add actual queued silence; preserve all captured and playback sample ordinals.
+            write_frames(
+                &playback,
+                &startup[..padding_frames as usize * playback_channels],
+                playback_channels,
+            )?;
+        }
+
+        let mut measurements = Measurements::default();
+        let mut playback_position = 0_u64;
+        let mut capture_position = 0_u64;
+        let mut next_pulse_frame = playback_position.saturating_add(FIRST_PULSE_OFFSET);
+        let drain_periods = PULSE_INTERVAL_FRAMES.div_ceil(u64::from(period_frames)) + 2;
+        let total_periods = args.periods.saturating_add(drain_periods);
+        let mut processed_periods = 0_u64;
+
+        while processed_periods < total_periods {
+            let mut available = duplex_poll.wait(&playback, &capture)?;
+            while available >= period && processed_periods < total_periods {
+                read_frames(&capture, &mut capture_period, capture_channels).map_err(|error| {
+                    format!("capture transfer at period {processed_periods} failed: {error}")
+                })?;
+                measurements.observe_capture(
+                    capture_position,
+                    &capture_period,
+                    capture_channels,
+                    args.input_channel,
+                );
+                capture_position = capture_position.saturating_add(u64::from(period_frames));
+
+                playback_period.fill(0);
+                if processed_periods < args.periods {
+                    measurements.emit_playback(
+                        playback_position,
+                        &mut playback_period,
+                        playback_channels,
+                        args.output_channel,
+                        u64::from(start_frames) + padding_frames,
+                        &mut next_pulse_frame,
+                    );
+                }
+                write_frames(&playback, &playback_period, playback_channels).map_err(|error| {
+                    format!("playback transfer at period {processed_periods} failed: {error}")
+                })?;
+                playback_position = playback_position.saturating_add(u64::from(period_frames));
+                processed_periods = processed_periods.saturating_add(1);
+                available -= period;
+            }
+        }
+
+        playback.unlink()?;
+        capture.drop()?;
+        playback.drop()?;
+
+        println!(
+            "direct_restart_index={restart} direct_prepare_wait_ms={} direct_start_order={:?}",
+            args.prepare_wait_ms, args.start_order
+        );
+        println!("direct_period_frames={period_frames}");
+        println!("direct_hardware_period_frames={hardware_period_frames}");
+        println!("direct_buffer_frames={buffer_frames}");
+        println!("direct_start_frames={start_frames}");
+        if let Some(unpadded) = unpadded_delay {
+            println!(
+                "direct_uncalibrated_frames={unpadded} direct_padding_frames={padding_frames}"
+            );
+        }
+        println!("direct_scheduled_pulses={}", measurements.scheduled);
+        println!("direct_measurements={}", measurements.measured);
+        if measurements.pending_output_frame.is_some() {
+            return Err("a direct loopback pulse remained pending".into());
+        }
+        if measurements.measured != measurements.scheduled || measurements.measured < 2 {
+            return Err(format!(
+                "measured {} of {} direct loopback pulses",
+                measurements.measured, measurements.scheduled
+            )
+            .into());
+        }
+        println!("direct_min_frames={}", measurements.minimum);
+        println!("direct_max_frames={}", measurements.maximum);
+        println!(
+            "direct_mean_frames={:.3}",
+            measurements.total as f64 / measurements.measured as f64
+        );
+        println!(
+            "direct_min_ms={:.3}",
+            measurements.minimum as f64 * 1_000.0 / f64::from(config.rate)
+        );
+        println!(
+            "direct_max_ms={:.3}",
+            measurements.maximum as f64 * 1_000.0 / f64::from(config.rate)
+        );
+        println!(
+            "direct_physical_min_frames={}",
+            measurements.physical_minimum
+        );
+        println!(
+            "direct_physical_max_frames={}",
+            measurements.physical_maximum
+        );
+        println!(
+            "direct_physical_mean_frames={:.3}",
+            measurements.physical_total as f64 / measurements.measured as f64
+        );
+        if measurements.minimum != measurements.maximum {
+            return Err("direct loopback phase changed within one hardware start".into());
+        }
+        if args
+            .target_loopback_frames
+            .is_some_and(|target| measurements.minimum != u64::from(target))
+        {
+            return Err("actual loopback delay did not match the calibrated target".into());
         }
     }
-
-    playback.unlink()?;
-    capture.drop()?;
-    playback.drop()?;
-
-    println!("direct_buffer_frames={buffer_frames}");
-    println!("direct_start_frames={start_frames}");
-    println!("direct_scheduled_pulses={}", measurements.scheduled);
-    println!("direct_measurements={}", measurements.measured);
-    if measurements.pending_output_frame.is_some() {
-        return Err("a direct loopback pulse remained pending".into());
-    }
-    if measurements.measured != measurements.scheduled || measurements.measured < 2 {
-        return Err(format!(
-            "measured {} of {} direct loopback pulses",
-            measurements.measured, measurements.scheduled
-        )
-        .into());
-    }
-    println!("direct_min_frames={}", measurements.minimum);
-    println!("direct_max_frames={}", measurements.maximum);
-    println!(
-        "direct_mean_frames={:.3}",
-        measurements.total as f64 / measurements.measured as f64
-    );
-    println!(
-        "direct_min_ms={:.3}",
-        measurements.minimum as f64 * 1_000.0 / f64::from(config.rate)
-    );
-    println!(
-        "direct_max_ms={:.3}",
-        measurements.maximum as f64 * 1_000.0 / f64::from(config.rate)
-    );
-    println!(
-        "direct_physical_min_frames={}",
-        measurements.physical_minimum
-    );
-    println!(
-        "direct_physical_max_frames={}",
-        measurements.physical_maximum
-    );
-    println!(
-        "direct_physical_mean_frames={:.3}",
-        measurements.physical_total as f64 / measurements.measured as f64
-    );
     Ok(())
 }
 
@@ -366,7 +476,16 @@ fn configure_pcm(
     params.set_period_size(i64::from(period), ValueOr::Nearest)?;
     params.set_periods(buffer / period, ValueOr::Nearest)?;
     params.set_buffer_size(i64::from(buffer))?;
-    pcm.hw_params(&params)
+    pcm.hw_params(&params)?;
+    let actual = pcm.hw_params_current()?;
+    if actual.get_period_size()? != i64::from(period)
+        || actual.get_buffer_size()? != i64::from(buffer)
+        || actual.get_rate()? != rate
+        || actual.get_channels()? != channels
+    {
+        return Err(alsa::Error::new("verify direct PCM geometry", libc::EINVAL));
+    }
+    Ok(())
 }
 
 fn configure_sw(pcm: &PCM, start_threshold: i64, avail_min: i64) -> alsa::Result<()> {
@@ -434,6 +553,11 @@ fn parse_args() -> Result<Args, String> {
     let mut periods = 5_000;
     let mut buffer_frames = None;
     let mut start_frames = None;
+    let mut hardware_period_frames = None;
+    let mut prepare_wait_ms = 0;
+    let mut restarts = 0;
+    let mut start_order = StartOrder::default();
+    let mut target_loopback_frames = None;
     let mut output_channel = 0;
     let mut input_channel = 4;
     while let Some(argument) = arguments.next() {
@@ -446,6 +570,31 @@ fn parse_args() -> Result<Args, String> {
             Some("--start-frames") => {
                 start_frames = Some(parse_value(&mut arguments, "--start-frames")?)
             }
+            Some("--hardware-period-frames") => {
+                hardware_period_frames =
+                    Some(parse_value(&mut arguments, "--hardware-period-frames")?)
+            }
+            Some("--prepare-wait-ms") => {
+                prepare_wait_ms = parse_value(&mut arguments, "--prepare-wait-ms")?
+            }
+            Some("--restarts") => restarts = parse_value(&mut arguments, "--restarts")?,
+            Some("--start-order") => {
+                start_order = match next_value(&mut arguments, "--start-order")?.to_str() {
+                    Some("linked") => StartOrder::Linked,
+                    Some("capture-first") => StartOrder::CaptureFirst,
+                    Some("playback-first") => StartOrder::PlaybackFirst,
+                    _ => {
+                        return Err(
+                            "--start-order requires linked, capture-first, or playback-first"
+                                .into(),
+                        );
+                    }
+                };
+            }
+            Some("--target-loopback-frames") => {
+                target_loopback_frames =
+                    Some(parse_value(&mut arguments, "--target-loopback-frames")?)
+            }
             Some("--output-channel") => {
                 output_channel = parse_value(&mut arguments, "--output-channel")?
             }
@@ -454,7 +603,7 @@ fn parse_args() -> Result<Args, String> {
             }
             Some("--help") | Some("-h") => {
                 println!(
-                    "sidealsa-direct-loopback-test [--profile PATH] [--periods COUNT] [--buffer-frames COUNT] [--start-frames COUNT] [--output-channel INDEX] [--input-channel INDEX]"
+                    "sidealsa-direct-loopback-test [--profile PATH] [--periods COUNT] [--buffer-frames COUNT] [--start-frames COUNT] [--hardware-period-frames COUNT] [--prepare-wait-ms MS] [--restarts COUNT] [--start-order linked|capture-first|playback-first] [--target-loopback-frames COUNT] [--output-channel INDEX] [--input-channel INDEX]"
                 );
                 std::process::exit(0);
             }
@@ -470,6 +619,11 @@ fn parse_args() -> Result<Args, String> {
         periods,
         buffer_frames,
         start_frames,
+        hardware_period_frames,
+        prepare_wait_ms,
+        restarts,
+        start_order,
+        target_loopback_frames,
         output_channel,
         input_channel,
     })
@@ -496,4 +650,24 @@ where
         .ok_or_else(|| format!("{name} must be valid UTF-8"))?
         .parse()
         .map_err(|_| format!("{name} has an invalid value"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn physical_metric_subtracts_only_the_known_startup_offset() {
+        let mut measurements = Measurements {
+            pending_output_frame: Some((65, 65 + 128)),
+            ..Measurements::default()
+        };
+        let mut capture = [0; 64];
+        capture[10] = PULSE_AMPLITUDE;
+        measurements.observe_capture(480, &capture, 1, 0);
+        assert_eq!(measurements.measured, 1);
+        assert_eq!(measurements.minimum, 425);
+        assert_eq!(measurements.physical_minimum, 297);
+        assert_eq!(measurements.minimum - measurements.physical_minimum, 128);
+    }
 }

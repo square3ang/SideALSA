@@ -90,7 +90,7 @@ generation when the stream must be rebased.
 | Sample format and rate | S32_LE, 48 kHz |
 | Physical channels | 8 playback, 10 capture |
 | Native protocol and PRO ALSA period | 64 frames |
-| Physical ALSA period | 64 frames |
+| Physical ALSA period | 32 frames |
 | Physical ALSA buffer | 256 frames |
 | Direct PRO startup queue | 128 frames |
 | Independent SHARED ring | 512 frames |
@@ -103,10 +103,16 @@ The reported PRO latency does not include USB transport, device firmware,
 converters, or analog loopback delay.
 
 The reference PRO loop primes the linked ALSA ring, then lets capture
-and playback poll readiness jointly drive each Q64 transfer. The B256 ring is
-capacity; Q128 is queued. Client playback completion wakes the daemon
-through eventfd. There is no playback queue target, phase calibration, or live
-delay calculation in this mode. Exact PRO playback has a bounded 1.0 ms handoff
+and playback poll readiness jointly drive each whole-Q64 transfer over P32
+transport. Both directions use `avail_min = 64`; the smaller physical period
+reduces USB batching without changing the PRO callback size. The B256 ring is
+capacity; Q128 is the base prime. Optional
+[startup normalization](docs/startup-loopback.md) can align the configured
+digital return at startup, but is disabled in the reference because later
+device-side shifts can invalidate it. Client playback completion wakes the daemon
+through eventfd. There is no continuous playback queue-target control,
+pointer-based phase calibration, or live delay calculation in this mode.
+Exact PRO playback has a bounded 1.0 ms handoff
 deadline that is dynamically shortened from the post-poll ALSA availability so
 fallback selection and the ALSA write retain a Q16 queue reserve.
 
@@ -488,8 +494,12 @@ chrt --fifo 48 target/release/sidealsa-direct-loopback-test \
 ```
 
 `direct_min_frames` and `direct_max_frames` use the same app-visible coordinate
-as `sidealsa-loopback-test`. `direct_physical_*` removes Q128 and reports the
-device/USB/analog component. Separate hardware opens can select different
+as `sidealsa-loopback-test`. `direct_physical_*` removes the known startup offset
+and reports the remaining device/USB offset, not pure converter latency. The
+reference channel pair is an internal digital loopback. The direct diagnostic
+does not apply the daemon's `startup_loopback` table automatically; add
+`--target-loopback-frames 376` to test actual silence-padding normalization.
+Without normalization, separate hardware opens can select different
 duplex phases, so parity means matching the direct distribution without a
 SideALSA-only Q64 displacement, not equality between arbitrary paired opens.
 The current Q128 verification measured 361 frames in a direct open and 373
@@ -558,6 +568,7 @@ and test conditions.
 - [PipeWire integration](docs/milestone-8.md)
 - [Wine ASIO frontend](docs/milestone-asio.md)
 - [Performance and SIMD](docs/performance.md)
+- [Same-process audio-load benchmark](docs/audio-load-benchmark.md)
 
 ## License
 

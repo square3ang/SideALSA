@@ -7,11 +7,13 @@
 #include <windows.h>
 
 #include <errno.h>
+#include <math.h>
 #include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifndef SIDEALSA_ASIO_LOOPBACK_DEFAULT
 #define SIDEALSA_ASIO_LOOPBACK_DEFAULT 0
@@ -156,6 +158,40 @@ static LONG callback_wait_errors;
 #define LOOPBACK_INTERVAL_FRAMES 4097
 #define MAX_STRESS_THREADS 64
 #define STRESS_CPU_BATCH 65536
+#define STRESS_GATE_CHUNK 1024
+#define MAX_SINE_VOICES 4096
+#define SINE_STAGE_COUNT 3
+#define SINE_TWO_PI 6.28318530717958647692
+#define SINE_PEAK 0.03125
+
+static struct
+{
+    double phase;
+    double step;
+} sine_oscillators[MAX_SINE_VOICES];
+
+static struct
+{
+    uint64_t callbacks;
+    LONG64 total_ticks;
+    LONG64 max_ticks;
+    uint64_t period_overruns;
+    uint64_t voice_samples;
+    uint64_t loopback_count;
+    LONG loopback_min;
+    LONG loopback_max;
+    uint64_t first_sample_position;
+    uint64_t first_mono_ns;
+    LONG64 worker_begin;
+    LONG64 worker_end;
+} sine_stats[SINE_STAGE_COUNT];
+
+static DWORD sine_voices;
+static uint64_t sine_total_frames;
+static LONG sine_stage = -1;
+static LONG pending_pulse_stage = -1;
+static volatile double sine_prewarm_sink;
+static volatile LONG stress_active;
 
 typedef struct
 {
@@ -196,6 +232,154 @@ static LONG callback_sched_priority = INT32_MIN;
 static LONG callback_sched_reset_on_fork;
 static LONG callback_sched_set_attempted;
 static LONG callback_sched_set_error;
+
+static int
+prepare_sine(DWORD run_ms)
+{
+    struct timespec now;
+
+    if (sine_voices == 0 || sine_voices > MAX_SINE_VOICES || run_ms < 1000)
+        return 0;
+    sine_total_frames = (uint64_t)run_ms * 48;
+    memset(sine_oscillators, 0, sizeof(sine_oscillators));
+    for (DWORD voice = 0; voice < sine_voices; ++voice)
+    {
+        double frequency = 220.0;
+
+        if (sine_voices > 1)
+            frequency += 1780.0 * voice / (sine_voices - 1);
+        sine_oscillators[voice].step = SINE_TWO_PI * frequency / 48000.0;
+    }
+    /* Prewarm the full phase range even for one voice, before any callback can run. */
+    for (LONG sample = 0; sample < 64; ++sample)
+        sine_prewarm_sink = sin(SINE_TWO_PI * sample / 64.0 + sine_oscillators[0].step);
+    return clock_gettime(CLOCK_MONOTONIC, &now) == 0;
+}
+
+static void
+reset_sine(void)
+{
+    /* Only called before Start, with the previous callback fully stopped. */
+    InterlockedExchange(&stress_active, 0);
+    for (DWORD voice = 0; voice < sine_voices; ++voice)
+        sine_oscillators[voice].phase = 0.0;
+    memset(sine_stats, 0, sizeof(sine_stats));
+    for (LONG stage = 0; stage < SINE_STAGE_COUNT; ++stage)
+        sine_stats[stage].loopback_min = INT32_MAX;
+    sine_stage = -1;
+    pending_pulse_stage = -1;
+}
+
+static void
+select_sine_stage(uint64_t block_start)
+{
+    uint64_t elapsed = sine_stage < 0 ? 0 : block_start - sine_stats[0].first_sample_position;
+    LONG stage = elapsed < sine_total_frames / 4
+                   ? 0
+                   : elapsed < sine_total_frames * 3 / 4 ? 1 : 2;
+
+    if (stage != sine_stage)
+    {
+        struct timespec now;
+        LONG64 work_units = InterlockedCompareExchange64(&stress_work_units, 0, 0);
+
+        /* Transitions use sample time, rounded up to a callback boundary, never host IPC. */
+        if (sine_stage >= 0)
+            sine_stats[sine_stage].worker_end = work_units;
+        sine_stats[stage].worker_begin = work_units;
+        sine_stats[stage].worker_end = work_units;
+        sine_stage = stage;
+        sine_stats[stage].first_sample_position = block_start;
+        sine_stats[stage].first_mono_ns = clock_gettime(CLOCK_MONOTONIC, &now) == 0
+                                          ? (uint64_t)now.tv_sec * UINT64_C(1000000000)
+                                                + (uint64_t)now.tv_nsec
+                                          : 0;
+        InterlockedExchange(&stress_active, stage == 1);
+    }
+}
+
+static void
+process_sine(LONG index)
+{
+    DWORD voices;
+    double gain;
+    float *output;
+
+    if (sine_voices == 0)
+        return;
+    voices = sine_stage == 1 ? sine_voices : 1;
+    gain = SINE_PEAK / voices;
+    output = active_buffers[10].buffers[index];
+    for (LONG frame = 0; frame < 64; ++frame)
+    {
+        double sample = 0.0;
+
+        for (DWORD voice = 0; voice < voices; ++voice)
+        {
+            double phase = sine_oscillators[voice].phase;
+
+            sample += sin(phase);
+            phase += sine_oscillators[voice].step;
+            if (phase >= SINE_TWO_PI)
+                phase -= SINE_TWO_PI;
+            sine_oscillators[voice].phase = phase;
+        }
+        output[frame] += (float)(sample * gain);
+    }
+    for (LONG channel = 11; channel < 18; ++channel)
+        memset(active_buffers[channel].buffers[index], 0, 64 * sizeof(float));
+    sine_stats[sine_stage].voice_samples += (uint64_t)voices * 64;
+}
+
+static int
+finish_sine_stages(void)
+{
+    /* Only after Stop has quiesced the callback; workers keep their global counters. */
+    InterlockedExchange(&stress_active, 0);
+    if (sine_stage >= 0)
+        sine_stats[sine_stage].worker_end = InterlockedCompareExchange64(&stress_work_units, 0, 0);
+    for (LONG stage = 0; stage < SINE_STAGE_COUNT; ++stage)
+    {
+        if (sine_stats[stage].callbacks == 0 || sine_stats[stage].loopback_count == 0
+            || sine_stats[stage].period_overruns != 0 || sine_stats[stage].first_mono_ns == 0
+            || sine_stats[stage].worker_end < sine_stats[stage].worker_begin
+            || (stage == 1 && stress_thread_count > 0 && sine_voices > 0
+                && sine_stats[stage].worker_end == sine_stats[stage].worker_begin))
+            return 0;
+    }
+    return 1;
+}
+
+static int
+print_sine_stages(const char *leg)
+{
+    static const char *const names[SINE_STAGE_COUNT] = { "warm", "loaded", "cool" };
+    int success = finish_sine_stages();
+
+    for (LONG stage = 0; stage < SINE_STAGE_COUNT; ++stage)
+    {
+        double ticks_per_us = (double)benchmark_frequency.QuadPart / 1000000.0;
+
+        fprintf(stderr,
+                "[asio-probe] %s sine stage: stage=%s voices=%lu count=%llu mean_us=%.3f max_us=%.3f period_overruns=%llu voice_samples=%llu loopback_count=%llu loopback_min=%ld loopback_max=%ld first_sample_position=%llu first_mono_ns=%llu worker_units=%llu\n",
+                leg, names[stage], (unsigned long)(stage == 1 ? sine_voices : 1),
+                (unsigned long long)sine_stats[stage].callbacks,
+                sine_stats[stage].callbacks == 0
+                  ? 0.0
+                  : (double)sine_stats[stage].total_ticks
+                        / ((double)sine_stats[stage].callbacks * ticks_per_us),
+                (double)sine_stats[stage].max_ticks / ticks_per_us,
+                (unsigned long long)sine_stats[stage].period_overruns,
+                (unsigned long long)sine_stats[stage].voice_samples,
+                (unsigned long long)sine_stats[stage].loopback_count,
+                (long)(sine_stats[stage].loopback_count == 0 ? 0 : sine_stats[stage].loopback_min),
+                (long)sine_stats[stage].loopback_max,
+                (unsigned long long)sine_stats[stage].first_sample_position,
+                (unsigned long long)sine_stats[stage].first_mono_ns,
+                (unsigned long long)(sine_stats[stage].worker_end - sine_stats[stage].worker_begin));
+    }
+    return success;
+}
 
 static int
 read_environment_u32(const char *name, DWORD maximum, DWORD *value)
@@ -249,12 +433,23 @@ stress_worker_main(void *opaque)
     {
         LONG64 work_units = 0;
 
+        if (sine_voices > 0 && !InterlockedCompareExchange(&stress_active, 0, 0))
+        {
+            Sleep(1);
+            continue;
+        }
         if (worker->memory_size > 0)
         {
             for (SIZE_T offset = 0; offset + sizeof(uint64_t) <= worker->memory_size;
                  offset += 64)
             {
                 volatile uint64_t *slot = (volatile uint64_t *)(worker->memory + offset);
+
+                /* At most 1024 cache lines (64 KiB) of work between gate checks. */
+                if (sine_voices > 0 && work_units % STRESS_GATE_CHUNK == 0
+                    && (!InterlockedCompareExchange(&stress_active, 0, 0)
+                        || InterlockedCompareExchange(&stress_stop_requested, 0, 0)))
+                    break;
                 state ^= state << 13;
                 state ^= state >> 7;
                 state ^= state << 17;
@@ -265,16 +460,22 @@ stress_worker_main(void *opaque)
         }
         else
         {
-            for (LONG index = 0; index < STRESS_CPU_BATCH; ++index)
+            for (work_units = 0; work_units < STRESS_CPU_BATCH; ++work_units)
             {
+                if (sine_voices > 0 && work_units % STRESS_GATE_CHUNK == 0
+                    && (!InterlockedCompareExchange(&stress_active, 0, 0)
+                        || InterlockedCompareExchange(&stress_stop_requested, 0, 0)))
+                    break;
                 state ^= state << 13;
                 state ^= state >> 7;
                 state ^= state << 17;
             }
-            work_units = STRESS_CPU_BATCH;
         }
-        InterlockedIncrement64(&stress_passes);
-        InterlockedExchangeAdd64(&stress_work_units, work_units);
+        if (sine_voices == 0 || work_units > 0)
+        {
+            InterlockedIncrement64(&stress_passes);
+            InterlockedExchangeAdd64(&stress_work_units, work_units);
+        }
     }
     worker->state = state;
     InterlockedExchangeAdd64(&stress_checksum, (LONG64)state);
@@ -570,6 +771,8 @@ process_loopback(LONG index)
                              : loopback_frame;
     uint64_t block_end = block_start + 64;
 
+    if (sine_voices > 0)
+        select_sine_stage(block_start);
     for (LONG frame = 0; frame < 64; ++frame)
     {
         float sample = input[frame];
@@ -583,6 +786,14 @@ process_loopback(LONG index)
             loopback_min = (LONG)delay;
         if ((LONG)delay > loopback_max)
             loopback_max = (LONG)delay;
+        if (sine_voices > 0 && pending_pulse_stage >= 0)
+        {
+            ++sine_stats[pending_pulse_stage].loopback_count;
+            if ((LONG)delay < sine_stats[pending_pulse_stage].loopback_min)
+                sine_stats[pending_pulse_stage].loopback_min = (LONG)delay;
+            if ((LONG)delay > sine_stats[pending_pulse_stage].loopback_max)
+                sine_stats[pending_pulse_stage].loopback_max = (LONG)delay;
+        }
         break;
     }
     if (pending_pulse
@@ -601,6 +812,7 @@ process_loopback(LONG index)
             InterlockedIncrement(&loopback_lost);
         output[next_pulse_frame - block_start] = 0.25f;
         pending_pulse_frame = next_pulse_frame;
+        pending_pulse_stage = sine_stage;
         pending_pulse = 1;
         InterlockedIncrement(&loopback_emitted);
         next_pulse_frame += LOOPBACK_INTERVAL_FRAMES;
@@ -665,6 +877,8 @@ buffer_switch(LONG index, LONG direct_process)
         InterlockedIncrement(&callback_index_errors);
     if (loopback_enabled)
         process_loopback(index);
+    if (sine_voices > 0)
+        process_sine(index);
     if (benchmark_enabled)
     {
         LONG64 duration;
@@ -677,6 +891,15 @@ buffer_switch(LONG index, LONG direct_process)
         update_max_ticks(&callback_max_ticks, duration);
         if (duration > callback_period_ticks)
             InterlockedIncrement(&callback_period_overruns);
+        if (sine_voices > 0)
+        {
+            ++sine_stats[sine_stage].callbacks;
+            sine_stats[sine_stage].total_ticks += duration;
+            if (duration > sine_stats[sine_stage].max_ticks)
+                sine_stats[sine_stage].max_ticks = duration;
+            if (duration > callback_period_ticks)
+                ++sine_stats[sine_stage].period_overruns;
+        }
     }
     InterlockedIncrement(&cycles);
 }
@@ -721,6 +944,309 @@ fail(const char *operation, LONG result)
     fprintf(stderr, "[asio-probe] %s failed: %ld\n", operation, (long)result);
     return 1;
 }
+
+#define SINE_CHECK(condition) \
+    do \
+    { \
+        if (!(condition)) \
+        { \
+            fprintf(stderr, "[asio-probe] sine self-test FAIL line=%d: %s\n", \
+                    __LINE__, #condition); \
+            return 1; \
+        } \
+    } while (0)
+
+static int
+run_sine_self_test(void)
+{
+    AsioBufferInfo buffers[18] = { 0 };
+    static float audio[18][2][64];
+    float delayed[4][64] = { 0 };
+    const DWORD voice_counts[] = { 1, MAX_SINE_VOICES };
+
+    active_buffers = buffers;
+    for (LONG channel = 0; channel < 18; ++channel)
+        for (LONG index = 0; index < 2; ++index)
+            buffers[channel].buffers[index] = audio[channel][index];
+
+    sine_voices = MAX_SINE_VOICES + 1;
+    SINE_CHECK(!prepare_sine(1000));
+    sine_voices = 1;
+    SINE_CHECK(!prepare_sine(999));
+    SINE_CHECK(prepare_sine(UINT32_MAX));
+    SINE_CHECK(sine_total_frames == (uint64_t)UINT32_MAX * 48);
+    sine_voices = 0;
+    SINE_CHECK(!prepare_sine(1000));
+    reset_loopback();
+    process_loopback(0);
+    process_sine(0);
+    process_loopback(1);
+    process_sine(1);
+    for (LONG frame = 0; frame < 64; ++frame)
+    {
+        SINE_CHECK(audio[10][0][frame] == 0.0f);
+        SINE_CHECK(audio[10][1][frame] == (frame == 1 ? 0.25f : 0.0f));
+    }
+    SINE_CHECK(pending_pulse_frame == 65 && next_pulse_frame == 65 + 4097);
+    for (LONG sign = -1; sign <= 1; sign += 2)
+    {
+        memset(audio, 0, sizeof(audio));
+        reset_loopback();
+        process_loopback(0);
+        process_loopback(1);
+        for (LONG frame = 0; frame < 64; ++frame)
+            audio[4][0][frame] = (float)(sign * SINE_PEAK);
+        process_loopback(0);
+        SINE_CHECK(pending_pulse && loopback_measurements == 0);
+        audio[4][1][0] = (float)(0.25 + sign * SINE_PEAK);
+        process_loopback(1);
+        SINE_CHECK(!pending_pulse && loopback_measurements == 1 && loopback_min == 127);
+    }
+
+    for (size_t test = 0; test < sizeof(voice_counts) / sizeof(voice_counts[0]); ++test)
+    {
+        uint64_t origin = UINT64_C(1) << 32;
+        uint64_t first_ns;
+        double phase;
+        double energy = 0.0;
+
+        sine_voices = voice_counts[test];
+        SINE_CHECK(prepare_sine(1000));
+        reset_sine();
+        select_sine_stage(origin);
+        first_ns = sine_stats[0].first_mono_ns;
+        SINE_CHECK(sine_stage == 0 && first_ns != 0 && stress_active == 0);
+        memset(audio, 0, sizeof(audio));
+        process_sine(0);
+        phase = sine_oscillators[0].phase;
+        SINE_CHECK(phase > 0.0);
+        for (DWORD voice = 0; voice < sine_voices; ++voice)
+            SINE_CHECK(fabs(sine_oscillators[voice].phase
+                            - (voice == 0 ? fmod(sine_oscillators[voice].step * 64, SINE_TWO_PI)
+                                          : 0.0)) < 1e-10);
+        select_sine_stage(origin + 11999);
+        SINE_CHECK(sine_stage == 0 && sine_stats[0].first_mono_ns == first_ns);
+        select_sine_stage(origin + 12000);
+        SINE_CHECK(sine_stage == 1 && stress_active == 1);
+        SINE_CHECK(sine_stats[1].first_sample_position == origin + 12000);
+        SINE_CHECK(sine_stats[1].first_mono_ns >= first_ns);
+        SINE_CHECK(sine_oscillators[0].phase == phase);
+        for (LONG block = 0; block < 16; ++block)
+        {
+            double expected_sample = 0.0;
+
+            /* Reference sample 17 uses analytic phases, not renderer state or output. */
+            for (DWORD voice = 0; voice < sine_voices; ++voice)
+            {
+                double frequency = 220.0 + (sine_voices > 1
+                                             ? 1780.0 * voice / (sine_voices - 1) : 0.0);
+                double step = SINE_TWO_PI * frequency / 48000.0;
+                LONG samples = (voice == 0 ? 64 : 0) + block * 64 + 17;
+
+                expected_sample += sin(fmod(step * samples, SINE_TWO_PI));
+            }
+            expected_sample *= SINE_PEAK / sine_voices;
+            memset(audio[10][0], 0, sizeof(audio[10][0]));
+            for (LONG channel = 11; channel < 18; ++channel)
+                audio[channel][0][0] = 1.0f;
+            process_sine(0);
+            SINE_CHECK(fabs(audio[10][0][17] - expected_sample) < 1e-8);
+            for (LONG frame = 0; frame < 64; ++frame)
+            {
+                float sample = audio[10][0][frame];
+
+                SINE_CHECK(isfinite(sample) && fabs(sample) <= SINE_PEAK);
+                SINE_CHECK(fabs(sample) < 0.125);
+                SINE_CHECK(0.25f + sample >= 0.21875f && 0.25f + sample <= 0.28125f);
+                SINE_CHECK(0.25f - sample >= 0.21875f && 0.25f - sample <= 0.28125f);
+                energy += fabs(sample);
+                for (LONG channel = 11; channel < 18; ++channel)
+                    SINE_CHECK(audio[channel][0][frame] == 0.0f);
+            }
+        }
+        SINE_CHECK(energy > 0.0);
+        SINE_CHECK(sine_stats[1].voice_samples == (uint64_t)sine_voices * 16 * 64);
+        for (DWORD voice = 0; voice < sine_voices; ++voice)
+        {
+            double frequency = 220.0 + (sine_voices > 1
+                                         ? 1780.0 * voice / (sine_voices - 1) : 0.0);
+            double step = SINE_TWO_PI * frequency / 48000.0;
+            LONG samples = (voice == 0 ? 17 : 16) * 64;
+
+            SINE_CHECK(isfinite(sine_oscillators[voice].phase));
+            SINE_CHECK(sine_oscillators[voice].phase >= 0.0
+                       && sine_oscillators[voice].phase < SINE_TWO_PI);
+            SINE_CHECK(sine_oscillators[voice].step >= SINE_TWO_PI * 220.0 / 48000.0
+                       && sine_oscillators[voice].step <= SINE_TWO_PI * 2000.0 / 48000.0);
+            SINE_CHECK(fabs(sine_oscillators[voice].step - step) < 1e-15);
+            SINE_CHECK(fabs(sine_oscillators[voice].phase
+                            - fmod(step * samples, SINE_TWO_PI)) < 1e-10);
+        }
+        phase = sine_oscillators[0].phase;
+        select_sine_stage(origin + 35999);
+        SINE_CHECK(sine_stage == 1 && stress_active == 1);
+        select_sine_stage(origin + 36000);
+        SINE_CHECK(sine_stage == 2 && stress_active == 0);
+        SINE_CHECK(sine_oscillators[0].phase == phase);
+        SINE_CHECK(sine_stats[2].first_sample_position == origin + 36000);
+        SINE_CHECK(sine_stats[2].first_mono_ns >= sine_stats[1].first_mono_ns);
+        first_ns = sine_stats[2].first_mono_ns;
+        select_sine_stage(origin + 48000);
+        SINE_CHECK(sine_stage == 2 && sine_stats[2].first_mono_ns == first_ns);
+        memset(audio[10][0], 0, sizeof(audio[10][0]));
+        process_sine(0);
+        for (DWORD voice = 0; voice < sine_voices; ++voice)
+            SINE_CHECK(fabs(sine_oscillators[voice].phase
+                            - fmod(sine_oscillators[voice].step * (voice == 0 ? 18 : 16) * 64,
+                                   SINE_TWO_PI)) < 1e-10);
+    }
+
+    sine_voices = 8;
+    SINE_CHECK(prepare_sine(1030));
+    SINE_CHECK(QueryPerformanceFrequency(&benchmark_frequency));
+    callback_period_ticks = benchmark_frequency.QuadPart * 64 / 48000;
+    benchmark_enabled = 1;
+    loopback_enabled = 1;
+    stress_passes = 17;
+    stress_work_units = 23;
+    stress_checksum = 29;
+    stress_stop_requested = 1;
+    host_heartbeats = 31;
+    for (LONG leg = 0; leg < 2; ++leg)
+    {
+        LONG cross_stage_observations = 0;
+        LONG64 timed_before = callback_timed_cycles;
+
+        memset(audio, 0, sizeof(audio));
+        memset(delayed, 0, sizeof(delayed));
+        reset_loopback();
+        reset_sine();
+        cycles = 0;
+        first_index = -1;
+        SINE_CHECK(sine_stage == -1 && pending_pulse_stage == -1 && stress_active == 0);
+        SINE_CHECK(next_pulse_frame == 65 && !pending_pulse);
+        SINE_CHECK(stress_passes == 17 && stress_work_units == 23 && stress_checksum == 29);
+        SINE_CHECK(stress_stop_requested == 1 && host_heartbeats == 31);
+        for (DWORD voice = 0; voice < sine_voices; ++voice)
+            SINE_CHECK(sine_oscillators[voice].phase == 0.0 && sine_oscillators[voice].step > 0.0);
+        for (LONG stage = 0; stage < SINE_STAGE_COUNT; ++stage)
+        {
+            SINE_CHECK(sine_stats[stage].callbacks == 0 && sine_stats[stage].voice_samples == 0);
+            SINE_CHECK(sine_stats[stage].loopback_count == 0
+                       && sine_stats[stage].loopback_min == INT32_MAX);
+            SINE_CHECK(sine_stats[stage].total_ticks == 0 && sine_stats[stage].max_ticks == 0
+                       && sine_stats[stage].period_overruns == 0);
+            SINE_CHECK(sine_stats[stage].first_mono_ns == 0
+                       && sine_stats[stage].first_sample_position == 0);
+        }
+        /* A four-block cable crosses both stage boundaries with these unchanged pulses. */
+        for (uint64_t frame = 0; frame < sine_total_frames + 4800; frame += 64)
+        {
+            LONG index = (LONG)(frame / 64 % 2);
+            LONG slot = (LONG)(frame / 64 % 4);
+            LONG emitted_stage = pending_pulse_stage;
+            LONG measured_before = loopback_measurements;
+            AsioTimeInfo info = { 0 };
+
+            memcpy(audio[4][index], delayed[slot], sizeof(delayed[slot]));
+            if (frame >= sine_total_frames)
+                loopback_emit = 0;
+            info.sample_position.lo = (ULONG)frame;
+            buffer_switch_time_info(&info, index, 1);
+            memcpy(delayed[slot], audio[10][index], sizeof(delayed[slot]));
+            if (loopback_measurements != measured_before && emitted_stage != sine_stage)
+                ++cross_stage_observations;
+            SINE_CHECK(stress_active == (frame >= 12360 && frame < 37080));
+        }
+        SINE_CHECK(cross_stage_observations == 2);
+        SINE_CHECK(loopback_emitted == 13 && loopback_measurements == 13);
+        SINE_CHECK(loopback_lost == 0 && pending_pulse == 0);
+        SINE_CHECK(loopback_min == 256 && loopback_max == 256);
+        SINE_CHECK(callback_index_errors == 0 && sample_position_errors == 0 && first_index == 0);
+        SINE_CHECK(callback_timed_cycles == timed_before + cycles);
+        SINE_CHECK(sine_stats[0].loopback_count == 4 && sine_stats[1].loopback_count == 6
+                   && sine_stats[2].loopback_count == 3);
+        SINE_CHECK(sine_stats[0].first_sample_position == 0
+                   && sine_stats[1].first_sample_position == 12416
+                   && sine_stats[2].first_sample_position == 37120);
+        for (LONG stage = 0; stage < SINE_STAGE_COUNT; ++stage)
+        {
+            SINE_CHECK(sine_stats[stage].callbacks > 0 && sine_stats[stage].first_mono_ns > 0);
+            SINE_CHECK(sine_stats[stage].voice_samples
+                       == sine_stats[stage].callbacks * 64 * (stage == 1 ? sine_voices : 1));
+            SINE_CHECK(sine_stats[stage].loopback_min == 256 && sine_stats[stage].loopback_max == 256);
+        }
+    }
+
+    AsioTimeInfo shifted = { 0 };
+    shifted.sample_position.lo = (ULONG)(last_sample_position + 65);
+    buffer_switch_time_info(&shifted, last_callback_index, 1);
+    SINE_CHECK(sample_position_errors == 1 && callback_index_errors == 1);
+    memset(audio, 0, sizeof(audio));
+    memset(delayed, 0, sizeof(delayed));
+    reset_loopback();
+    reset_sine();
+    for (uint64_t frame = 0; frame < 5000; frame += 64)
+    {
+        LONG index = (LONG)(frame / 64 % 2);
+        LONG slot = (LONG)(frame / 64 % 4);
+
+        memcpy(audio[4][index], delayed[slot], sizeof(delayed[slot]));
+        if (frame == 320)
+        {
+            audio[4][index][2] = audio[4][index][1];
+            audio[4][index][1] = 0.0f;
+        }
+        /* Exercise the no-time-info fallback and the existing one-sample strict check. */
+        buffer_switch(index, 1);
+        memcpy(delayed[slot], audio[10][index], sizeof(delayed[slot]));
+    }
+    SINE_CHECK(loopback_measurements == 2 && loopback_lost == 0 && pending_pulse == 0);
+    SINE_CHECK(loopback_min == 256 && loopback_max == 257);
+
+    stress_thread_count = 1;
+    for (LONG leg = 0; leg < 2; ++leg)
+    {
+        LONG64 before = InterlockedCompareExchange64(&stress_work_units, 0, 0);
+        LONG64 loaded_units = leg == 0 ? 11 : 0;
+
+        reset_sine();
+        SINE_CHECK(InterlockedCompareExchange64(&stress_work_units, 0, 0) == before);
+        select_sine_stage(0);
+        SINE_CHECK(stress_active == 0 && sine_stats[0].worker_begin == before);
+        InterlockedExchangeAdd64(&stress_work_units, 3);
+        select_sine_stage(sine_total_frames / 4);
+        SINE_CHECK(stress_active == 1 && sine_stats[0].worker_end == before + 3);
+        SINE_CHECK(sine_stats[1].worker_begin == sine_stats[0].worker_end);
+        InterlockedExchangeAdd64(&stress_work_units, loaded_units);
+        select_sine_stage(sine_total_frames / 4 + 64);
+        SINE_CHECK(stress_active == 1 && sine_stats[1].worker_begin == before + 3);
+        select_sine_stage(sine_total_frames * 3 / 4);
+        SINE_CHECK(stress_active == 0 && sine_stats[1].worker_end == before + 3 + loaded_units);
+        SINE_CHECK(sine_stats[2].worker_begin == sine_stats[1].worker_end);
+        InterlockedExchangeAdd64(&stress_work_units, 7);
+        select_sine_stage(sine_total_frames * 3 / 4 + 64);
+        SINE_CHECK(sine_stats[2].worker_begin == before + 3 + loaded_units);
+        for (LONG stage = 0; stage < SINE_STAGE_COUNT; ++stage)
+        {
+            sine_stats[stage].callbacks = 1;
+            sine_stats[stage].loopback_count = 1;
+        }
+        /* Quiescent fake workers allow spill, but previous-leg work cannot satisfy loaded. */
+        SINE_CHECK(finish_sine_stages() == (leg == 0));
+        SINE_CHECK(sine_stats[2].worker_end == before + 3 + loaded_units + 7);
+        SINE_CHECK(sine_stats[2].worker_end
+                   == InterlockedCompareExchange64(&stress_work_units, 0, 0));
+        SINE_CHECK(stress_active == 0 && stress_stop_requested == 1);
+    }
+    stress_thread_count = 0;
+    SINE_CHECK(finish_sine_stages());
+    fprintf(stderr,
+            "[asio-probe] sine self-test PASS: bounds=1..4096 stages/reset all-voice-phase/mix phase/peak legacy pulse/shift emission-stage two-legs worker-snapshots/per-leg\n");
+    return 0;
+}
+
+#undef SINE_CHECK
 
 int
 main(void)
@@ -770,10 +1296,24 @@ main(void)
     int lifecycle_enabled = SIDEALSA_ASIO_LIFECYCLE_DEFAULT;
     DWORD stress_memory_mib = 0;
     DWORD callback_work_us = 0;
+    DWORD sine_self_test = 0;
+    int sine_stages_ok = 1;
 
+    if (!read_environment_u32("SIDEALSA_ASIO_PROBE_SINE_SELF_TEST", 1, &sine_self_test))
+        return 1;
+    if (sine_self_test)
+        return run_sine_self_test();
+    if (!read_environment_u32("SIDEALSA_ASIO_PROBE_SINE_VOICES", MAX_SINE_VOICES,
+                              &sine_voices))
+        return 1;
     start_thread = (LONG)GetCurrentThreadId();
 
-    if (GetEnvironmentVariableA("SIDEALSA_ASIO_PROBE_MS", run_text, sizeof(run_text)) > 0)
+    if (sine_voices > 0)
+    {
+        if (!read_environment_u32("SIDEALSA_ASIO_PROBE_MS", UINT32_MAX, &run_ms))
+            return 1;
+    }
+    else if (GetEnvironmentVariableA("SIDEALSA_ASIO_PROBE_MS", run_text, sizeof(run_text)) > 0)
         run_ms = (DWORD)strtoul(run_text, NULL, 10);
     loopback_enabled = SIDEALSA_ASIO_LOOPBACK_DEFAULT
                        || GetEnvironmentVariableA("SIDEALSA_ASIO_PROBE_LOOPBACK", loopback_text,
@@ -801,7 +1341,13 @@ main(void)
         || !read_environment_u32("SIDEALSA_ASIO_PROBE_RT_PRIORITY", 99,
                                  &benchmark_rt_priority))
         return 1;
-    benchmark_enabled = stress_thread_count > 0 || callback_work_us > 0
+    if (sine_voices > 0)
+    {
+        loopback_enabled = 1;
+        if (run_ms < 1000)
+            return fail("sine mode requires at least 1000 ms per Start leg", -1);
+    }
+    benchmark_enabled = sine_voices > 0 || stress_thread_count > 0 || callback_work_us > 0
                         || benchmark_rt_priority > 0
                         || GetEnvironmentVariableA("SIDEALSA_ASIO_PROBE_BENCHMARK",
                                                    benchmark_text, sizeof(benchmark_text)) > 0;
@@ -811,6 +1357,8 @@ main(void)
         return fail("benchmark heartbeat must be nonzero", -1);
     if (benchmark_enabled && lifecycle_enabled)
         return fail("benchmark and lifecycle modes are incompatible", -1);
+    if (sine_voices > 0 && !prepare_sine(run_ms))
+        return fail("prepare sine/monotonic clock", -1);
     if (benchmark_enabled && !QueryPerformanceFrequency(&benchmark_frequency))
         return fail("QueryPerformanceFrequency", (LONG)GetLastError());
     stress_memory_bytes = (SIZE_T)stress_memory_mib * 1024 * 1024;
@@ -828,6 +1376,11 @@ main(void)
                 (unsigned long)callback_work_us, (unsigned long)benchmark_heartbeat_ms,
                 (unsigned long)benchmark_rt_priority);
     }
+    if (sine_voices > 0)
+        fprintf(stderr,
+                "[asio-probe] sine config: voices=%lu run_ms=%lu total_frames=%llu peak=0.03125 warm_percent=25 loaded_percent=50 cool_percent=25 worker_gate=loaded\n",
+                (unsigned long)sine_voices, (unsigned long)run_ms,
+                (unsigned long long)sine_total_frames);
 
     hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     if (FAILED(hr))
@@ -1001,6 +1554,8 @@ main(void)
         exit_code = fail("start benchmark workers", (LONG)GetLastError());
         goto dispose;
     }
+    if (sine_voices > 0)
+        reset_sine();
     result = asio->lpVtbl->Start(asio);
     if (result != 0)
     {
@@ -1079,6 +1634,8 @@ main(void)
         result = asio->lpVtbl->Stop(asio);
         started = 0;
     }
+    if (result == 0 && sine_voices > 0)
+        sine_stages_ok &= print_sine_stages("first");
     if (result != 0 || cycles == 0 || first_index != 0 || callback_thread == 0
         || callback_thread_mismatch != 0 || invalid_callback_stack != 0)
     {
@@ -1118,6 +1675,8 @@ main(void)
         InterlockedExchange(&callback_stop_result, INT32_MIN);
         InterlockedExchange(&callback_stop_once, 1);
     }
+    if (sine_voices > 0)
+        reset_sine();
     result = asio->lpVtbl->Start(asio);
     if (result != 0)
     {
@@ -1152,6 +1711,8 @@ main(void)
         result = asio->lpVtbl->Stop(asio);
         started = 0;
     }
+    if (result == 0 && sine_voices > 0)
+        sine_stages_ok &= print_sine_stages("second");
     if (benchmark_enabled && !finish_benchmark())
     {
         exit_code = fail("benchmark finalization", (LONG)GetLastError());
@@ -1165,6 +1726,8 @@ main(void)
         goto dispose;
     }
     exit_code = 0;
+    if (!sine_stages_ok)
+        exit_code = fail("sine stage coverage/timing", -1);
     fprintf(stderr, "[asio-probe] callbacks: %ld\n", (long)cycles);
     if (loopback_enabled)
     {
