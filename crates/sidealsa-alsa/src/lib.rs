@@ -58,7 +58,6 @@ pub struct SideAlsaStream {
     period_frames: usize,
     buffer_frames: usize,
     scratch: Vec<i32>,
-    capture_discard: Vec<i32>,
     playback_fifo: Vec<i32>,
     playback_fifo_frames: usize,
     capture_frames: usize,
@@ -149,13 +148,6 @@ pub unsafe extern "C" fn sidealsa_stream_open(
         let period_frames = usize::try_from(info.period_frames).map_err(|_| libc::EINVAL)?;
         let channels = usize::try_from(channels).map_err(|_| libc::EINVAL)?;
         let scratch_len = period_frames.checked_mul(channels).ok_or(libc::EINVAL)?;
-        let capture_discard_len = if playback && mode == MODE_PRO {
-            period_frames
-                .checked_mul(usize::try_from(info.capture_channels).map_err(|_| libc::EINVAL)?)
-                .ok_or(libc::EINVAL)?
-        } else {
-            0
-        };
         let requested_buffer_size = requested_buffer_size(
             mode,
             device_info.buffer_size,
@@ -194,8 +186,7 @@ pub unsafe extern "C" fn sidealsa_stream_open(
             channels,
             period_frames,
             buffer_frames,
-            scratch: vec![0; scratch_len],
-            capture_discard: vec![0; capture_discard_len],
+            scratch: vec![0; if playback { 0 } else { scratch_len }],
             playback_fifo: vec![0; fifo_len],
             playback_fifo_frames: 0,
             capture_frames: 0,
@@ -567,13 +558,16 @@ impl SideAlsaStream {
                 }
             };
             let queued_periods = self.playback_fifo_frames / self.period_frames;
-            let plan = plan_playback_sequence_with_queue(
+            let mut plan = plan_playback_sequence_with_queue(
                 self.next_playback_sequence,
                 observed,
                 self.playback_latency_periods,
                 self.pro,
                 queued_periods,
             )?;
+            if self.pro {
+                plan = apply_pro_playback_watermark(plan, self.stream.playback_sequence())?;
+            }
             if plan.expired_periods > 0 {
                 let action =
                     expired_playback_action(self.pro, plan.expired_periods, queued_periods);
@@ -614,10 +608,9 @@ impl SideAlsaStream {
                 .period_frames
                 .checked_mul(self.channels)
                 .ok_or(libc::EOVERFLOW)?;
-            self.scratch[..samples].copy_from_slice(&self.playback_fifo[..samples]);
             if !self
                 .stream
-                .submit_playback(sequence, &self.scratch)
+                .submit_playback(sequence, &self.playback_fifo[..samples])
                 .map_err(client_error_code)?
             {
                 self.playback_cycle_sequence = None;
@@ -730,19 +723,17 @@ impl SideAlsaStream {
 
     fn wait_period(&mut self) -> Result<u64, c_int> {
         loop {
-            match self.stream.wait_period(wait_timeout(self.nonblock)) {
+            let wait = if self.playback && self.pro {
+                self.stream
+                    .wait_pro_playback_period(wait_timeout(self.nonblock))
+            } else {
+                self.stream.wait_period(wait_timeout(self.nonblock))
+            };
+            match wait {
                 Ok(sequence) => {
                     if self.start_sequence.is_none() {
                         self.start_sequence = self.stream.activation_sequence();
                     }
-                    let sequence = if self.playback && self.pro {
-                        self.stream
-                            .capture_buffer_for_sequence(sequence, &mut self.capture_discard)
-                            .map_err(client_error_code)?
-                            .unwrap_or(sequence)
-                    } else {
-                        sequence
-                    };
                     return Ok(sequence);
                 }
                 Err(ClientError::Timeout) if !self.nonblock => continue,
@@ -844,6 +835,25 @@ fn plan_playback_sequence_with_queue(
         sequence,
         expired_periods: 0,
     })
+}
+
+fn apply_pro_playback_watermark(
+    mut plan: PlaybackSequencePlan,
+    minimum: u64,
+) -> Result<PlaybackSequencePlan, c_int> {
+    // Capture may be discarded after its playback was already consumed. Keep
+    // actual output expiry strict rather than silently submitting to that past cycle.
+    match sequence_order(plan.sequence, minimum) {
+        Some(Ordering::Less) => {
+            plan.expired_periods = plan.expired_periods.saturating_add(
+                usize::try_from(minimum.wrapping_sub(plan.sequence)).unwrap_or(usize::MAX),
+            );
+            plan.sequence = minimum;
+            Ok(plan)
+        }
+        Some(Ordering::Equal | Ordering::Greater) => Ok(plan),
+        None => Err(libc::EPIPE),
+    }
 }
 
 fn newest_playback_sequence(observed: u64, same_cycle: bool) -> u64 {
@@ -1212,6 +1222,39 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn playback_only_clock_cannot_hide_already_consumed_output() {
+        let plan = super::PlaybackSequencePlan {
+            sequence: 10,
+            expired_periods: 2,
+        };
+        let expired = super::apply_pro_playback_watermark(plan, 11).unwrap();
+        assert_eq!(expired.sequence, 11);
+        assert_eq!(expired.expired_periods, 3);
+        assert_eq!(
+            super::expired_playback_action(true, expired.expired_periods, 4),
+            super::ExpiredPlaybackAction::Xrun
+        );
+        let future = super::PlaybackSequencePlan {
+            sequence: 12,
+            expired_periods: 0,
+        };
+        assert_eq!(
+            super::apply_pro_playback_watermark(future, 11).unwrap(),
+            future
+        );
+        let wrapped = super::PlaybackSequencePlan {
+            sequence: u64::MAX,
+            expired_periods: 0,
+        };
+        assert_eq!(
+            super::apply_pro_playback_watermark(wrapped, 0).unwrap(),
+            super::PlaybackSequencePlan {
+                sequence: 0,
+                expired_periods: 1
+            }
+        );
+    }
     use super::*;
 
     fn playback_plan(

@@ -797,6 +797,40 @@ impl SharedRegion {
         Some(sequence)
     }
 
+    pub(crate) fn discard_capture_through(&self, through: u64, minimum: u64) {
+        if self.capture_samples == 0 {
+            return;
+        }
+        let mut expired = 0;
+        for index in 0..self.layout.slot_count() {
+            let slot = unsafe { self.slot(self.layout.capture_offset(), index) };
+            if slot
+                .state
+                .compare_exchange(
+                    SHARED_SLOT_READY,
+                    SHARED_SLOT_READING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            let sequence = slot.sequence.load(Ordering::Relaxed);
+            if sequence_is_after(sequence, through) {
+                slot.state.store(SHARED_SLOT_READY, Ordering::Release);
+                continue;
+            }
+            expired += u64::from(sequence_is_before(sequence, minimum));
+            slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
+        }
+        if expired != 0 {
+            self.header()
+                .client_expired_capture_blocks
+                .fetch_add(expired, Ordering::Relaxed);
+        }
+    }
+
     unsafe fn slot(&self, ring_offset: usize, index: usize) -> &SharedSlotHeader {
         unsafe { &*self.slot_ptr(ring_offset, index) }
     }
@@ -911,6 +945,16 @@ fn close_fd(fd: RawFd) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capture_discard_never_touches_a_playback_only_ring() {
+        let region = super::SharedRegion::create(1, 1, 0).unwrap();
+        let mut index = 0;
+        assert!(region.try_client_publish_playback(&mut index, 11, &[17]));
+        region.discard_capture_through(11, 12);
+        let mut output = [0];
+        assert!(region.try_consume_playback(11, &mut output));
+        assert_eq!(output, [17]);
+    }
     use super::*;
 
     #[test]

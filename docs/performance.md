@@ -50,6 +50,10 @@ end-to-end latency claims, and should be rerun on each deployment CPU.
 
 ## Audio-load benchmarks
 
+The [ALSA PRO playback-only optimization](alsa-pro-playback.md) removes an
+unnecessary dependency on still-valid capture for playback scheduling. It is
+distinct from ASIO spinning and includes blocking/external-poll probe results.
+
 The [bounded ASIO capture-spin experiment and deployment](asio-spin.md) documents
 the zero-lead wait strategy, measured miss reduction and additional CPU cost.
 It does not change hardware buffering or the write reserve.

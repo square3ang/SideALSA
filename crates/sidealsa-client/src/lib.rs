@@ -397,6 +397,63 @@ impl AudioStream {
         Ok(duplicate_cloexec(self.control.as_raw_fd())?)
     }
 
+    /// Waits for the PRO hardware cycle for a playback-only consumer, discarding
+    /// unused capture through that cycle. Unlike duplex acquisition, this does
+    /// not require capture to remain valid after queued playback was consumed.
+    /// It adds no sequence lead; callers retain responsibility for playback expiry.
+    pub fn wait_pro_playback_period(&mut self, timeout: Duration) -> Result<u64, ClientError> {
+        self.ensure_started()?;
+        if !matches!(self.mode, StreamMode::Pro) {
+            return Err(ClientError::Unsupported);
+        }
+        if self.info.playback_channels == 0 {
+            return Err(ClientError::MissingDirection("playback"));
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        loop {
+            self.refresh_generation();
+            self.check_hardware_generation()?;
+            self.check_capture_discontinuity()?;
+            if self.info.capture_channels > 0 {
+                self.capture_event.drain();
+            } else {
+                self.playback_event.drain();
+            }
+            let generation = self.lifecycle_generation;
+            let sequence = self.region.cycle_sequence();
+            // Free unused input even when startup cannot accept this cycle;
+            // otherwise a full capture ring can suppress all subsequent wakes.
+            self.region
+                .discard_capture_through(sequence, self.region.playback_sequence());
+            if self
+                .activation_sequence()
+                .is_some_and(|start| sequence_is_before(start, sequence))
+                && self.last_sequence != Some(sequence)
+                && (self.last_sequence.is_some()
+                    || !sequence_is_before(sequence, self.region.playback_sequence()))
+            {
+                self.check_hardware_generation()?;
+                if self.region.lifecycle_generation() != generation {
+                    continue;
+                }
+                self.last_sequence = Some(sequence);
+                return Ok(sequence);
+            }
+            let event = if self.info.capture_channels > 0 {
+                &self.capture_event
+            } else {
+                &self.playback_event
+            };
+            let wait = event.wait_until(self.control.as_raw_fd(), deadline);
+            if matches!(&wait, Err(ClientError::Closed)) {
+                self.poison_control();
+            }
+            wait?;
+        }
+    }
+
     pub fn wait_period(&mut self, timeout: Duration) -> Result<u64, ClientError> {
         self.ensure_started()?;
         let deadline = Instant::now()
@@ -1658,6 +1715,128 @@ mod tests {
         assert_eq!(capture, [25]);
         assert_eq!(server_region.client_expired_capture_blocks(), 4);
         assert_eq!(server_region.oldest_valid_client_capture_sequence(25), None);
+        stream.closed = true;
+    }
+
+    #[test]
+    fn playback_only_pro_clock_does_not_depend_on_unneeded_capture_validity() {
+        let region = SharedRegion::create(1, 1, 1).unwrap();
+        let client_fd = unsafe { libc::dup(region.fd()) };
+        assert!(client_fd >= 0);
+        let (peer, control) = UnixStream::pair().unwrap();
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Pro,
+            region.info(),
+            owned_fds([client_fd, event_fd(), event_fd(), event_fd()]),
+        )
+        .unwrap();
+        stream.started = true;
+        region.reset_activation();
+        assert!(region.establish_activation(8));
+        region.set_cycle_sequence(8);
+        assert!(matches!(
+            stream.wait_pro_playback_period(Duration::ZERO),
+            Err(ClientError::Timeout)
+        ));
+        // Initial audio must not be assigned to an already-consumed cycle.
+        region.set_cycle_sequence(9);
+        region.set_playback_sequence(10);
+        assert!(matches!(
+            stream.wait_pro_playback_period(Duration::ZERO),
+            Err(ClientError::Timeout)
+        ));
+        region.set_cycle_sequence(10);
+        assert_eq!(stream.wait_pro_playback_period(Duration::ZERO).unwrap(), 10);
+        let mut index = 0;
+        assert!(region.try_publish_capture(&mut index, 11, &[11]));
+        region.set_cycle_sequence(11);
+        region.set_playback_sequence(12);
+        stream.capture_event.notify().unwrap();
+        assert_eq!(stream.wait_pro_playback_period(Duration::ZERO).unwrap(), 11);
+        assert_eq!(region.ready_capture_slots(), 0);
+        assert_eq!(region.client_expired_capture_blocks(), 1);
+
+        assert!(region.try_publish_capture(&mut index, 13, &[13]));
+        region.set_cycle_sequence(12);
+        assert_eq!(stream.wait_pro_playback_period(Duration::ZERO).unwrap(), 12);
+        assert_eq!(region.next_client_capture_sequence(0), Some(13));
+        region.set_cycle_sequence(13);
+        assert_eq!(stream.wait_pro_playback_period(Duration::ZERO).unwrap(), 13);
+        assert_eq!(region.ready_capture_slots(), 0);
+        assert!(matches!(
+            stream.wait_pro_playback_period(Duration::ZERO),
+            Err(ClientError::Timeout)
+        ));
+
+        drop(peer);
+        assert!(matches!(
+            stream.wait_pro_playback_period(Duration::ZERO),
+            Err(ClientError::Closed)
+        ));
+    }
+
+    #[test]
+    fn playback_only_pro_startup_reclaims_a_full_expired_capture_ring() {
+        let region = SharedRegion::create(1, 1, 1).unwrap();
+        let client_fd = unsafe { libc::dup(region.fd()) };
+        assert!(client_fd >= 0);
+        let (_peer, control) = UnixStream::pair().unwrap();
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Pro,
+            region.info(),
+            owned_fds([client_fd, event_fd(), event_fd(), event_fd()]),
+        )
+        .unwrap();
+        stream.started = true;
+        region.reset_activation();
+        assert!(region.establish_activation(0));
+        let slots = u64::from(region.info().slot_count);
+        let mut index = 0;
+        for sequence in 1..=slots {
+            assert!(region.try_publish_capture(&mut index, sequence, &[0]));
+        }
+        region.set_cycle_sequence(slots);
+        region.set_playback_sequence(slots + 1);
+        stream.capture_event.notify().unwrap();
+        assert!(matches!(
+            stream.wait_pro_playback_period(Duration::ZERO),
+            Err(ClientError::Timeout)
+        ));
+        assert_eq!(region.ready_capture_slots(), 0);
+        assert!(region.try_publish_capture(&mut index, slots + 1, &[0]));
+        region.set_cycle_sequence(slots + 1);
+        stream.capture_event.notify().unwrap();
+        assert_eq!(
+            stream.wait_pro_playback_period(Duration::ZERO).unwrap(),
+            slots + 1
+        );
+        stream.closed = true;
+    }
+
+    #[test]
+    fn playback_only_pro_wait_checks_hardware_generation_before_clock_progress() {
+        let region = SharedRegion::create(1, 1, 0).unwrap();
+        let client_fd = unsafe { libc::dup(region.fd()) };
+        assert!(client_fd >= 0);
+        let (_peer, control) = UnixStream::pair().unwrap();
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Pro,
+            region.info(),
+            owned_fds([client_fd, event_fd(), event_fd(), event_fd()]),
+        )
+        .unwrap();
+        stream.started = true;
+        region.set_hardware_generation(1);
+        assert!(matches!(
+            stream.wait_pro_playback_period(Duration::ZERO),
+            Err(ClientError::CaptureDiscontinuity)
+        ));
         stream.closed = true;
     }
 
