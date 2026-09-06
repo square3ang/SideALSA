@@ -8,6 +8,7 @@
 
 #include <errno.h>
 #include <math.h>
+#include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -232,6 +233,11 @@ static LONG callback_sched_priority = INT32_MIN;
 static LONG callback_sched_reset_on_fork;
 static LONG callback_sched_set_attempted;
 static LONG callback_sched_set_error;
+static clockid_t callback_cpu_clock;
+static struct timespec callback_cpu_started;
+static struct timespec callback_cpu_wall_started;
+static const char *callback_cpu_error_operation = "no_callback";
+static int callback_cpu_error = ENODATA;
 
 static int
 prepare_sine(DWORD run_ms)
@@ -602,6 +608,21 @@ observe_callback_scheduler(void)
     }
     if (callback_sched_policy != INT32_MIN)
         return;
+    /* Snapshot the worker, not just callback bodies: include inter-callback spinning. */
+    callback_cpu_error_operation = "pthread_getcpuclockid";
+    callback_cpu_error = pthread_getcpuclockid(pthread_self(), &callback_cpu_clock);
+    if (callback_cpu_error == 0)
+    {
+        callback_cpu_error_operation = "clock_gettime_thread_start";
+        if (clock_gettime(callback_cpu_clock, &callback_cpu_started) != 0)
+            callback_cpu_error = errno;
+        else
+        {
+            callback_cpu_error_operation = "clock_gettime_monotonic_start";
+            if (clock_gettime(CLOCK_MONOTONIC, &callback_cpu_wall_started) != 0)
+                callback_cpu_error = errno;
+        }
+    }
     policy = sched_getscheduler(0);
     if (policy >= 0 && sched_getparam(0, &parameters) == 0)
         callback_sched_priority = parameters.sched_priority;
@@ -664,6 +685,8 @@ reset_benchmark(void)
     callback_sched_reset_on_fork = 0;
     callback_sched_set_attempted = 0;
     callback_sched_set_error = 0;
+    callback_cpu_error_operation = "no_callback";
+    callback_cpu_error = ENODATA;
 }
 
 static int
@@ -682,6 +705,55 @@ start_benchmark(void)
     return 1;
 }
 
+static void
+print_benchmark_thread_cpu(void)
+{
+    struct timespec cpu_finished;
+    struct timespec wall_finished;
+    const char *operation = callback_cpu_error_operation;
+    int error = callback_cpu_error;
+    int64_t cpu_ns;
+    int64_t wall_ns;
+
+    /* Non-RT, after Stop and while the callback worker normally still lives. */
+    if (error != 0)
+        goto unavailable;
+    operation = "clock_gettime_thread_end";
+    if (clock_gettime(callback_cpu_clock, &cpu_finished) != 0)
+    {
+        error = errno;
+        goto unavailable;
+    }
+    operation = "clock_gettime_monotonic_end";
+    if (clock_gettime(CLOCK_MONOTONIC, &wall_finished) != 0)
+    {
+        error = errno;
+        goto unavailable;
+    }
+    cpu_ns = (int64_t)(cpu_finished.tv_sec - callback_cpu_started.tv_sec)
+                 * INT64_C(1000000000)
+             + cpu_finished.tv_nsec - callback_cpu_started.tv_nsec;
+    wall_ns = (int64_t)(wall_finished.tv_sec - callback_cpu_wall_started.tv_sec)
+                  * INT64_C(1000000000)
+              + wall_finished.tv_nsec - callback_cpu_wall_started.tv_nsec;
+    if (cpu_ns < 0 || wall_ns <= 0)
+    {
+        operation = "invalid_clock_delta";
+        error = ERANGE;
+        goto unavailable;
+    }
+    fprintf(stderr,
+            "[asio-probe] benchmark thread_cpu: cpu_ns=%llu wall_ns=%llu percent_one_core=%.3f\n",
+            (unsigned long long)cpu_ns, (unsigned long long)wall_ns,
+            (double)cpu_ns * 100.0 / (double)wall_ns);
+    return;
+
+unavailable:
+    fprintf(stderr,
+            "[asio-probe] benchmark thread_cpu: unavailable operation=%s error=%d (%s)\n",
+            operation, error, strerror(error));
+}
+
 static int
 finish_benchmark(void)
 {
@@ -695,6 +767,7 @@ finish_benchmark(void)
 
     if (!benchmark_running)
         return 1;
+    print_benchmark_thread_cpu();
     QueryPerformanceCounter(&finished);
     elapsed_ticks = finished.QuadPart - benchmark_started.QuadPart;
     benchmark_running = 0;

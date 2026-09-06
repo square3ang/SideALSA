@@ -16,6 +16,8 @@ VOICES="${SIDEALSA_ASIO_AUDIO_LOAD_VOICES:-512}"
 THREADS="${SIDEALSA_ASIO_AUDIO_LOAD_THREADS:-24}"
 MEMORY="${SIDEALSA_ASIO_AUDIO_LOAD_MEMORY_MIB:-512}"
 NATIVE_PERIODS="${SIDEALSA_ASIO_NATIVE_PERIODS:-1500}"
+DIAGNOSTIC="${SIDEALSA_ASIO_AUDIO_LOAD_DIAGNOSTIC:-0}"
+[[ "$DIAGNOSTIC" == 0 || "$DIAGNOSTIC" == 1 ]] || { printf 'diagnostic mode must be 0 or 1\n' >&2; exit 2; }
 read -r -a CASES <<< "${SIDEALSA_ASIO_AUDIO_LOAD_CASES:-pulse_only sine_baseline dsp workers combined}"
 ((${#CASES[@]} > 0)) || { printf 'at least one audio load case is required\n' >&2; exit 2; }
 declare -A selected_cases=()
@@ -61,19 +63,30 @@ read_stats() {
 }
 
 measure_native() {
-    local log=$1 output minimum maximum count lost
+    local log=$1 output minimum maximum count lost status=0 misses key
     output="$(timeout --kill-after=2s "${NATIVE_TIMEOUT}s" chrt -f 46 "$NATIVE" \
-        --socket "$SOCKET" --periods "$NATIVE_PERIODS" --output-channel 0 --input-channel 4 2>&1)" || {
-        printf '%s\n' "$output" > "$log"
+        --socket "$SOCKET" --periods "$NATIVE_PERIODS" --output-channel 0 --input-channel 4 2>&1)" || status=$?
+    printf '%s\nnative_exit_status=%s\n' "$output" "$status" > "$log"
+    if ((status != 0 && DIAGNOSTIC == 0)); then
         printf 'native reference failed: %s\n' "$log" >&2
         return 1
-    }
-    printf '%s\n' "$output" > "$log"
+    fi
     minimum="$(stat_value "$output" loopback_min_frames)"
     maximum="$(stat_value "$output" loopback_max_frames)"
     count="$(stat_value "$output" loopback_measurements)"
     lost="$(stat_value "$output" loopback_lost_pulses)"
-    ((count >= 2 && lost == 0 && minimum == maximum)) || return 1
+    ((count >= 2)) || return 1
+    misses="$(stat_value "$output" pro_deadline_misses_delta)"
+    if ((status != 0 || lost != 0 || minimum != maximum || misses != 0)); then
+        # Continue measured audio failures only, never crashes, timeouts or HW resets.
+        ((DIAGNOSTIC == 1 && status <= 1 && (misses > 0 || lost > 0 || minimum != maximum))) || return 1
+        for key in hw_playback_xruns_delta hw_capture_xruns_delta timeline_resets_delta; do
+            [[ "$(stat_value "$output" "$key")" == 0 ]] || return 1
+        done
+        failed=1
+        printf 'native_reference_unstable=1 pro_misses=%s lost=%s min=%s max=%s diagnostic_continue=1 log=%s\n' \
+            "$misses" "$lost" "$minimum" "$maximum" "$log"
+    fi
     NATIVE_PHASE=$minimum
 }
 

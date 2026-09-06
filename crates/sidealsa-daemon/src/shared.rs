@@ -1,4 +1,9 @@
-use std::{io, mem::size_of, os::fd::RawFd, ptr, time::Duration};
+use std::{
+    io,
+    mem::size_of,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    ptr,
+};
 
 pub use sidealsa_client::{SharedError, SharedRegion};
 
@@ -16,10 +21,21 @@ pub struct SharedEvents {
     capture: RawFd,
     playback: RawFd,
     playback_ready: RawFd,
+    playback_deadline: OwnedFd,
 }
 
 impl SharedEvents {
     pub fn new() -> Result<Self, SharedError> {
+        let timer = unsafe {
+            libc::timerfd_create(
+                libc::CLOCK_MONOTONIC,
+                libc::TFD_CLOEXEC | libc::TFD_NONBLOCK,
+            )
+        };
+        if timer < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let playback_deadline = unsafe { OwnedFd::from_raw_fd(timer) };
         let flags = libc::EFD_CLOEXEC | libc::EFD_NONBLOCK;
         let capture = unsafe { libc::eventfd(0, flags) };
         if capture < 0 {
@@ -42,6 +58,7 @@ impl SharedEvents {
             capture,
             playback,
             playback_ready,
+            playback_deadline,
         })
     }
 
@@ -73,34 +90,92 @@ impl SharedEvents {
         notify(self.playback_ready);
     }
 
-    pub fn wait_playback_ready(&self, timeout: Duration) -> PlaybackReadyWait {
-        let mut descriptor = libc::pollfd {
-            fd: self.playback_ready,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let timeout = libc::timespec {
-            tv_sec: timeout.as_secs().try_into().unwrap_or(libc::time_t::MAX),
-            tv_nsec: timeout.subsec_nanos().into(),
-        };
-        let result = unsafe { libc::ppoll(&mut descriptor, 1, &timeout, ptr::null()) };
-        if result == 0 {
-            return PlaybackReadyWait::Timeout;
+    // Only the hardware playback thread waits on this endpoint's private timer.
+    pub fn wait_playback_ready_before(&self, cutoff_nanos: u64) -> PlaybackReadyWait {
+        if self.playback_ready < 0 {
+            return PlaybackReadyWait::Failed;
         }
-        if result < 0 {
-            return if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+        let mut descriptors = [
+            libc::pollfd {
+                fd: self.playback_ready,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: self.playback_deadline.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let zero = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // A zero timer value disarms it; use an expired absolute deadline instead.
+        let cutoff_nanos = cutoff_nanos.max(1);
+        let timer = libc::itimerspec {
+            it_interval: zero,
+            it_value: libc::timespec {
+                tv_sec: (cutoff_nanos / 1_000_000_000)
+                    .try_into()
+                    .unwrap_or(libc::time_t::MAX),
+                tv_nsec: (cutoff_nanos % 1_000_000_000) as _,
+            },
+        };
+        // Keep the deadline absolute even if preempted before entering ppoll.
+        if unsafe {
+            libc::timerfd_settime(
+                self.playback_deadline.as_raw_fd(),
+                libc::TFD_TIMER_ABSTIME,
+                &timer,
+                ptr::null_mut(),
+            )
+        } < 0
+        {
+            return PlaybackReadyWait::Failed;
+        }
+        let result = unsafe {
+            libc::ppoll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as _,
+                ptr::null(),
+                ptr::null(),
+            )
+        };
+        let outcome = if result < 0 {
+            if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 PlaybackReadyWait::Interrupted
             } else {
                 PlaybackReadyWait::Failed
-            };
-        }
-        if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            }
+        } else if descriptors.iter().any(|descriptor| {
+            descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+        }) {
             PlaybackReadyWait::Failed
-        } else if descriptor.revents & libc::POLLIN != 0 {
+        } else if descriptors[0].revents & libc::POLLIN != 0 {
             PlaybackReadyWait::Ready
+        } else if descriptors[1].revents & libc::POLLIN != 0 {
+            PlaybackReadyWait::Timeout
         } else {
             PlaybackReadyWait::Failed
+        };
+        // Avoid a needless timer interrupt after the client has already responded.
+        let disarmed = libc::itimerspec {
+            it_interval: zero,
+            it_value: zero,
+        };
+        if unsafe {
+            libc::timerfd_settime(
+                self.playback_deadline.as_raw_fd(),
+                0,
+                &disarmed,
+                ptr::null_mut(),
+            )
+        } < 0
+        {
+            return PlaybackReadyWait::Failed;
         }
+        outcome
     }
 
     pub fn drain(&self) {
@@ -150,17 +225,29 @@ mod tests {
     use super::{PlaybackReadyWait, SharedEvents};
     use std::time::Duration;
 
+    fn monotonic_nanos() -> u64 {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) },
+            0
+        );
+        time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
+    }
+
     #[test]
     fn playback_ready_wait_distinguishes_timeout_and_notification() {
         let events = SharedEvents::new().expect("events should create");
 
         assert_eq!(
-            events.wait_playback_ready(Duration::ZERO),
+            events.wait_playback_ready_before(0),
             PlaybackReadyWait::Timeout
         );
         events.notify_playback_ready();
         assert_eq!(
-            events.wait_playback_ready(Duration::from_millis(10)),
+            events.wait_playback_ready_before(monotonic_nanos() + 10_000_000),
             PlaybackReadyWait::Ready
         );
     }
@@ -168,12 +255,65 @@ mod tests {
     #[test]
     fn playback_ready_wait_reports_descriptor_failure() {
         let mut events = SharedEvents::new().expect("events should create");
+        let fd = std::mem::replace(&mut events.playback_ready, -1);
         unsafe {
-            libc::close(events.playback_ready);
+            libc::close(fd);
         }
-        let result = events.wait_playback_ready(Duration::ZERO);
-        events.playback_ready = -1;
+        let result = events.wait_playback_ready_before(0);
 
         assert_eq!(result, PlaybackReadyWait::Failed);
+    }
+
+    #[test]
+    fn elapsed_absolute_deadline_does_not_restart_the_wait() {
+        let events = SharedEvents::new().expect("events should create");
+        let cutoff = monotonic_nanos() + 1_000_000;
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(monotonic_nanos() >= cutoff);
+        assert_eq!(
+            events.wait_playback_ready_before(cutoff),
+            PlaybackReadyWait::Timeout
+        );
+    }
+
+    #[test]
+    fn playback_deadline_can_be_rearmed_after_timeout_and_ready() {
+        let events = SharedEvents::new().expect("events should create");
+        assert_eq!(
+            events.wait_playback_ready_before(0),
+            PlaybackReadyWait::Timeout
+        );
+        events.notify_playback_ready();
+        assert_eq!(
+            events.wait_playback_ready_before(monotonic_nanos() + 1_000_000_000),
+            PlaybackReadyWait::Ready
+        );
+        let mut timer = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+        };
+        use std::os::fd::AsRawFd;
+        assert_eq!(
+            unsafe { libc::timerfd_gettime(events.playback_deadline.as_raw_fd(), &mut timer) },
+            0
+        );
+        assert_eq!(timer.it_value.tv_sec, 0);
+        assert_eq!(timer.it_value.tv_nsec, 0);
+        events.drain_playback_ready();
+        let cutoff = monotonic_nanos() + 2_000_000;
+        assert_eq!(
+            events.wait_playback_ready_before(cutoff),
+            PlaybackReadyWait::Timeout
+        );
+        assert!(
+            monotonic_nanos() >= cutoff,
+            "stale expiration must not end a new wait"
+        );
     }
 }

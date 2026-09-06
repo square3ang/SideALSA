@@ -18,7 +18,7 @@ use sidealsa_protocol::{
 };
 use thiserror::Error;
 
-const EVENTFD_NOTIFY_ATTEMPTS: usize = 2;
+const EVENTFD_IO_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -462,6 +462,36 @@ impl AudioStream {
         }
     }
 
+    /// Shared-memory readiness hint only; no notification I/O. Acquisition must
+    /// still use the normal generation/expiry checks and monitor daemon control.
+    pub fn has_ready_capture(&self) -> bool {
+        if !self.started || self.closed || self.info.capture_channels == 0 {
+            return false;
+        }
+        let minimum = matches!(self.mode, StreamMode::Pro).then(|| self.region.playback_sequence());
+        self.region.has_ready_capture_since(minimum)
+    }
+
+    /// Acquires capture without polling, for callers with their own event loop.
+    /// Consume notifications before inspecting shared memory so a concurrent
+    /// publication cannot lose its wake. Remaining capture keeps the FD readable.
+    /// The caller must separately monitor `control_fd()` for daemon disconnects.
+    pub fn try_capture_buffer(&mut self, samples: &mut [i32]) -> Result<Option<u64>, ClientError> {
+        self.ensure_started()?;
+        self.capture_event.drain();
+        let sequence = self.capture_buffer(samples)?;
+        let next = match self.mode {
+            StreamMode::Pro => self
+                .region
+                .oldest_valid_client_capture_sequence(self.region.playback_sequence()),
+            StreamMode::Shared(_) => self.region.next_client_capture_sequence(self.capture_index),
+        };
+        if next.is_some() {
+            self.capture_event.notify()?;
+        }
+        Ok(sequence)
+    }
+
     pub fn capture_buffer(&mut self, samples: &mut [i32]) -> Result<Option<u64>, ClientError> {
         self.ensure_started()?;
         self.refresh_generation();
@@ -739,7 +769,7 @@ impl EventFd {
 
     fn notify(&self) -> Result<(), ClientError> {
         let value = 1_u64;
-        for _ in 0..EVENTFD_NOTIFY_ATTEMPTS {
+        for _ in 0..EVENTFD_IO_ATTEMPTS {
             let bytes = unsafe {
                 libc::write(
                     self.as_raw_fd(),
@@ -764,7 +794,9 @@ impl EventFd {
     }
 
     fn drain(&self) {
-        loop {
+        // A non-semaphore eventfd read clears the accumulated count. Do not
+        // chase new notifications or retry interruptions without a bound.
+        for _ in 0..EVENTFD_IO_ATTEMPTS {
             let mut value = 0_u64;
             let bytes = unsafe {
                 libc::read(
@@ -774,7 +806,7 @@ impl EventFd {
                 )
             };
             if bytes == size_of::<u64>() as isize {
-                continue;
+                return;
             }
             if bytes < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
@@ -1213,6 +1245,35 @@ mod tests {
     }
 
     #[test]
+    fn eventfd_drain_clears_accumulated_notifications_and_preserves_the_next_wake() {
+        let event = EventFd::from_owned(unsafe { OwnedFd::from_raw_fd(event_fd()) });
+        for _ in 0..32 {
+            signal_event(event.as_raw_fd());
+        }
+        event.drain();
+        assert_eq!(
+            event
+                .consume_ready(libc::POLLIN)
+                .expect("drain should clear all notifications"),
+            EventWait::Spurious
+        );
+        event.drain();
+        signal_event(event.as_raw_fd());
+        assert_eq!(
+            event
+                .consume_ready(libc::POLLIN)
+                .expect("next notification should remain readable"),
+            EventWait::Notified
+        );
+        assert_eq!(
+            event
+                .consume_ready(libc::POLLIN)
+                .expect("notification should be consumed once"),
+            EventWait::Spurious
+        );
+    }
+
+    #[test]
     fn daemon_disconnect_wakes_wait_period_as_closed() {
         let server_region = SharedRegion::create(1, 1, 0).expect("region should create");
         let client_fd = unsafe { libc::dup(server_region.fd()) };
@@ -1598,6 +1659,123 @@ mod tests {
         assert_eq!(server_region.client_expired_capture_blocks(), 4);
         assert_eq!(server_region.oldest_valid_client_capture_sequence(25), None);
         stream.closed = true;
+    }
+
+    #[test]
+    fn externally_polled_capture_handles_backlog_expiry_and_stale_wakes() {
+        let server_region = SharedRegion::create(1, 1, 1).expect("region should create");
+        let client_fd = unsafe { libc::dup(server_region.fd()) };
+        assert!(client_fd >= 0);
+        let (_peer, control) = UnixStream::pair().expect("socket pair should create");
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Pro,
+            server_region.info(),
+            owned_fds([client_fd, event_fd(), event_fd(), event_fd()]),
+        )
+        .expect("stream should create");
+        stream.started = true;
+        drop(_peer);
+        let mut capture = [0];
+        let mut producer_index = 0;
+        server_region.set_playback_sequence(4);
+        for sequence in 3..=5 {
+            assert!(server_region.try_publish_capture(
+                &mut producer_index,
+                sequence,
+                &[sequence as i32]
+            ));
+        }
+        stream
+            .capture_event
+            .notify()
+            .expect("notify should succeed");
+        assert!(stream.has_ready_capture());
+        assert_eq!(server_region.client_expired_capture_blocks(), 0);
+        assert_eq!(stream.try_capture_buffer(&mut capture).unwrap(), Some(4));
+        assert_eq!(capture, [4]);
+        assert_eq!(server_region.client_expired_capture_blocks(), 1);
+        let mut descriptor = libc::pollfd {
+            fd: stream.capture_event.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 1);
+        assert_eq!(stream.try_capture_buffer(&mut capture).unwrap(), Some(5));
+        assert_eq!(capture, [5]);
+        assert!(!stream.has_ready_capture());
+        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 0);
+
+        // A notification without data must not make the outer poll spin.
+        stream
+            .capture_event
+            .notify()
+            .expect("notify should succeed");
+        assert_eq!(stream.try_capture_buffer(&mut capture).unwrap(), None);
+        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 0);
+        assert!(server_region.try_publish_capture(&mut producer_index, 6, &[6]));
+        stream
+            .capture_event
+            .notify()
+            .expect("notify should succeed");
+        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 1);
+        assert_eq!(stream.try_capture_buffer(&mut capture).unwrap(), Some(6));
+        assert_eq!(capture, [6]);
+
+        server_region.record_capture_discontinuity();
+        assert!(matches!(
+            stream.try_capture_buffer(&mut capture),
+            Err(ClientError::CaptureDiscontinuity)
+        ));
+        server_region.set_hardware_generation(1);
+        assert!(matches!(
+            stream.try_capture_buffer(&mut capture),
+            Err(ClientError::CaptureDiscontinuity)
+        ));
+        stream.closed = true;
+    }
+
+    #[test]
+    #[ignore = "release-mode capture acquisition microbenchmark; no audio hardware"]
+    fn benchmark_externally_polled_capture_acquisition() {
+        for direct in [false, true] {
+            let server_region = SharedRegion::create(64, 8, 10).expect("region should create");
+            let client_fd = unsafe { libc::dup(server_region.fd()) };
+            assert!(client_fd >= 0);
+            let (peer, control) = UnixStream::pair().expect("socket pair should create");
+            let mut stream = AudioStream::from_parts(
+                control,
+                9,
+                StreamMode::Pro,
+                server_region.info(),
+                owned_fds([client_fd, event_fd(), event_fd(), event_fd()]),
+            )
+            .expect("stream should create");
+            drop(peer);
+            stream.started = true;
+            let mut producer_index = 0;
+            let source = [42; 640];
+            let mut capture = [0; 640];
+            let started = Instant::now();
+            for sequence in 0..20_000 {
+                assert!(server_region.try_publish_capture(&mut producer_index, sequence, &source));
+                stream.capture_event.notify().unwrap();
+                let acquired = if direct {
+                    stream.try_capture_buffer(&mut capture).unwrap()
+                } else {
+                    let ready = stream.wait_period(Duration::ZERO).unwrap();
+                    stream
+                        .capture_buffer_for_sequence(ready, &mut capture)
+                        .unwrap()
+                };
+                assert_eq!(acquired, Some(sequence));
+                std::hint::black_box(&capture);
+            }
+            let nanos_per_block = started.elapsed().as_nanos() / 20_000;
+            stream.closed = true;
+            println!("direct={direct} capture_roundtrip_ns_per_block={nanos_per_block}");
+        }
     }
 
     #[test]

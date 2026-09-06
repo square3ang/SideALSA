@@ -24,6 +24,21 @@ info() {
     printf '%s\n' "$*"
 }
 
+install_atomic() {
+    local source=$1 target=$2 mode=$3 temporary
+    mkdir -p -- "$(dirname -- "$target")"
+    if [[ -f "$target" && ! -L "$target" ]] && cmp -s -- "$source" "$target" \
+        && [[ "$(stat -c '%a' -- "$target")" == "${mode#0}" ]]; then
+        return
+    fi
+    # Never truncate a library that a running Wine process may have mapped.
+    temporary=$(mktemp "${target}.new.XXXXXX")
+    if ! install -m "$mode" -- "$source" "$temporary" || ! mv -Tf -- "$temporary" "$target"; then
+        rm -f -- "$temporary"
+        die "could not atomically install $target"
+    fi
+}
+
 usage() {
     cat <<'EOF'
 Usage: scripts/install-asio.sh [options]
@@ -116,8 +131,8 @@ UNIX_SOURCE="$BUILD_DIR/sidealsa-asio64.dll.so"
 WINE_ROOT="$INSTALL_ROOT/lib/wine"
 WINDOWS_ROOT="$WINE_ROOT/x86_64-windows"
 UNIX_ROOT="$WINE_ROOT/x86_64-unix"
-install -D -m 0644 "$DLL_SOURCE" "$WINDOWS_ROOT/sidealsa-asio64.dll"
-install -D -m 0755 "$UNIX_SOURCE" "$UNIX_ROOT/sidealsa-asio64.dll.so"
+install_atomic "$DLL_SOURCE" "$WINDOWS_ROOT/sidealsa-asio64.dll" 0644
+install_atomic "$UNIX_SOURCE" "$UNIX_ROOT/sidealsa-asio64.dll.so" 0755
 ln -sfn sidealsa-asio64.dll "$WINDOWS_ROOT/sidealsa-asio.dll"
 ln -sfn sidealsa-asio64.dll.so "$UNIX_ROOT/sidealsa-asio.dll.so"
 info "installed ASIO under $WINE_ROOT"
@@ -169,8 +184,8 @@ done
 
 for prefix in "${UNIQUE_PREFIXES[@]}"; do
     info "registering SideALSA ASIO in $prefix"
-    install -D -m 0644 "$DLL_SOURCE" \
-        "$prefix/drive_c/windows/system32/sidealsa-asio64.dll"
+    install_atomic "$DLL_SOURCE" \
+        "$prefix/drive_c/windows/system32/sidealsa-asio64.dll" 0644
     env \
         WINEPREFIX="$prefix" \
         WINEDLLPATH="$WINE_ROOT${WINEDLLPATH:+:$WINEDLLPATH}" \

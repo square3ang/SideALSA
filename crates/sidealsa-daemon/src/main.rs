@@ -18,6 +18,7 @@ use signal_hook::{
 struct Args {
     profile: PathBuf,
     socket: PathBuf,
+    pro_diagnostics: bool,
 }
 
 fn main() {
@@ -35,6 +36,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    if args.pro_diagnostics && !profile.device.uses_event_driven_linked_pro() {
+        eprintln!("--pro-diagnostics currently requires direct event-driven linked PRO");
+        std::process::exit(2);
+    }
     let engine = match DuplexEngine::open(profile.clone()) {
         Ok(engine) => engine,
         Err(error) => {
@@ -52,6 +57,9 @@ fn main() {
     };
 
     let stop = Arc::new(AtomicBool::new(false));
+    if args.pro_diagnostics {
+        state.enable_pro_diagnostics();
+    }
     if let Err(error) = flag::register(SIGINT, Arc::clone(&stop)) {
         eprintln!("could not register SIGINT handler: {error}");
         std::process::exit(1);
@@ -121,6 +129,14 @@ fn main() {
         result
     });
 
+    if args.pro_diagnostics {
+        while !hardware_handle.is_finished() && !stop.load(std::sync::atomic::Ordering::Acquire) {
+            if let Some(snapshot) = state.pro_diagnostics() {
+                eprintln!("pro_diagnostics {snapshot:?}");
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
     let (run_result, stop_result) = match hardware_handle.join() {
         Ok(result) => result,
         Err(_) => {
@@ -145,6 +161,11 @@ fn main() {
         std::process::exit(1);
     }
     let stats = state.stats();
+    if args.pro_diagnostics
+        && let Some(snapshot) = state.pro_diagnostics()
+    {
+        eprintln!("pro_diagnostics final {snapshot:?}");
+    }
     println!("periods_processed={}", stats.periods_processed);
     println!("sample_position={}", stats.sample_position);
     println!("playback_position={}", stats.playback_position);
@@ -235,12 +256,19 @@ fn prefault_realtime_stack() {
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut arguments = std::env::args_os().skip(1);
+    parse_args_from(std::env::args_os().skip(1))
+}
+
+fn parse_args_from(
+    mut arguments: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<Args, String> {
     let mut profile = PathBuf::from("profiles/topping-e1x2.toml");
     let mut socket = PathBuf::from("/tmp/sidealsad.sock");
+    let mut pro_diagnostics = false;
 
     while let Some(argument) = arguments.next() {
         match argument.to_str() {
+            Some("--pro-diagnostics") => pro_diagnostics = true,
             Some("--profile") => {
                 let value = arguments
                     .next()
@@ -261,17 +289,39 @@ fn parse_args() -> Result<Args, String> {
             None => return Err("arguments must be valid UTF-8".into()),
         }
     }
-    Ok(Args { profile, socket })
+    Ok(Args {
+        profile,
+        socket,
+        pro_diagnostics,
+    })
 }
 
 fn print_help() {
-    println!("sidealsad [--profile PATH] [--socket PATH]");
+    println!("sidealsad [--profile PATH] [--socket PATH] [--pro-diagnostics]");
+    println!("--pro-diagnostics: log direct-PRO last-miss timing once per second, outside RT");
     println!("default profile: profiles/topping-e1x2.toml");
     println!("default socket: /tmp/sidealsad.sock");
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pro_diagnostics_flag_is_opt_in() {
+        let defaults = super::parse_args_from(std::iter::empty()).unwrap();
+        assert!(!defaults.pro_diagnostics);
+        let enabled = super::parse_args_from(
+            ["--pro-diagnostics", "--socket", "/tmp/diagnostic-test.sock"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        )
+        .unwrap();
+        assert!(enabled.pro_diagnostics);
+        assert_eq!(
+            enabled.socket,
+            std::path::PathBuf::from("/tmp/diagnostic-test.sock")
+        );
+    }
+
     #[test]
     fn unqualified_loopback_prevents_service_restart() {
         assert_eq!(

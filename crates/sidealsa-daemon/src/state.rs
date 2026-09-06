@@ -9,9 +9,10 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use thiserror::Error;
 
+use crate::diagnostics::{ProDiagnostics, ProDiagnosticsSnapshot, ProMiss};
 use crate::shared::{PlaybackReadyWait, SharedError, SharedEvents, SharedRegion};
 
 const SESSION_CLOSING: u64 = u64::MAX;
@@ -505,6 +506,7 @@ impl SharedPortState {
 }
 
 pub struct DaemonState {
+    pro_diagnostics: Arc<ProDiagnostics>,
     info: DeviceInfo,
     timeline: Arc<HardwareTimeline>,
     hardware_ready: Arc<AtomicBool>,
@@ -580,6 +582,7 @@ impl DaemonState {
         }
         Ok(Self {
             info: device_info(profile),
+            pro_diagnostics: Arc::new(ProDiagnostics::default()),
             timeline,
             hardware_ready: Arc::new(AtomicBool::new(false)),
             pro,
@@ -599,6 +602,15 @@ impl DaemonState {
 
     pub fn info(&self) -> DeviceInfo {
         self.info.clone()
+    }
+
+    /// Enable before starting the direct-duplex hardware loop.
+    pub fn enable_pro_diagnostics(&self) {
+        self.pro_diagnostics.enabled.store(true, Ordering::Relaxed);
+    }
+
+    pub fn pro_diagnostics(&self) -> Option<ProDiagnosticsSnapshot> {
+        self.pro_diagnostics.snapshot()
     }
 
     pub fn stats(&self) -> Stats {
@@ -751,6 +763,8 @@ impl DaemonState {
             timeline: Arc::clone(&self.timeline),
         };
         let playback = DaemonPlaybackBridge {
+            pro_diagnostics: Arc::clone(&self.pro_diagnostics),
+            pro_wait_timing: None,
             pro_endpoint: Arc::clone(&self.pro.endpoint),
             pro_active: Arc::clone(&self.pro.active),
             pro_gate: ProPlaybackGate {
@@ -796,6 +810,9 @@ pub struct DaemonCaptureBridge {
 }
 
 pub struct DaemonPlaybackBridge {
+    pro_diagnostics: Arc<ProDiagnostics>,
+    // Identity, sequence, cutoff, budget at entry to the direct client wait.
+    pro_wait_timing: Option<(ProPlaybackIdentity, u64, u64, u64)>,
     pro_endpoint: Arc<EndpointSlot>,
     pro_active: Arc<AtomicU64>,
     pro_gate: ProPlaybackGate,
@@ -1213,10 +1230,30 @@ impl ProPlaybackSource for DaemonPlaybackBridge {
     }
 
     fn wait_for_playback_before(&mut self, sequence: u64, cutoff_nanos: u64) {
+        let wait_budget = self
+            .pro_diagnostics
+            .enabled
+            .load(Ordering::Relaxed)
+            .then(|| cutoff_nanos.saturating_sub(monotonic_nanos()));
         let wait_started = Instant::now();
         let endpoint = self.pro_endpoint.load();
         let session_id = self.pro_active.load(Ordering::SeqCst);
         let hardware_generation = self.timeline.generation();
+        self.pro_wait_timing = wait_budget.map(|budget| {
+            (
+                ProPlaybackIdentity {
+                    session_id,
+                    lifecycle_generation: self
+                        .pro_gate
+                        .lifecycle_generation
+                        .load(Ordering::Acquire),
+                    hardware_generation,
+                },
+                sequence,
+                cutoff_nanos,
+                budget,
+            )
+        });
         if session_id == 0
             || endpoint.session_id != session_id
             || !endpoint.region.activation_ready()
@@ -1266,10 +1303,7 @@ impl ProPlaybackSource for DaemonPlaybackBridge {
             if remaining == 0 {
                 break;
             }
-            match endpoint
-                .events
-                .wait_playback_ready(Duration::from_nanos(remaining))
-            {
+            match endpoint.events.wait_playback_ready_before(cutoff_nanos) {
                 PlaybackReadyWait::Ready | PlaybackReadyWait::Interrupted => {}
                 PlaybackReadyWait::Timeout => break,
                 PlaybackReadyWait::Failed => {
@@ -1324,6 +1358,13 @@ impl DaemonPlaybackBridge {
         cutoff_nanos: Option<u64>,
         playback: &mut [i32],
     ) {
+        let diagnostics_enabled = self.pro_diagnostics.enabled.load(Ordering::Relaxed);
+        let selection_started_nanos = if diagnostics_enabled {
+            monotonic_nanos()
+        } else {
+            0
+        };
+        let wait_timing = self.pro_wait_timing.take();
         let endpoint = self.pro_endpoint.load();
         let gate = self
             .pro_gate
@@ -1346,26 +1387,41 @@ impl DaemonPlaybackBridge {
             && endpoint.region.client_state() != SHARED_CLIENT_IDLE
         {
             endpoint.events.drain_playback_ready();
-            let consumed = if self.pro_active.load(Ordering::SeqCst) == session_id
+            let (outcome, published_nanos) = if self.pro_active.load(Ordering::SeqCst) == session_id
                 && endpoint.region.client_state() == SHARED_CLIENT_RUNNING
             {
                 match cutoff_nanos {
-                    Some(cutoff) => {
-                        endpoint
-                            .region
-                            .try_consume_playback_before(sequence, cutoff, playback)
-                            == PlaybackConsume::Ready
-                    }
-                    None => endpoint.region.try_consume_playback(sequence, playback),
+                    Some(cutoff) => endpoint
+                        .region
+                        .try_consume_playback_before_with_timestamp(sequence, cutoff, playback),
+                    None => (
+                        if endpoint.region.try_consume_playback(sequence, playback) {
+                            PlaybackConsume::Ready
+                        } else {
+                            PlaybackConsume::Missing
+                        },
+                        None,
+                    ),
                 }
             } else {
-                false
+                (PlaybackConsume::Missing, None)
+            };
+            let consumed = outcome == PlaybackConsume::Ready;
+            let capture_to_publish_nanos = if diagnostics_enabled {
+                published_nanos.and_then(|published| {
+                    self.timeline.pro_capture_elapsed_nanos(sequence, published)
+                })
+            } else {
+                None
             };
             let identity_is_current = self.pro_active.load(Ordering::SeqCst) == session_id
                 && self.pro_gate.lifecycle_generation.load(Ordering::Acquire)
                     == identity.lifecycle_generation
                 && self.timeline.generation() == gate.hardware_generation;
             if consumed && identity_is_current {
+                if let Some(elapsed) = capture_to_publish_nanos {
+                    self.pro_diagnostics.record_accepted(elapsed);
+                }
                 self.timeline
                     .record_pro_playback_block(playback.iter().any(|sample| *sample != 0));
                 self.last_valid_pro.copy_from_slice(playback);
@@ -1390,6 +1446,26 @@ impl DaemonPlaybackBridge {
                     self.timeline.record_pro_core_deadline_miss();
                 } else {
                     self.timeline.record_pro_deadline_miss();
+                }
+                if diagnostics_enabled {
+                    self.pro_diagnostics.record_miss(ProMiss {
+                        generation: gate.hardware_generation,
+                        session_id,
+                        sequence,
+                        wait_entry_budget_nanos: wait_timing
+                            .filter(|(wait_identity, wait_sequence, cutoff, _)| {
+                                *wait_identity == identity
+                                    && *wait_sequence == sequence
+                                    && Some(*cutoff) == cutoff_nanos
+                            })
+                            .map(|(_, _, _, budget)| budget),
+                        cutoff_nanos,
+                        selection_started_nanos,
+                        published_nanos,
+                        capture_to_publish_nanos,
+                        core: core_deadline_miss,
+                        late: outcome == PlaybackConsume::Late,
+                    });
                 }
                 if self.last_valid_pro_identity == Some(identity) {
                     playback.copy_from_slice(&self.last_valid_pro);
@@ -1709,6 +1785,83 @@ mod tests {
         playback.process_playback(12, &mut output);
         assert_eq!(output, [11; 8]);
         assert_eq!(timeline.snapshot().pro_deadline_misses, 1);
+        assert_eq!(state.pro_diagnostics().unwrap().misses_recorded, 0);
+    }
+
+    #[test]
+    fn pro_diagnostics_distinguish_late_missing_and_unknown_wait_budget() {
+        let profile = Profile::from_toml(PROFILE).unwrap();
+        let timeline = Arc::new(HardwareTimeline::default());
+        let state = DaemonState::new(&profile, Arc::clone(&timeline)).unwrap();
+        state.enable_pro_diagnostics();
+        let session = open_pro(&state).0;
+        assert!(state.start(session));
+        activate_session(&state, session, 9);
+        let (_, mut playback) = state.bridges();
+        let mut producer_index = 0;
+        let mut output = [0; 8];
+        playback.prepare_playback(10);
+        assert!(state.pro.current().region.try_client_publish_playback(
+            &mut producer_index,
+            10,
+            &[10; 8]
+        ));
+        playback.process_playback_before(10, u64::MAX, &mut output);
+        assert!(state.pro_diagnostics().unwrap().last_miss.is_none());
+
+        playback.wait_for_playback_before(11, 0);
+        assert!(state.pro.current().region.try_client_publish_playback(
+            &mut producer_index,
+            11,
+            &[11; 8]
+        ));
+        playback.mark_playback_budget_exhausted(11);
+        playback.process_playback_before(11, 0, &mut output);
+        let late = state.pro_diagnostics().unwrap().last_miss.unwrap();
+        assert_eq!(late.sequence, 11);
+        assert_eq!(late.session_id, session);
+        assert_eq!(late.wait_entry_budget_nanos, Some(0));
+        assert!(late.late && late.core);
+        assert!(late.published_nanos.is_some());
+        assert_eq!(late.capture_to_publish_nanos, None);
+        assert_eq!(output, [10; 8]);
+
+        let cutoff = monotonic_nanos().saturating_add(10_000);
+        playback.wait_for_playback_before(12, cutoff);
+        playback.process_playback_before(12, cutoff, &mut output);
+        let missing = state.pro_diagnostics().unwrap().last_miss.unwrap();
+        assert_eq!(missing.sequence, 12);
+        assert!(missing.wait_entry_budget_nanos.is_some());
+        assert!(!missing.late && !missing.core);
+        assert_eq!(missing.published_nanos, None);
+
+        playback.process_playback_before(13, cutoff, &mut output);
+        let snapshot = state.pro_diagnostics().unwrap();
+        assert_eq!(snapshot.misses_recorded, 3);
+        assert_eq!(snapshot.last_miss.unwrap().wait_entry_budget_nanos, None);
+        let stats = timeline.snapshot();
+        assert_eq!(stats.pro_core_deadline_misses, 1);
+        assert_eq!(stats.pro_client_deadline_misses, 2);
+        assert_eq!(stats.hw_playback_xruns, 0);
+        assert_eq!(stats.generation, 0);
+
+        for mismatch in 0..5 {
+            let sequence = 14 + mismatch;
+            let mut identity = playback.last_valid_pro_identity.unwrap();
+            match mismatch {
+                0 => identity.session_id += 1,
+                1 => identity.lifecycle_generation += 1,
+                2 => identity.hardware_generation += 1,
+                _ => {}
+            }
+            let wait_sequence = sequence + u64::from(mismatch == 3);
+            let wait_cutoff = cutoff + u64::from(mismatch == 4);
+            playback.pro_wait_timing = Some((identity, wait_sequence, wait_cutoff, 123));
+            playback.process_playback_before(sequence, cutoff, &mut output);
+            let miss = state.pro_diagnostics().unwrap().last_miss.unwrap();
+            assert_eq!(miss.wait_entry_budget_nanos, None);
+            assert_eq!(miss.sequence, sequence);
+        }
     }
 
     #[test]

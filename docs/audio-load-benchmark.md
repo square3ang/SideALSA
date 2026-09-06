@@ -6,6 +6,10 @@ Optional background workers live in that same playback process. It uses the
 reference 48 kHz/Q64, 10-input/8-output interface and the output-0/input-4
 internal digital return, not an analog DAC/ADC latency measurement.
 
+For PRO deadline investigation without loopback stability as a criterion, use
+the [silent callback-time sweep](pro-deadline-benchmark.md). Digital return
+latency variation is a separate observation, not assumed to cause PRO misses.
+
 ## Build and Run
 
 ```sh
@@ -62,6 +66,7 @@ Host sleep overshoot and the final 100 ms pulse drain can extend the cool stage.
 | `SIDEALSA_ASIO_BUILD_DIR` | `build-asio` under the repository |
 | `SIDEALSA_ASIO_DLL_DIR` | Same as build directory; use `/usr/local/lib/wine` for installed DLLs |
 | `SIDEALSA_AUDIO_LOAD_LOG_DIR` | Timestamped directory under `target/audio-load` |
+| `SIDEALSA_ASIO_AUDIO_LOAD_DIAGNOSTIC` | 0; set 1 to continue after measured native-reference PRO misses, pulse loss or phase variation. These still mark the full run failed. Crashes, timeouts, insufficient observations and hardware resets abort. |
 
 Example focused combined test:
 

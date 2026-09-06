@@ -3622,8 +3622,9 @@ fn wait_for_linked_duplex_period(
         }
 
         let capture_result = capture_pcm.avail_update();
-        let playback_result = playback_pcm.avail_update();
+        // Query latency and preemption must consume, not extend, the queue budget.
         let observed_nanos = monotonic_nanos();
+        let playback_result = playback_pcm.avail_update();
         let playback_xrun = playback_pcm.state() == State::XRun
             || matches!(&playback_result, Err(error) if error.errno() == libc::EPIPE);
         let capture_xrun = capture_pcm.state() == State::XRun
@@ -4836,6 +4837,20 @@ mod tests {
             direct_pro_cutoff_nanos(readiness(16), 64, 48_000, 750_000),
             1_000_000
         );
+    }
+
+    #[test]
+    fn direct_cutoff_charges_elapsed_work_to_the_observed_queue_budget() {
+        let readiness = DirectDuplexReadiness {
+            playback_queued_frames: 64,
+            observed_nanos: 1_000_000,
+        };
+        let cutoff = direct_pro_cutoff_nanos(readiness, 64, 48_000, 1_000_000);
+        assert_eq!(cutoff, 2_000_000);
+        // Availability-query time, capture publication and preemption all spend
+        // the same budget; none may start a new full handoff after they finish.
+        assert_eq!(cutoff.saturating_sub(1_200_000), 800_000);
+        assert_eq!(cutoff.saturating_sub(2_100_000), 0);
     }
 
     #[test]

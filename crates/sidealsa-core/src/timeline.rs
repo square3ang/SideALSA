@@ -326,16 +326,24 @@ impl HardwareTimeline {
         slot.sequence.store(sequence, Ordering::Release);
     }
 
-    pub(crate) fn record_pro_playback_write(&self, sequence: u64, nanos: u64) {
+    /// Matches an endpoint timestamp to the recent capture read. Direct duplex
+    /// callers use this on the same RT thread that records capture timing.
+    pub fn pro_capture_elapsed_nanos(&self, sequence: u64, nanos: u64) -> Option<u64> {
         let slot = &self.pro_timing[sequence as usize % PRO_TIMING_SLOT_COUNT];
         if slot.sequence.load(Ordering::Acquire) != sequence {
-            return;
+            return None;
         }
         let capture_read_nanos = slot.capture_read_nanos.load(Ordering::Relaxed);
         if capture_read_nanos == 0 || nanos < capture_read_nanos {
-            return;
+            return None;
         }
-        let duration = nanos - capture_read_nanos;
+        Some(nanos - capture_read_nanos)
+    }
+
+    pub(crate) fn record_pro_playback_write(&self, sequence: u64, nanos: u64) {
+        let Some(duration) = self.pro_capture_elapsed_nanos(sequence, nanos) else {
+            return;
+        };
         self.capture_to_playback_write_nanos
             .store(duration, Ordering::Relaxed);
         update_minimum(&self.capture_to_playback_write_min_nanos, duration);
@@ -602,6 +610,19 @@ mod tests {
         assert_eq!(stats.playback_driver_delay_frames, 168);
         assert_eq!(stats.playback_driver_delay_min_frames, 168);
         assert_eq!(stats.playback_driver_delay_max_frames, 192);
+    }
+
+    #[test]
+    fn capture_timestamp_correlation_rejects_unknown_reversed_and_overwritten_samples() {
+        let timeline = HardwareTimeline::default();
+        assert_eq!(timeline.pro_capture_elapsed_nanos(0, 100), None);
+        timeline.record_pro_capture_read(5, 100);
+        assert_eq!(timeline.pro_capture_elapsed_nanos(5, 150), Some(50));
+        assert_eq!(timeline.pro_capture_elapsed_nanos(5, 99), None);
+        assert_eq!(timeline.pro_capture_elapsed_nanos(6, 150), None);
+        timeline.record_pro_capture_read(13, 200);
+        assert_eq!(timeline.pro_capture_elapsed_nanos(5, 250), None);
+        assert_eq!(timeline.pro_capture_elapsed_nanos(13, 250), Some(50));
     }
 
     #[test]

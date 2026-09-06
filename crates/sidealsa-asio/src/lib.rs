@@ -590,6 +590,7 @@ impl AsioDriver {
         let thread_ops = self.thread_ops.ok_or(AsioError::Worker)?;
         let device = inner.device.as_ref().ok_or(AsioError::InvalidState)?;
         let rate = device.rate;
+        let zero_lead = device.pro_latency_periods == 0;
         let realtime_priority = c_int::try_from(device.pro_realtime_priority)
             .map_err(|_| AsioError::InvalidParameter)?;
         let shared = inner.shared.ok_or(AsioError::InvalidState)?;
@@ -624,6 +625,7 @@ impl AsioDriver {
                 callbacks,
                 time_info,
                 rate,
+                zero_lead,
                 realtime_priority,
                 period_frames,
                 capture_samples,
@@ -962,6 +964,7 @@ struct WorkerInput {
     callbacks: AsioCallbacks,
     time_info: bool,
     rate: u32,
+    zero_lead: bool,
     realtime_priority: c_int,
     period_frames: usize,
     capture_samples: usize,
@@ -1347,6 +1350,12 @@ impl Drop for StopSignal {
 }
 
 fn run_worker(stream: &mut AudioStream, input: &WorkerInput) -> Result<(), AsioError> {
+    let spin_setting = match std::env::var("SIDEALSA_ASIO_SPIN_US") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => return Err(AsioError::WorkerStopped("invalid SIDEALSA_ASIO_SPIN_US")),
+    };
+    let requested_spin_nanos = capture_spin_nanos(spin_setting.as_deref(), input.zero_lead)?;
     let mut capture = checked_i32_buffer(input.capture_samples)?;
     let mut playback = checked_i32_buffer(input.playback_samples)?;
     let audio_fd = unsafe { OwnedFd::from_raw_fd(stream.notification_fd()?) };
@@ -1361,6 +1370,12 @@ fn run_worker(stream: &mut AudioStream, input: &WorkerInput) -> Result<(), AsioE
                 None
             }
         }
+    };
+    // Do not busy-wait if the callback thread could not acquire RT scheduling.
+    let spin_nanos = if realtime.is_some() {
+        requested_spin_nanos
+    } else {
+        0
     };
     let result = match stream.start() {
         Ok(()) => catch_unwind(AssertUnwindSafe(|| {
@@ -1380,6 +1395,7 @@ fn run_worker(stream: &mut AudioStream, input: &WorkerInput) -> Result<(), AsioE
                 &mut playback,
                 input.sample_kernels,
                 &input.position,
+                spin_nanos,
             )
         }))
         .unwrap_or(Err(AsioError::Worker)),
@@ -1410,17 +1426,28 @@ fn worker_loop(
     playback: &mut [i32],
     sample_kernels: SampleKernels,
     position: &PositionSnapshot,
+    spin_nanos: u64,
 ) -> Result<(), AsioError> {
     let mut buffer_index = 0_usize;
     let mut previous_sequence = None;
     let mut run_generation = u64::MAX;
     let mut last_active_sequence = None;
     let mut stopping_after = None;
+    let period_nanos = u64::try_from(period_frames)
+        .unwrap_or(0)
+        .saturating_mul(1_000_000_000)
+        / u64::from(rate);
+    let mut capture_spin = CaptureSpin {
+        half_window_nanos: spin_nanos.min(period_nanos / 4),
+        period_nanos,
+        last: None,
+    };
     macro_rules! recover_discontinuity {
         ($result:expr) => {
             match $result.map_err(AsioError::from) {
                 Ok(value) => value,
                 Err(error) if is_recoverable_discontinuity(&error) => {
+                    capture_spin.last = None;
                     recover_worker_discontinuity(
                         stream,
                         gate,
@@ -1447,18 +1474,24 @@ fn worker_loop(
             &mut stopping_after,
         );
         let acquisition_generation = run_generation;
-        let sequence = match recover_discontinuity!(wait_worker_event(
-            stream, audio_fd, control_fd, stop, gate
+        let spin_window = capture_spin.window(run_generation, gate.command().1);
+        let block_sequence = match recover_discontinuity!(wait_worker_event(
+            stream,
+            capture,
+            audio_fd,
+            control_fd,
+            stop,
+            gate,
+            spin_window
         )) {
             WorkerEvent::Cycle(sequence) => sequence,
             WorkerEvent::Gate => continue,
             WorkerEvent::Stop => break,
         };
-        let Some(block_sequence) =
-            recover_discontinuity!(stream.capture_buffer_for_sequence(sequence, capture))
-        else {
-            continue;
-        };
+        if capture_spin.half_window_nanos != 0 {
+            capture_spin.observe(block_sequence, monotonic_nanos(), acquisition_generation);
+        }
+        // Check once after acquisition, before dispatching the host callback.
         check_daemon_control(control_fd)?;
         let running = apply_gate_transition(
             gate,
@@ -1521,10 +1554,6 @@ fn worker_loop(
         let callback_start = stamp;
         invoke_callback(callbacks, time_info, buffer_index, samples, stamp, rate)?;
         let callback_duration = monotonic_nanos().saturating_sub(callback_start);
-        let period_nanos = u64::try_from(period_frames)
-            .unwrap_or(0)
-            .saturating_mul(1_000_000_000)
-            / u64::from(rate);
         stream.record_callback_timing(callback_duration, period_nanos);
         // Kernel selection proved its target features and buffer geometry before worker startup.
         unsafe {
@@ -1668,12 +1697,83 @@ enum WorkerEvent {
     Stop,
 }
 
+fn capture_spin_nanos(value: Option<&str>, zero_lead: bool) -> Result<u64, AsioError> {
+    let Some(value) = value else {
+        return Ok(if zero_lead { 200_000 } else { 0 });
+    };
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|us| *us <= 250)
+        .map(|us| us * 1000)
+        .ok_or(AsioError::WorkerStopped(
+            "SIDEALSA_ASIO_SPIN_US must be 0..250",
+        ))
+}
+
+struct CaptureSpin {
+    half_window_nanos: u64,
+    period_nanos: u64,
+    // Sequence, observed arrival time, and host lifecycle generation.
+    last: Option<(u64, u64, u64)>,
+}
+
+impl CaptureSpin {
+    fn window(&self, generation: u64, running: bool) -> Option<(u64, u64, u64)> {
+        let (_, observed, previous_generation) = self.last?;
+        if self.half_window_nanos == 0 || !running || generation != previous_generation {
+            return None;
+        }
+        let expected = observed.saturating_add(self.period_nanos);
+        Some((
+            expected.saturating_sub(self.half_window_nanos),
+            expected.saturating_add(self.half_window_nanos),
+            generation,
+        ))
+    }
+
+    fn observe(&mut self, sequence: u64, observed: u64, generation: u64) {
+        // Never extrapolate across a missed cycle or lifecycle transition.
+        let consecutive = self.last.is_none_or(|(previous, _, previous_generation)| {
+            sequence == previous.wrapping_add(1) && generation == previous_generation
+        });
+        self.last = (consecutive && observed != 0).then_some((sequence, observed, generation));
+    }
+}
+
+fn spin_until_capture(
+    end: u64,
+    generation: u64,
+    stop: &StopSignal,
+    gate: &WorkerGate,
+    mut ready: impl FnMut() -> bool,
+) -> Option<WorkerEvent> {
+    loop {
+        let now = monotonic_nanos();
+        if now == 0 || now >= end {
+            return None;
+        }
+        if stop.is_requested() {
+            return Some(WorkerEvent::Stop);
+        }
+        if gate.command() != (generation, true) {
+            return Some(WorkerEvent::Gate);
+        }
+        if ready() {
+            return None;
+        }
+        std::hint::spin_loop();
+    }
+}
+
 fn wait_worker_event(
     stream: &mut AudioStream,
+    capture: &mut [i32],
     audio_fd: RawFd,
     control_fd: RawFd,
     stop: &StopSignal,
     gate: &WorkerGate,
+    spin_window: Option<(u64, u64, u64)>,
 ) -> Result<WorkerEvent, AsioError> {
     let mut fds = [
         libc::pollfd {
@@ -1701,23 +1801,40 @@ fn wait_worker_event(
         if stop.is_requested() {
             return Ok(WorkerEvent::Stop);
         }
-        match stream.wait_period(Duration::ZERO) {
-            Ok(sequence) => {
-                check_daemon_control(control_fd)?;
-                return Ok(WorkerEvent::Cycle(sequence));
-            }
-            Err(ClientError::Timeout) => {}
+        match stream.try_capture_buffer(capture) {
+            Ok(Some(sequence)) => return Ok(WorkerEvent::Cycle(sequence)),
+            Ok(None) => {}
             Err(error) => return Err(error.into()),
+        }
+        let mut early_timeout = None;
+        if let Some((start, end, generation)) = spin_window {
+            let now = monotonic_nanos();
+            if now < start {
+                let remaining = (start - now).min(WORKER_POLL_HEARTBEAT_MS as u64 * 1_000_000);
+                early_timeout = Some(libc::timespec {
+                    tv_sec: (remaining / 1_000_000_000) as _,
+                    tv_nsec: (remaining % 1_000_000_000) as _,
+                });
+            } else if now < end {
+                if let Some(event) =
+                    spin_until_capture(end, generation, stop, gate, || stream.has_ready_capture())
+                {
+                    return Ok(event);
+                }
+                // Reacquire with full generation/expiry checks, or block once
+                // this fixed window expires. Signals never extend the window.
+                continue;
+            }
         }
         for fd in &mut fds {
             fd.revents = 0;
         }
         let result = unsafe {
-            libc::poll(
-                fds.as_mut_ptr(),
-                fds.len() as libc::nfds_t,
-                WORKER_POLL_HEARTBEAT_MS,
-            )
+            if let Some(timeout) = early_timeout {
+                libc::ppoll(fds.as_mut_ptr(), fds.len() as _, &timeout, std::ptr::null())
+            } else {
+                libc::poll(fds.as_mut_ptr(), fds.len() as _, WORKER_POLL_HEARTBEAT_MS)
+            }
         };
         if result < 0 {
             let error = std::io::Error::last_os_error();
@@ -2596,6 +2713,69 @@ pub unsafe extern "C" fn sidealsa_asio_get_sample_position(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capture_spin_prediction_is_bounded_and_resets_on_gaps() {
+        let mut spin = super::CaptureSpin {
+            half_window_nanos: 50_000,
+            period_nanos: 1_333_333,
+            last: None,
+        };
+        assert_eq!(spin.window(1, true), None);
+        spin.observe(u64::MAX, 1_000_000, 1);
+        assert_eq!(spin.window(1, true), Some((2_283_333, 2_383_333, 1)));
+        assert_eq!(spin.window(1, false), None);
+        assert_eq!(spin.window(2, true), None);
+        spin.observe(0, 2_333_333, 1);
+        assert!(spin.window(1, true).is_some());
+        spin.observe(2, 5_000_000, 1);
+        assert_eq!(spin.window(1, true), None);
+        spin.observe(3, 6_000_000, 1);
+        spin.observe(4, 7_000_000, 2);
+        assert_eq!(spin.window(2, true), None);
+        spin.observe(5, 0, 2);
+        assert_eq!(spin.window(2, true), None);
+        spin.half_window_nanos = 0;
+        spin.observe(6, 8_000_000, 2);
+        assert_eq!(spin.window(2, true), None);
+    }
+
+    #[test]
+    fn capture_spin_stops_for_deadline_stop_and_lifecycle_changes() {
+        let stop = super::StopSignal::new().unwrap();
+        let gate = super::WorkerGate::new(true).unwrap();
+        assert!(
+            super::spin_until_capture(0, 0, &stop, &gate, || panic!(
+                "expired spin queried readiness"
+            ))
+            .is_none()
+        );
+        let end = super::monotonic_nanos().saturating_add(1_000_000_000);
+        assert!(super::spin_until_capture(end, 0, &stop, &gate, || true).is_none());
+        gate.set_running(false);
+        assert!(matches!(
+            super::spin_until_capture(end, 0, &stop, &gate, || false),
+            Some(super::WorkerEvent::Gate)
+        ));
+        stop.request();
+        assert!(matches!(
+            super::spin_until_capture(end, 0, &stop, &gate, || false),
+            Some(super::WorkerEvent::Stop)
+        ));
+    }
+
+    #[test]
+    fn capture_spin_default_is_zero_lead_only_and_can_be_disabled() {
+        assert_eq!(super::capture_spin_nanos(None, true).unwrap(), 200_000);
+        assert_eq!(super::capture_spin_nanos(None, false).unwrap(), 0);
+        assert_eq!(super::capture_spin_nanos(Some("0"), true).unwrap(), 0);
+        assert_eq!(
+            super::capture_spin_nanos(Some("250"), true).unwrap(),
+            250_000
+        );
+        for value in ["-1", "251", "invalid", ""] {
+            assert!(super::capture_spin_nanos(Some(value), true).is_err());
+        }
+    }
     use super::*;
     use std::{
         cell::Cell,

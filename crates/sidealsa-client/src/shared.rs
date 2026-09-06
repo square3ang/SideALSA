@@ -505,7 +505,8 @@ impl SharedRegion {
             sequence,
             None,
             samples,
-        ) == PlaybackConsume::Ready
+        )
+        .0 == PlaybackConsume::Ready
     }
 
     pub fn has_ready_playback(&self, sequence: u64) -> bool {
@@ -525,6 +526,20 @@ impl SharedRegion {
         cutoff_nanos: u64,
         samples: &mut [i32],
     ) -> PlaybackConsume {
+        self.try_consume_playback_before_with_timestamp(sequence, cutoff_nanos, samples)
+            .0
+    }
+
+    /// Consumes the exact playback sequence if published at or before the cutoff.
+    /// Returns its nonzero publication timestamp for Ready or Late, and None for
+    /// Missing. A zero timestamp is Late with None metadata. Late and Missing
+    /// leave samples unchanged; Ready and Late both release the matching slot.
+    pub fn try_consume_playback_before_with_timestamp(
+        &self,
+        sequence: u64,
+        cutoff_nanos: u64,
+        samples: &mut [i32],
+    ) -> (PlaybackConsume, Option<u64>) {
         self.try_consume_exact(
             self.layout.playback_offset(),
             self.playback_samples,
@@ -541,12 +556,12 @@ impl SharedRegion {
         expected_sequence: u64,
         cutoff_nanos: Option<u64>,
         samples: &mut [i32],
-    ) -> PlaybackConsume {
+    ) -> (PlaybackConsume, Option<u64>) {
         if sample_count == 0 {
-            return PlaybackConsume::Missing;
+            return (PlaybackConsume::Missing, None);
         }
         if samples.len() < sample_count {
-            return PlaybackConsume::Missing;
+            return (PlaybackConsume::Missing, None);
         }
         let mut exact_index = None;
         for index in 0..self.layout.slot_count() {
@@ -569,7 +584,7 @@ impl SharedRegion {
             reclaim_ready_slot(slot);
         }
         let Some(index) = exact_index else {
-            return PlaybackConsume::Missing;
+            return (PlaybackConsume::Missing, None);
         };
         let slot = unsafe { self.slot(ring_offset, index) };
         if slot
@@ -582,24 +597,23 @@ impl SharedRegion {
             )
             .is_err()
         {
-            return PlaybackConsume::Missing;
+            return (PlaybackConsume::Missing, None);
         }
         if slot.sequence.load(Ordering::Relaxed) != expected_sequence {
             slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
-            return PlaybackConsume::Missing;
+            return (PlaybackConsume::Missing, None);
         }
-        if cutoff_nanos.is_some_and(|cutoff| {
-            let published = slot.published_nanos.load(Ordering::Relaxed);
-            published == 0 || published > cutoff
-        }) {
+        let published = slot.published_nanos.load(Ordering::Relaxed);
+        let timestamp = (published != 0).then_some(published);
+        if cutoff_nanos.is_some_and(|cutoff| published == 0 || published > cutoff) {
             slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
-            return PlaybackConsume::Late;
+            return (PlaybackConsume::Late, timestamp);
         }
         unsafe {
             samples[..sample_count].copy_from_slice(self.audio(ring_offset, index, sample_count));
         }
         slot.state.store(SHARED_SLOT_FREE, Ordering::Release);
-        PlaybackConsume::Ready
+        (PlaybackConsume::Ready, timestamp)
     }
 
     pub fn try_client_read_capture(
@@ -706,6 +720,19 @@ impl SharedRegion {
             }
         }
         selected.map(|(sequence, _)| sequence)
+    }
+
+    pub(crate) fn has_ready_capture_since(&self, minimum_sequence: Option<u64>) -> bool {
+        if self.capture_samples == 0 {
+            return false;
+        }
+        (0..self.layout.slot_count()).any(|index| {
+            let slot = unsafe { self.slot(self.layout.capture_offset(), index) };
+            slot.state.load(Ordering::Acquire) == SHARED_SLOT_READY
+                && minimum_sequence.is_none_or(|minimum| {
+                    !sequence_is_before(slot.sequence.load(Ordering::Relaxed), minimum)
+                })
+        })
     }
 
     pub fn try_client_read_valid_capture(
@@ -945,6 +972,95 @@ mod tests {
             PlaybackConsume::Ready
         );
         assert_eq!(samples, [8]);
+    }
+
+    #[test]
+    fn playback_cutoff_returns_ready_late_and_missing_metadata() {
+        let region = SharedRegion::create(1, 1, 0).expect("region should create");
+        let mut producer_index = 0;
+        let mut samples = [-1];
+
+        for (sequence, published, cutoff, expected) in [
+            (7, 100, 100, PlaybackConsume::Ready),
+            (8, 200, 199, PlaybackConsume::Late),
+        ] {
+            let index = producer_index;
+            assert!(region.try_client_publish_playback(
+                &mut producer_index,
+                sequence,
+                &[sequence as i32]
+            ));
+            let slot = unsafe { region.slot(region.layout.playback_offset(), index) };
+            slot.published_nanos.store(published, Ordering::Relaxed);
+            assert_eq!(
+                region.try_consume_playback_before_with_timestamp(sequence, cutoff, &mut samples),
+                (expected, Some(published))
+            );
+            assert_eq!(samples, [7]);
+            assert_eq!(
+                region.try_consume_playback_before_with_timestamp(sequence, cutoff, &mut samples),
+                (PlaybackConsume::Missing, None)
+            );
+            assert_eq!(samples, [7]);
+        }
+    }
+
+    #[test]
+    fn playback_zero_timestamp_is_late_without_metadata() {
+        let region = SharedRegion::create(1, 1, 0).expect("region should create");
+        let mut producer_index = 0;
+        let mut samples = [-1];
+        for sequence in 7..10 {
+            let index = producer_index;
+            assert!(region.try_client_publish_playback(&mut producer_index, sequence, &[7]));
+            let slot = unsafe { region.slot(region.layout.playback_offset(), index) };
+            slot.published_nanos.store(0, Ordering::Relaxed);
+            match sequence {
+                7 => assert_eq!(
+                    region.try_consume_playback_before_with_timestamp(
+                        sequence,
+                        u64::MAX,
+                        &mut samples
+                    ),
+                    (PlaybackConsume::Late, None)
+                ),
+                8 => assert_eq!(
+                    region.try_consume_playback_before(sequence, u64::MAX, &mut samples),
+                    PlaybackConsume::Late
+                ),
+                _ => assert!(region.try_consume_playback(sequence, &mut samples)),
+            }
+            assert_eq!(samples, if sequence == 9 { [7] } else { [-1] });
+        }
+    }
+
+    #[test]
+    fn playback_timestamp_survives_later_stale_reclamation_and_reuse() {
+        let region = SharedRegion::create(1, 1, 0).expect("region should create");
+        let mut producer_index = 0;
+        assert!(region.try_client_publish_playback(&mut producer_index, 10, &[10]));
+        assert!(region.try_client_publish_playback(&mut producer_index, 9, &[9]));
+        let exact = unsafe { region.slot(region.layout.playback_offset(), 0) };
+        let stale = unsafe { region.slot(region.layout.playback_offset(), 1) };
+        exact.published_nanos.store(100, Ordering::Relaxed);
+        stale.published_nanos.store(1, Ordering::Relaxed);
+        let mut samples = [0];
+        assert_eq!(
+            region.try_consume_playback_before_with_timestamp(10, 100, &mut samples),
+            (PlaybackConsume::Ready, Some(100))
+        );
+        assert_eq!(samples, [10]);
+        assert_eq!(stale.state.load(Ordering::Acquire), SHARED_SLOT_FREE);
+
+        producer_index = 1;
+        assert!(region.try_client_publish_playback(&mut producer_index, 11, &[11]));
+        let published = stale.published_nanos.load(Ordering::Relaxed);
+        assert!(published > 1);
+        assert_eq!(
+            region.try_consume_playback_before_with_timestamp(11, published, &mut samples),
+            (PlaybackConsume::Ready, Some(published))
+        );
+        assert_eq!(samples, [11]);
     }
 
     #[test]
