@@ -72,7 +72,7 @@ Automatic adapter generation for arbitrary validated profiles is not yet
 implemented.
 
 The E1x2 PRO pipeline uses Q64 client blocks and P32 physical ALSA periods with a
-B256 hardware ring. `pro_latency_periods = 0`, timer scheduling is disabled, and
+B192 hardware ring. `pro_latency_periods = 0`, timer scheduling is disabled, and
 `linked_phase_max_attempts = 0`. Linked startup primes the ALSA playback ring
 with a Q128 base of silence selected by `playback_queue_periods = 2` and starts
 playback and capture together. When explicitly enabled, digital loopback
