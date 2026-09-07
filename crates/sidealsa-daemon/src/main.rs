@@ -7,6 +7,9 @@ use std::{
 };
 
 use sidealsa_config::Profile;
+use sidealsa_config::selection::{
+    DEFAULT_SOCKET_PATH, InstalledSelection, LEGACY_PROFILE_PATH, installed_selection,
+};
 use sidealsa_core::DuplexEngine;
 use sidealsa_daemon::{DaemonState, run_control_listener};
 use signal_hook::{
@@ -259,11 +262,32 @@ fn parse_args() -> Result<Args, String> {
     parse_args_from(std::env::args_os().skip(1))
 }
 
-fn parse_args_from(
+fn parse_args_from(arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<Args, String> {
+    parse_args_with_selection(
+        arguments,
+        || installed_selection().map_err(|e| e.to_string()),
+        || {
+            // Compatibility only for the concrete profile installed before active.toml existed.
+            match std::fs::symlink_metadata(LEGACY_PROFILE_PATH) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(e.to_string()),
+                Ok(_) => sidealsa_config::selection::validate_installed_profile(
+                    std::path::Path::new(LEGACY_PROFILE_PATH),
+                )
+                .map(|()| true)
+                .map_err(|e| e.to_string()),
+            }
+        },
+    )
+}
+
+fn parse_args_with_selection(
     mut arguments: impl Iterator<Item = std::ffi::OsString>,
+    selection: impl FnOnce() -> Result<Option<InstalledSelection>, String>,
+    legacy_exists: impl FnOnce() -> Result<bool, String>,
 ) -> Result<Args, String> {
-    let mut profile = PathBuf::from("profiles/topping-e1x2.toml");
-    let mut socket = PathBuf::from("/tmp/sidealsad.sock");
+    let mut profile = None;
+    let mut socket = None;
     let mut pro_diagnostics = false;
 
     while let Some(argument) = arguments.next() {
@@ -273,13 +297,13 @@ fn parse_args_from(
                 let value = arguments
                     .next()
                     .ok_or_else(|| "--profile requires a path".to_string())?;
-                profile = PathBuf::from(value);
+                profile = Some(PathBuf::from(value));
             }
             Some("--socket") => {
                 let value = arguments
                     .next()
                     .ok_or_else(|| "--socket requires a path".to_string())?;
-                socket = PathBuf::from(value);
+                socket = Some(PathBuf::from(value));
             }
             Some("--help") | Some("-h") => {
                 print_help();
@@ -289,6 +313,18 @@ fn parse_args_from(
             None => return Err("arguments must be valid UTF-8".into()),
         }
     }
+    if (profile.is_none() || socket.is_none())
+        && let Some(selected) = selection()?
+    {
+        profile.get_or_insert(selected.profile);
+        socket.get_or_insert(selected.socket);
+    }
+    let profile = match profile {
+        Some(profile) => profile,
+        None if legacy_exists()? => PathBuf::from(LEGACY_PROFILE_PATH),
+        None => return Err("no installed selection or legacy profile; use --profile PATH (including development profiles)".into()),
+    };
+    let socket = socket.unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET_PATH));
     Ok(Args {
         profile,
         socket,
@@ -299,20 +335,105 @@ fn parse_args_from(
 fn print_help() {
     println!("sidealsad [--profile PATH] [--socket PATH] [--pro-diagnostics]");
     println!("--pro-diagnostics: log direct-PRO last-miss timing once per second, outside RT");
-    println!("default profile: profiles/topping-e1x2.toml");
-    println!("default socket: /tmp/sidealsad.sock");
+    println!(
+        "Defaults: trusted /etc/sidealsa/active.toml; legacy profile only if installed; otherwise use --profile PATH."
+    );
+    println!("Socket without selection: {DEFAULT_SOCKET_PATH}");
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn pro_diagnostics_flag_is_opt_in() {
-        let defaults = super::parse_args_from(std::iter::empty()).unwrap();
-        assert!(!defaults.pro_diagnostics);
-        let enabled = super::parse_args_from(
-            ["--pro-diagnostics", "--socket", "/tmp/diagnostic-test.sock"]
+    fn selection_precedence_and_absence() {
+        use super::*;
+        for (flags, selected, legacy, expected) in [
+            (
+                vec![],
+                true,
+                false,
+                Some(("/selected.toml", "/selected.sock")),
+            ),
+            (
+                vec!["--profile", "dev.toml"],
+                true,
+                false,
+                Some(("dev.toml", "/selected.sock")),
+            ),
+            (
+                vec!["--socket", "/explicit.sock"],
+                true,
+                false,
+                Some(("/selected.toml", "/explicit.sock")),
+            ),
+            (
+                vec!["--profile", "dev.toml"],
+                false,
+                false,
+                Some(("dev.toml", DEFAULT_SOCKET_PATH)),
+            ),
+            (
+                vec![],
+                false,
+                true,
+                Some((LEGACY_PROFILE_PATH, DEFAULT_SOCKET_PATH)),
+            ),
+            (vec![], false, false, None),
+        ] {
+            let result = parse_args_with_selection(
+                flags.into_iter().map(std::ffi::OsString::from),
+                || {
+                    Ok(selected.then(|| InstalledSelection {
+                        profile: "/selected.toml".into(),
+                        socket: "/selected.sock".into(),
+                    }))
+                },
+                || Ok(legacy),
+            );
+            if let Some((profile, socket)) = expected {
+                let args = result.unwrap();
+                assert_eq!(args.profile, PathBuf::from(profile));
+                assert_eq!(args.socket, PathBuf::from(socket));
+            } else {
+                assert!(result.unwrap_err().contains("use --profile"));
+            }
+        }
+        parse_args_with_selection(
+            ["--profile", "dev.toml", "--socket", "/explicit.sock"]
                 .into_iter()
                 .map(std::ffi::OsString::from),
+            || panic!("selection must not be read"),
+            || panic!("legacy must not be checked"),
+        )
+        .unwrap();
+        let error = parse_args_with_selection(
+            ["--profile", "dev.toml"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+            || Err("untrusted selection".into()),
+            || panic!("must not fall back"),
+        );
+        assert_eq!(error.unwrap_err(), "untrusted selection");
+    }
+
+    #[test]
+    fn pro_diagnostics_flag_is_opt_in() {
+        let defaults = super::parse_args_from(
+            ["--profile", "dev.toml", "--socket", "/tmp/test.sock"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        )
+        .unwrap();
+        assert!(!defaults.pro_diagnostics);
+        let enabled = super::parse_args_from(
+            [
+                "--pro-diagnostics",
+                "--profile",
+                "dev.toml",
+                "--socket",
+                "/tmp/diagnostic-test.sock",
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from),
         )
         .unwrap();
         assert!(enabled.pro_diagnostics);

@@ -57,10 +57,10 @@ prints diagnostics after the RT loop exits.
 - Capture is discarded.
 - Playback is silence only.
 - Only `S32_LE` is supported.
-- Exact logical `period_size = 64`, physical `hardware_period_size = 32`, and
+- Exact logical `period_size = 64`, physical `hardware_period_size = 64`, and
   `buffer_size = 256` are required by the E1x2 profile. Devices rejecting that
   setup fail before streaming.
-- The E1x2 hardware buffer holds eight physical periods (four logical blocks);
+- The current E1x2 hardware buffer holds four physical periods (four logical blocks);
   B128 is insufficient for the current zero-lead and shared-client paths.
 - An earlier optimized release `64/192` run completed `7500` periods with `generation=0`,
   `timeline_resets=0`, `hw_playback_xruns=0`, and `hw_capture_xruns=0`.

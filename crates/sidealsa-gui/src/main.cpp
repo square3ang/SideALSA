@@ -34,8 +34,6 @@
 
 namespace {
 
-constexpr auto kDefaultProfile = "/etc/sidealsa/profiles/topping-e1x2.toml";
-constexpr auto kDefaultSocket = "/tmp/sidealsad.sock";
 constexpr int kClientRefreshRequiredErrorExitCode = 2;
 constexpr int kAudioRestartTimeoutMs = 30000;
 
@@ -554,8 +552,12 @@ private:
         restartRequired_ = false;
         updateApplyState();
         QProcess process;
-        process.start(helperPath_, {QStringLiteral("show"), QStringLiteral("--profile"), profilePath_,
-                                    QStringLiteral("--socket"), socketPath_});
+        QStringList arguments = {QStringLiteral("show")};
+        if (!profilePath_.isEmpty())
+            arguments << QStringLiteral("--profile") << profilePath_;
+        if (!socketPath_.isEmpty())
+            arguments << QStringLiteral("--socket") << socketPath_;
+        process.start(helperPath_, arguments);
         if (!process.waitForStarted(2000) || !process.waitForFinished(4000)
             || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
             const QString error = QString::fromUtf8(process.readAllStandardError()).trimmed();
@@ -569,11 +571,17 @@ private:
 
         const QHash<QString, QString> values = parseSettings(process.readAllStandardOutput());
         revision_ = values.value(QStringLiteral("revision"));
-        if (revision_.isEmpty()) {
+        const QString resolvedProfile = values.value(QStringLiteral("profile_path"));
+        const QString resolvedSocket = values.value(QStringLiteral("socket_path"));
+        if (revision_.isEmpty() || resolvedProfile.isEmpty() || resolvedSocket.isEmpty()) {
             setStatus(QStringLiteral("Invalid helper output"), "error");
+            detailLabel_->setText(QStringLiteral("The helper did not return a revision and resolved profile/socket paths. Install the matching sidealsa-admin helper."));
             updateApplyState();
             return false;
         }
+        profilePath_ = resolvedProfile;
+        socketPath_ = resolvedSocket;
+        detailLabel_->setToolTip(QStringLiteral("Profile: %1\nSocket: %2").arg(profilePath_, socketPath_));
         loadingWidgets_ = true;
         const bool widgetsLoaded = loadWidgets(values);
         loadingWidgets_ = false;
@@ -936,9 +944,9 @@ int main(int argc, char **argv)
     parser.addHelpOption();
     parser.addVersionOption();
     QCommandLineOption profileOption(QStringLiteral("profile"), QStringLiteral("Installed profile path"),
-                                     QStringLiteral("path"), QString::fromUtf8(kDefaultProfile));
+                                     QStringLiteral("path"));
     QCommandLineOption socketOption(QStringLiteral("socket"), QStringLiteral("Daemon socket path"),
-                                    QStringLiteral("path"), QString::fromUtf8(kDefaultSocket));
+                                    QStringLiteral("path"));
     parser.addOption(profileOption);
     parser.addOption(socketOption);
     parser.process(application);

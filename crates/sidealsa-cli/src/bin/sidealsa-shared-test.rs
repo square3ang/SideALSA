@@ -5,7 +5,7 @@ use sidealsa_client::{SideAlsaClient, StreamMode};
 #[derive(Debug)]
 struct Args {
     socket: PathBuf,
-    port: String,
+    port: Option<String>,
     periods: u64,
     delay_ms: u64,
     delay_every: u64,
@@ -27,8 +27,23 @@ fn main() {
 }
 
 fn run(args: Args) -> Result<(), Box<dyn Error>> {
-    let client = SideAlsaClient::connect(&args.socket)?;
-    let mut stream = client.open_shared(args.port.clone())?;
+    let mut client = SideAlsaClient::connect(&args.socket)?;
+    let device = client.get_info()?;
+    if device.rate == 0 || args.tone_hz > device.rate / 2 {
+        return Err("invalid device rate or tone above Nyquist frequency".into());
+    }
+    let port = args
+        .port
+        .clone()
+        .or_else(|| {
+            device
+                .playback_ports
+                .first()
+                .or_else(|| device.capture_ports.first())
+                .map(|port| port.id.clone())
+        })
+        .ok_or("profile has no SHARED ports")?;
+    let mut stream = client.open_shared(port.clone())?;
     let direction = stream.mode();
     stream.start()?;
 
@@ -52,6 +67,7 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
                         info.period_frames,
                         info.playback_channels,
                         args.tone_hz,
+                        device.rate,
                         &mut phase,
                     );
                 }
@@ -75,6 +91,8 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
     stream.close()?;
 
     println!("direction={direction:?}");
+    println!("port={port}");
+    println!("rate={}", device.rate);
     println!("periods_requested={}", args.periods);
     println!("playback_blocks_published={published}");
     println!("playback_publish_failures={publish_failures}");
@@ -107,10 +125,17 @@ fn sample_count(info: sidealsa_protocol::SharedRegionInfo) -> Result<usize, Box<
     .map_err(|_| "shared sample count does not fit usize".into())
 }
 
-fn fill_tone(samples: &mut [i32], frames: u32, channels: u32, frequency: u32, phase: &mut f64) {
+fn fill_tone(
+    samples: &mut [i32],
+    frames: u32,
+    channels: u32,
+    frequency: u32,
+    rate: u32,
+    phase: &mut f64,
+) {
     let frames = usize::try_from(frames).unwrap_or(0);
     let channels = usize::try_from(channels).unwrap_or(0);
-    let increment = std::f64::consts::TAU * f64::from(frequency) / 48_000.0;
+    let increment = std::f64::consts::TAU * f64::from(frequency) / f64::from(rate);
     let amplitude = f64::from(i32::MAX) * 0.1;
     for frame in 0..frames {
         let value = (*phase).sin() * amplitude;
@@ -133,7 +158,7 @@ fn maybe_delay(args: &Args, sequence: u64) {
 fn parse_args() -> Result<Args, String> {
     let mut arguments = std::env::args_os().skip(1);
     let mut socket = PathBuf::from("/tmp/sidealsad.sock");
-    let mut port = String::from("line1");
+    let mut port = None;
     let mut periods = 3000;
     let mut delay_ms = 0;
     let mut delay_every = 16;
@@ -142,7 +167,7 @@ fn parse_args() -> Result<Args, String> {
     while let Some(argument) = arguments.next() {
         match argument.to_str() {
             Some("--socket") => socket = PathBuf::from(next_value(&mut arguments, "--socket")?),
-            Some("--port") => port = next_string(&mut arguments, "--port")?,
+            Some("--port") => port = Some(next_string(&mut arguments, "--port")?),
             Some("--periods") => periods = parse_value(&mut arguments, "--periods")?,
             Some("--delay-ms") => delay_ms = parse_value(&mut arguments, "--delay-ms")?,
             Some("--delay-every") => delay_every = parse_value(&mut arguments, "--delay-every")?,
@@ -210,6 +235,22 @@ fn print_help() {
         "sidealsa-shared-test [--socket PATH] [--port ID] [--periods COUNT] [--delay-ms MS] [--delay-every COUNT] [--tone-hz HZ]"
     );
     println!("default socket: /tmp/sidealsad.sock");
-    println!("default port: line1");
+    println!("default port: first profile playback port, otherwise first capture port");
     println!("default periods: 3000");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn tone_uses_the_negotiated_device_rate() {
+        for rate in [44100, 48000, 96000] {
+            let mut samples = [0; 4];
+            let mut phase = 0.0;
+            super::fill_tone(&mut samples, 2, 2, 1000, rate, &mut phase);
+            let increment = std::f64::consts::TAU * 1000.0 / f64::from(rate);
+            let expected = (increment.sin() * f64::from(i32::MAX) * 0.1) as i32;
+            assert_eq!(samples, [0, 0, expected, expected]);
+            assert!((phase - 2.0 * increment).abs() < f64::EPSILON);
+        }
+    }
 }

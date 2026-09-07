@@ -27,8 +27,8 @@ pcm.sidealsa_line1 {
 }
 ```
 
-`configs/asound.sidealsa.conf` contains the current profile's PRO, playback,
-and capture examples.
+`sidealsa-config-gen` produces PRO and SHARED PCM definitions from the selected
+profile. The port names above are reference examples, not required identifiers.
 
 ## Build
 
@@ -38,11 +38,14 @@ cargo build -p sidealsa-alsa
 
 The plugin is written to `target/debug/libasound_module_pcm_sidealsa.so`.
 
-For local testing, point ALSA at the build output and example configuration:
+For local testing, generate configuration and point ALSA at the build output:
 
 ```text
-ALSA_PLUGIN_DIR="$PWD/target/debug" \
-ALSA_CONFIG_PATH="$PWD/configs/asound.sidealsa.conf"
+cargo run -p sidealsa-config --bin sidealsa-config-gen -- \
+  --profile profiles/topping-e1x2.toml --socket /tmp/sidealsad.sock \
+  --output-dir target/generated
+export ALSA_PLUGIN_DIR="$PWD/target/debug"
+export ALSA_CONFIG_PATH="$PWD/target/generated/asound.sidealsa.conf"
 ```
 
 ## Verification

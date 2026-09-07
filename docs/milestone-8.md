@@ -5,8 +5,8 @@
 PipeWire uses the existing ALSA ioplug. No PipeWire client or custom graph code
 was added.
 
-`configs/pipewire/pipewire.conf.d/sidealsa.conf` creates PipeWire adapter
-objects for the profile's shared playback and capture PCMs:
+`sidealsa-config-gen` creates PipeWire adapter objects for the selected profile's
+shared playback and capture PCMs. For the reference profile these include:
 
 ```text
 api.alsa.pcm.sink   -> sidealsa_line1 .. sidealsa_line4
@@ -14,7 +14,7 @@ api.alsa.pcm.source -> sidealsa_mic1 .. sidealsa_input910
 ```
 
 The PipeWire process must be able to resolve those names through
-`configs/asound.sidealsa.conf`, either by setting `ALSA_CONFIG_PATH` or by
+the generated `asound.sidealsa.conf`, either by setting `ALSA_CONFIG_PATH` or by
 installing the ALSA definitions in the normal ALSA configuration path. The
 plugin directory must likewise be installed or exposed through
 `ALSA_PLUGIN_DIR`.
@@ -62,13 +62,17 @@ restart; automatic ioplug reconnection is not implemented yet.
 
 ## Local Test
 
-Use the project config directory as `XDG_CONFIG_HOME` for a temporary session:
+Generate the selected profile's fragments for a separate temporary session.
+Do not start a second PipeWire instance on the normal runtime socket:
 
 ```text
-XDG_CONFIG_HOME="$PWD/configs" \
-ALSA_PLUGIN_DIR="$PWD/target/debug" \
-ALSA_CONFIG_PATH="$PWD/configs/asound.sidealsa.conf" \
-pipewire
+cargo run -p sidealsa-config --bin sidealsa-config-gen -- \
+  --profile profiles/topping-e1x2.toml --socket /tmp/sidealsad.sock \
+  --output-dir target/generated
+# Install generated pipewire.conf in the temporary session's pipewire.conf.d,
+# and use these environment settings with that isolated session:
+export ALSA_PLUGIN_DIR="$PWD/target/debug"
+export ALSA_CONFIG_PATH="$PWD/target/generated/asound.sidealsa.conf"
 ```
 
 Then inspect nodes with `pw-cli list-objects Node`. Raw test streams can target

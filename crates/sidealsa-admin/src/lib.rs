@@ -17,8 +17,7 @@ use sidealsa_config::{Profile, ProfileDocument, ProfileError, TimingSettings};
 use sidealsa_protocol::DeviceInfo;
 use thiserror::Error;
 
-pub const DEFAULT_PROFILE_PATH: &str = "/etc/sidealsa/profiles/topping-e1x2.toml";
-pub const DEFAULT_SOCKET_PATH: &str = "/tmp/sidealsad.sock";
+pub use sidealsa_config::selection::{DEFAULT_SOCKET_PATH, LEGACY_PROFILE_PATH};
 pub const PROFILE_ROOT: &str = "/etc/sidealsa/profiles";
 pub const APPLY_LOCK_PATH: &str = "/run/sidealsa-admin.lock";
 const SERVICE_NAME: &str = "sidealsad.service";
@@ -162,34 +161,8 @@ impl Drop for ApplyLock {
 }
 
 pub fn validate_managed_profile_path(path: &Path) -> Result<(), AdminError> {
-    if !path.is_absolute() || path.parent() != Some(Path::new(PROFILE_ROOT)) {
-        return Err(AdminError::InvalidArgument(format!(
-            "profile must be a direct child of {PROFILE_ROOT}"
-        )));
-    }
-    if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
-        return Err(AdminError::InvalidArgument(
-            "profile must have a .toml extension".into(),
-        ));
-    }
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(AdminError::InvalidArgument(
-            "profile must be a regular file, not a symlink".into(),
-        ));
-    }
-    if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-        return Err(AdminError::InvalidArgument(
-            "profile must be root-owned and not group/world-writable".into(),
-        ));
-    }
-    let parent_metadata = fs::metadata(PROFILE_ROOT)?;
-    if parent_metadata.uid() != 0 || parent_metadata.mode() & 0o022 != 0 {
-        return Err(AdminError::InvalidArgument(
-            "profile directory must be root-owned and not group/world-writable".into(),
-        ));
-    }
-    Ok(())
+    sidealsa_config::selection::validate_installed_profile(path)
+        .map_err(|error| AdminError::InvalidArgument(error.to_string()))
 }
 
 pub fn read_snapshot(path: impl AsRef<Path>) -> Result<ProfileSnapshot, AdminError> {
@@ -206,9 +179,14 @@ pub fn render_snapshot(
     socket: impl AsRef<Path>,
 ) -> Result<String, AdminError> {
     let path = path.as_ref();
+    let socket = socket.as_ref();
+    let profile_path = snapshot_path(path)?;
+    let socket_path = snapshot_path(socket)?;
     let text = fs::read_to_string(path)?;
     let document = ProfileDocument::from_toml(&text)?;
     let mut output = String::new();
+    push_setting(&mut output, "profile_path", profile_path);
+    push_setting(&mut output, "socket_path", socket_path);
     push_setting(&mut output, "revision", &profile_revision(&text));
     push_timing(&mut output, &document.timing());
 
@@ -597,6 +575,16 @@ fn push_timing(output: &mut String, timing: &TimingSettings) {
     );
 }
 
+fn snapshot_path(path: &Path) -> Result<&str, AdminError> {
+    path.to_str()
+        .filter(|value| !value.chars().any(char::is_control))
+        .ok_or_else(|| {
+            AdminError::InvalidArgument(
+                "snapshot paths must be UTF-8 without control characters".into(),
+            )
+        })
+}
+
 fn push_setting(output: &mut String, key: &str, setting: &str) {
     output.push_str(key);
     output.push('=');
@@ -660,6 +648,22 @@ mod tests {
 
     const PROFILE: &str = include_str!("../../../profiles/topping-e1x2.toml");
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn snapshot_includes_paths_and_rejects_control_characters() {
+        let directory = test_directory();
+        let profile = directory.join("profile with spaces.toml");
+        let socket = directory.join("missing.sock");
+        fs::write(&profile, PROFILE).unwrap();
+        let output = render_snapshot(&profile, &socket).unwrap();
+        assert!(output.contains(&format!("profile_path={}\n", profile.display())));
+        assert!(output.contains(&format!("socket_path={}\n", socket.display())));
+        for invalid in ["/tmp/a\nb", "/tmp/a\rb", "/tmp/a\tb", "/tmp/a\u{7f}"] {
+            assert!(render_snapshot(&profile, invalid).is_err());
+            assert!(render_snapshot(invalid, &socket).is_err());
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     struct FakeRuntime {
         restart_count: usize,

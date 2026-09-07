@@ -13,7 +13,7 @@ appends actual silence for a verified target before clients start. It was not
 retained as a default after a later runtime shift invalidated the startup target.
 
 The adapter expects the daemon profile to expose a `64`-frame logical period.
-The reference E1x2 profile uses P32 physical ALSA periods and keeps
+The reference E1x2 profile uses P64 physical ALSA periods and keeps
 `buffer_size = 256`. Linked startup primes the playback ring with silence before
 starting playback and capture together. Capacity is B256; the queued startup
 audio begins with Q128; optional normalization may append up to Q64 of additional silence.
@@ -26,7 +26,7 @@ latency.
 PRO duplex clients use a zero-lead pipeline. Hardware capture sequence N is
 published as playback target N while SHARED capture retains hardware sequence
 N. ALSA playback and capture poll readiness jointly start each whole-Q64 cycle
-with `avail_min = 64` despite the P32 transport, and the
+with `avail_min = 64` matching the P64 transport, and the
 playback-ready eventfd ends the client wait early. The profile's 1.0 ms handoff
 deadline is dynamically shortened to retain a fixed playback write reserve.
 The reference mode does not use live-delay budgeting, a linked playback guard,
@@ -175,7 +175,7 @@ hardware/phase isolation from a fully clean client-scheduling pass.
 
 ASIO begins with the first playback-clock target and publishes playback under
 that exact sequence. The E1x2 profile keeps zero process-ahead blocks. It uses a
-P32 transport with whole-Q64 transfers, a Q128 playback queue, and a 1.0 ms
+P64 transport with whole-Q64 transfers, a Q128 playback queue, and a 1.0 ms
 event-driven client deadline. It consumes only the exact shared-memory sequence. When
 absent, the daemon repeats the last valid PRO period and resumes with the next
 exact sequence.

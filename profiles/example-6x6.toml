@@ -1,0 +1,65 @@
+# Example only, not a measured device preset. Replace the ALSA card identifier
+# and validate the physical capabilities/timing before starting the engine.
+[device]
+name = "Generic 6-in / 6-out example"
+rate = 44100
+period_size = 64
+hardware_period_size = 64
+buffer_size = 256
+shared_buffer_size = 512
+duplex_link = false
+pro_latency_periods = 1
+shared_latency_periods = 5
+
+[device.playback]
+device = "hw:YOUR_INTERFACE,0"
+channels = 6
+format = "S32_LE"
+
+[device.capture]
+device = "hw:YOUR_INTERFACE,0"
+channels = 6
+format = "S32_LE"
+
+# Frame-based desktop policy is independent of hardware period/rate negotiation.
+[integration.pipewire]
+playback_headroom_frames = 64
+capture_headroom_frames = 0
+playback_start_delay_frames = 128
+
+[[ports.playback]]
+id = "monitor"
+name = "Monitor"
+channels = [0, 1]
+positions = ["FL", "FR"]
+
+[[ports.playback]]
+id = "phones"
+name = "Headphones"
+channels = [2, 3]
+
+[[ports.playback]]
+id = "cue-a"
+name = "Cue A"
+channels = [4]
+
+[[ports.playback]]
+id = "cue-b"
+name = "Cue B"
+channels = [5]
+
+[[ports.capture]]
+id = "mic"
+name = "Microphone"
+channels = [0]
+
+[[ports.capture]]
+id = "instrument"
+name = "Instrument"
+channels = [1]
+
+[[ports.capture]]
+id = "digital"
+name = "Discrete Inputs"
+channels = [2, 3, 4, 5]
+positions = ["AUX0", "AUX1", "AUX2", "AUX3"]

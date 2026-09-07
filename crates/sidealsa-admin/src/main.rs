@@ -1,10 +1,11 @@
 use std::{env, path::PathBuf, process::ExitCode, time::Duration};
 
 use sidealsa_admin::{
-    APPLY_LOCK_PATH, AdminError, ApplyLock, ApplyOutcome, DEFAULT_PROFILE_PATH,
-    DEFAULT_SOCKET_PATH, SystemdRuntime, apply_transaction, parse_timing_assignments,
-    read_snapshot, render_snapshot, validate_managed_profile_path,
+    APPLY_LOCK_PATH, AdminError, ApplyLock, ApplyOutcome, DEFAULT_SOCKET_PATH, LEGACY_PROFILE_PATH,
+    SystemdRuntime, apply_transaction, parse_timing_assignments, read_snapshot, render_snapshot,
+    validate_managed_profile_path,
 };
+use sidealsa_config::selection::{InstalledSelection, installed_selection};
 
 const CLIENT_REFRESH_REQUIRED_ERROR_EXIT_CODE: u8 = 2;
 
@@ -82,7 +83,28 @@ fn run() -> Result<(), AdminError> {
 }
 
 fn parse_args() -> Result<Args, AdminError> {
-    let mut arguments = env::args().skip(1);
+    parse_args_from(
+        env::args().skip(1),
+        || Ok(installed_selection()?),
+        || {
+            // Only pre-selection installations may use this concrete legacy profile.
+            match std::fs::symlink_metadata(LEGACY_PROFILE_PATH) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error.into()),
+                Ok(_) => {
+                    validate_managed_profile_path(std::path::Path::new(LEGACY_PROFILE_PATH))?;
+                    Ok(true)
+                }
+            }
+        },
+    )
+}
+
+fn parse_args_from(
+    mut arguments: impl Iterator<Item = String>,
+    selection: impl FnOnce() -> Result<Option<InstalledSelection>, AdminError>,
+    legacy_exists: impl FnOnce() -> Result<bool, AdminError>,
+) -> Result<Args, AdminError> {
     let command = match arguments.next().as_deref() {
         Some("show") => Command::Show,
         Some("apply") => Command::Apply,
@@ -102,17 +124,17 @@ fn parse_args() -> Result<Args, AdminError> {
         }
     };
 
-    let mut profile = PathBuf::from(DEFAULT_PROFILE_PATH);
-    let mut socket = PathBuf::from(DEFAULT_SOCKET_PATH);
+    let mut profile = None;
+    let mut socket = None;
     let mut expected_revision = None;
     let mut assignments = Vec::new();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--profile" => {
-                profile = PathBuf::from(next_value(&mut arguments, "--profile")?);
+                profile = Some(PathBuf::from(next_value(&mut arguments, "--profile")?));
             }
             "--socket" => {
-                socket = PathBuf::from(next_value(&mut arguments, "--socket")?);
+                socket = Some(PathBuf::from(next_value(&mut arguments, "--socket")?));
             }
             "--expected-revision" => {
                 expected_revision = Some(next_value(&mut arguments, "--expected-revision")?);
@@ -129,6 +151,22 @@ fn parse_args() -> Result<Args, AdminError> {
             }
         }
     }
+    if (profile.is_none() || socket.is_none())
+        && let Some(selected) = selection()?
+    {
+        profile.get_or_insert(selected.profile);
+        socket.get_or_insert(selected.socket);
+    }
+    let profile = match profile {
+        Some(profile) => profile,
+        None if legacy_exists()? => PathBuf::from(LEGACY_PROFILE_PATH),
+        None => {
+            return Err(AdminError::InvalidArgument(
+                "no installed selection or legacy profile; use --profile PATH".into(),
+            ));
+        }
+    };
+    let socket = socket.unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET_PATH));
     if !socket.is_absolute() {
         return Err(AdminError::InvalidArgument(
             "socket path must be absolute".into(),
@@ -153,6 +191,9 @@ fn next_value(
 }
 
 fn print_help() {
+    println!(
+        "Defaults: trusted /etc/sidealsa/active.toml; legacy profile only if installed; otherwise use --profile PATH."
+    );
     println!("sidealsa-admin show [--profile PATH] [--socket PATH]");
     println!(
         "sidealsa-admin apply --expected-revision HASH [--profile PATH] [--socket PATH] key=value ..."
@@ -162,6 +203,89 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_precedence_and_absence() {
+        for (flags, selected, legacy, expected) in [
+            (
+                vec!["show"],
+                true,
+                false,
+                Some(("/selected.toml", "/selected.sock")),
+            ),
+            (
+                vec!["show", "--profile", "/explicit.toml"],
+                true,
+                false,
+                Some(("/explicit.toml", "/selected.sock")),
+            ),
+            (
+                vec!["show", "--socket", "/explicit.sock"],
+                true,
+                false,
+                Some(("/selected.toml", "/explicit.sock")),
+            ),
+            (
+                vec!["show", "--profile", "/explicit.toml"],
+                false,
+                false,
+                Some(("/explicit.toml", DEFAULT_SOCKET_PATH)),
+            ),
+            (
+                vec!["show"],
+                false,
+                true,
+                Some((LEGACY_PROFILE_PATH, DEFAULT_SOCKET_PATH)),
+            ),
+            (vec!["show"], false, false, None),
+        ] {
+            let result = parse_args_from(
+                flags.into_iter().map(String::from),
+                || {
+                    Ok(selected.then(|| InstalledSelection {
+                        profile: "/selected.toml".into(),
+                        socket: "/selected.sock".into(),
+                    }))
+                },
+                || Ok(legacy),
+            );
+            if let Some((profile, socket)) = expected {
+                let args = result.unwrap();
+                assert_eq!(args.profile, PathBuf::from(profile));
+                assert_eq!(args.socket, PathBuf::from(socket));
+            } else {
+                assert!(result.err().unwrap().to_string().contains("use --profile"));
+            }
+        }
+        parse_args_from(
+            [
+                "show",
+                "--profile",
+                "/explicit.toml",
+                "--socket",
+                "/explicit.sock",
+            ]
+            .into_iter()
+            .map(String::from),
+            || panic!("selection must not be read"),
+            || panic!("legacy must not be checked"),
+        )
+        .unwrap();
+        let error = parse_args_from(
+            ["show", "--profile", "/explicit.toml"]
+                .into_iter()
+                .map(String::from),
+            || Err(AdminError::InvalidArgument("untrusted selection".into())),
+            || panic!("must not fall back"),
+        );
+        assert!(
+            error
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("untrusted selection")
+        );
+    }
 
     #[test]
     fn client_refresh_errors_have_distinct_exit_code() {

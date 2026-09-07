@@ -14,7 +14,8 @@ PipeWire, and build paths retain that user's environment.
 Installer defaults:
 
 - binaries: `/usr/local/bin`
-- root-owned profile: `/etc/sidealsa/profiles/topping-e1x2.toml`
+- root-owned profile: `/etc/sidealsa/profiles/<selected-profile>.toml`
+- active profile/socket selection: `/etc/sidealsa/active.toml`
 - ALSA definitions: `/etc/alsa/conf.d/99-sidealsa.conf`
 - PipeWire objects: `/etc/pipewire/pipewire.conf.d/99-sidealsa.conf`
 - PipeWire Pulse scheduling: `/etc/pipewire/pipewire-pulse.conf.d/99-sidealsa.conf`
@@ -29,6 +30,8 @@ Installer defaults:
 
 The profile is seeded only on first install. Reinstalling or upgrading never
 overwrites it, including when `--force` is used. Uninstall also preserves it.
+Fresh installations use the E1x2 reference seed unless `--profile` is supplied.
+Subsequent installs reuse the active selection instead of switching devices.
 Profile defaults therefore do not migrate an existing installation. Review the
 profile diff first, then explicitly install the repository version when wanted.
 Profiles created before the USB IRQ-order fix retain their saved priorities;
@@ -36,14 +39,15 @@ set `realtime_priority = 48` and `pro_realtime_priority = 46`, or replace an
 otherwise unmodified profile:
 
 ```text
-scripts/install.sh --replace-profile
+scripts/install.sh --profile profiles/topping-e1x2.toml --replace-profile
 ```
 
-The current reference uses `hardware_period_size = 32` with logical Q64
-transfers. Existing P64 profiles remain unchanged on upgrade. After installing
-the engine with divided-period direct-mode support, explicitly edit that field
-or use `--replace-profile` to adopt the new reference. This changes transport
-batching, not the ASIO buffer size or the Q128 startup reserve.
+The current reference uses `hardware_period_size = 64` with logical Q64
+transfers, selected for improved stability after the fixes. Existing P32 profiles
+remain unchanged on upgrade, and explicit P32 remains supported. Adopting P64
+changes the physical period, not the ASIO buffer size or the Q128 startup reserve.
+When `hardware_period_size` is omitted, it inherits the logical `period_size`;
+64 is a reference-profile choice, not a generic engine default.
 
 Optional [digital loopback startup normalization](startup-loopback.md) was
 tested at 376 frames but is disabled in the reference after a later runtime
@@ -56,6 +60,12 @@ Use `--preserve-pipewire` when updating SideALSA binaries or profiles without
 rewriting the installed PipeWire adapter files or restarting the user PipeWire
 services. This mode requires the three adapter files to be present in the
 existing SideALSA install manifest and retains their previous ownership hashes.
+It also requires a verified `/etc/sidealsa/integration-profile.toml`, the snapshot
+used to generate the existing adapters. Topology changes are rejected even if
+the selected profile was edited in place. Legacy installs without that snapshot
+must first regenerate adapters without `--preserve-pipewire`; review custom
+configuration and back it up before that migration. `--replace-profile` now
+requires an explicit `--profile` rather than silently reinstalling the selected file.
 
 The reference profile enables
 `shared_playback_repeat_on_underrun = true`. Existing profiles that omit it
@@ -64,14 +74,20 @@ a checkbox. When enabled, a SHARED playback port repeats its last valid logical
 period until exact-sequence playback resumes; a long outage can therefore
 produce a repeating tone.
 
-The installed ALSA and PipeWire adapter fragments are currently static for the
-reference E1x2 port IDs (`line1` through `line4`, `mic1`, `mic2`, and
-`input34` through `input910`). The installer rejects a custom profile missing
-any of those IDs instead of installing adapters that cannot open their ports.
-Automatic adapter generation for arbitrary validated profiles is not yet
-implemented.
+The installer uses `sidealsa-config-gen` to generate ALSA definitions and
+PipeWire objects for every declared logical port. It renders from the destination
+profile when that file is preserved, otherwise from the selected seed. Validation
+and rendering finish before installed files are changed. No Topping port names
+are required. Channel positions and desktop frame policies are described in
+[Device Profiles](device-profiles.md).
 
-The E1x2 PRO pipeline uses Q64 client blocks and P32 physical ALSA periods with a
+Service and desktop launchers receive explicit selected paths. Bare daemon,
+admin and GUI commands use the trusted active selection. The pre-selection
+E1x2 installed path is a compatibility fallback only when it exists and passes
+security checks; otherwise supply an explicit profile. Development daemon runs
+should use `--profile profiles/<name>.toml`.
+
+The E1x2 PRO pipeline uses Q64 client blocks and P64 physical ALSA periods with a
 B256 hardware ring. `pro_latency_periods = 0`, timer scheduling is disabled, and
 `linked_phase_max_attempts = 0`. Linked startup primes the ALSA playback ring
 with a Q128 base of silence selected by `playback_queue_periods = 2` and starts

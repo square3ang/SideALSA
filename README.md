@@ -30,13 +30,14 @@ device to native, ALSA, PipeWire, Qt, and Wine clients.
 | Exclusive PRO shared-memory client | Implemented |
 | Buffered SHARED logical ports | Implemented |
 | ALSA external ioplug | Implemented, S32_LE/RW-interleaved only |
-| PipeWire integration through the ALSA ioplug | Implemented with static reference-port configuration |
+| PipeWire integration through the ALSA ioplug | Profile-generated ALSA PCMs and PipeWire adapters |
 | Qt 6 control panel and privileged profile helper | Implemented |
 | x86_64 Wine/Proton ASIO frontend | Experimental |
 
 The Topping E1x2 OTG is the first and currently the only fully exercised
-reference device. The core is profile-driven, but installation-time ALSA and
-PipeWire adapter generation for arbitrary profiles is not implemented yet.
+reference device. ALSA and PipeWire integration is generated from the selected
+profile rather than a fixed E1x2 port list. See [Device Profiles](docs/device-profiles.md)
+and the unmeasured [6-in/6-out example](profiles/example-6x6.toml).
 
 This is pre-release software. Do not treat successful startup or zero XRUN
 counters as proof of fixed end-to-end analog latency; see
@@ -90,22 +91,22 @@ generation when the stream must be rebased.
 | Sample format and rate | S32_LE, 48 kHz |
 | Physical channels | 8 playback, 10 capture |
 | Native protocol and PRO ALSA period | 64 frames |
-| Physical ALSA period | 32 frames |
+| Physical ALSA period | 64 frames |
 | Physical ALSA buffer | 256 frames |
 | Direct PRO startup queue | 128 frames |
 | Independent SHARED ring | 512 frames |
 | SHARED ALSA/PipeWire period | 256 frames |
-| SHARED ALSA buffer | 768 playback, 512 capture frames |
+| SHARED ALSA buffer | 768 playback, 1024 capture frames |
 | PRO software output latency reported to clients | 64 frames |
-| SHARED playback lookahead | 7 internal Q64 periods, 448 frames |
+| SHARED playback lookahead | 5 internal Q64 periods, 320 frames |
 
 The reported PRO latency does not include USB transport, device firmware,
 converters, or analog loopback delay.
 
 The reference PRO loop primes the linked ALSA ring, then lets capture
-and playback poll readiness jointly drive each whole-Q64 transfer over P32
-transport. Both directions use `avail_min = 64`; the smaller physical period
-reduces USB batching without changing the PRO callback size. The B256 ring is
+and playback poll readiness jointly drive each whole-Q64 transfer over P64
+transport. Both directions use `avail_min = 64`; the physical period matches
+the unchanged PRO callback size. The B256 ring is
 capacity; Q128 is the base prime. Optional
 [startup normalization](docs/startup-loopback.md) can align the configured
 digital return at startup, but is disabled in the reference because later
@@ -208,7 +209,7 @@ Common variants:
 ./scripts/install.sh --no-pipewire
 
 # Deliberately replace the existing installed profile
-./scripts/install.sh --replace-profile
+./scripts/install.sh --profile profiles/topping-e1x2.toml --replace-profile
 ```
 
 An existing installed profile is preserved by default, including during an
@@ -526,15 +527,16 @@ load.
 ## Known Limitations
 
 - The E1x2 OTG is the only fully exercised device profile.
-- The installed ALSA and PipeWire objects are static for the reference port IDs.
+- Topology/presentation changes require regenerating integration files and
+  reconnecting clients; profile support is not automatic device discovery.
 - Every SHARED port has one backend owner; multi-application desktop mixing
   occurs in PipeWire rather than inside SideALSA.
 - The ALSA ioplug supports S32_LE, RW-interleaved access, and the profile sample
   rate. It does not provide mmap, resampling, or format conversion.
 - ALSA `sidealsa_pro` does not currently provide a conventional two-handle
   full-duplex open because the second handle encounters exclusive PRO ownership.
-- PipeWire integration uses static ALSA adapters. There is no custom PipeWire
-  client, automatic node generation, or automatic reconnection after a daemon
+- PipeWire integration uses profile-generated ALSA adapters. There is no custom PipeWire
+  client, runtime hotplug integration, or automatic reconnection after a daemon
   restart.
 - The ASIO frontend is x86_64-only and experimental; non-reference stream
   geometry has not received acceptance coverage.
@@ -560,6 +562,7 @@ and test conditions.
 - [Installation and lifecycle](docs/installation.md)
 - [Direct ALSA engine](docs/milestone-1.md)
 - [Profiles and channel splitting](docs/milestone-2.md)
+- [Device profiles and generated integration](docs/device-profiles.md)
 - [Local PRO path](docs/milestone-3.md)
 - [Daemon and protocol](docs/milestone-4.md)
 - [SHARED path](docs/milestone-5.md)

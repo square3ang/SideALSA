@@ -4,6 +4,10 @@ use serde::Deserialize;
 use thiserror::Error;
 use toml_edit::{DocumentMut, Item, Table, value};
 
+pub mod integration;
+pub mod selection;
+pub use integration::{IntegrationConfig, PipeWireConfig};
+
 pub const MAX_PRO_LATENCY_PERIODS: u32 = 7;
 pub const MAX_SHARED_LATENCY_PERIODS: u32 = 7;
 pub const MAX_SHARED_BUFFER_PERIODS: u32 = 8;
@@ -18,6 +22,8 @@ pub const DIRECT_WRITE_RESERVE_DIVISOR: u32 = 4;
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     pub device: HardwareConfig,
+    #[serde(default)]
+    pub integration: IntegrationConfig,
     #[serde(default)]
     pub ports: PortsConfig,
 }
@@ -121,6 +127,8 @@ pub struct PortConfig {
     pub id: String,
     pub name: String,
     pub channels: Vec<u32>,
+    #[serde(default)]
+    pub positions: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -155,6 +163,7 @@ impl Profile {
 
     pub fn validate(&self) -> Result<(), ProfileError> {
         self.device.validate()?;
+        self.integration.pipewire.validate()?;
 
         let mut ids = HashSet::new();
         validate_ports(
@@ -186,6 +195,23 @@ impl Profile {
             hash_u32(&mut hash, loopback.playback_channel);
             hash_u32(&mut hash, loopback.capture_channel);
             hash_u32(&mut hash, loopback.target_frames);
+        }
+        if self.integration != IntegrationConfig::default() {
+            hash_string(&mut hash, "integration.pipewire");
+            let policy = &self.integration.pipewire;
+            hash_u32(&mut hash, policy.playback_headroom_frames);
+            hash_u32(&mut hash, policy.capture_headroom_frames);
+            hash_u32(&mut hash, policy.playback_start_delay_frames);
+        }
+        for port in self.ports.playback.iter().chain(&self.ports.capture) {
+            if let Some(positions) = &port.positions {
+                hash_string(&mut hash, "port.positions");
+                hash_string(&mut hash, &port.id);
+                hash_u64(&mut hash, positions.len() as u64);
+                for position in positions {
+                    hash_string(&mut hash, position);
+                }
+            }
         }
         hash
     }
@@ -811,6 +837,7 @@ fn validate_ports(
 
     for port in ports {
         validate_port_id(&port.id)?;
+        integration::validate_positions(port)?;
         if !ids.insert(port.id.clone()) {
             return Err(ProfileError::Invalid(format!(
                 "duplicate port id '{}'",
@@ -951,14 +978,15 @@ mod tests {
 
         assert_eq!(profile.device.buffer_size, 256);
         assert_eq!(profile.device.period_size, 64);
-        assert_eq!(profile.device.effective_hardware_period_size(), 32);
+        assert_eq!(profile.device.hardware_period_size, Some(64));
+        assert_eq!(profile.device.effective_hardware_period_size(), 64);
         assert_eq!(profile.device.playback_queue_periods, Some(2));
         assert_eq!(profile.device.pro_handoff_us, 1000);
         assert_eq!(profile.device.pro_latency_periods, 0);
         assert!(!profile.device.playback_timer_scheduling);
         assert!(profile.device.uses_event_driven_linked_pro());
         assert_eq!(profile.device.linked_playback_guard_frames, None);
-        assert_eq!(profile.device.effective_linked_playback_guard_frames(), 32);
+        assert_eq!(profile.device.effective_linked_playback_guard_frames(), 64);
         assert!(!profile.device.uses_staged_pro_packets());
         assert_eq!(profile.device.effective_pro_output_latency_frames(), 64);
         assert_eq!(profile.device.linked_phase_max_attempts, 0);
@@ -1044,7 +1072,7 @@ mod tests {
     fn whole_period_link_does_not_report_packet_staging() {
         for physical_period in [32, 64] {
             let text = E1X2_PROFILE.replace(
-                "hardware_period_size = 32",
+                "hardware_period_size = 64",
                 &format!("hardware_period_size = {physical_period}"),
             );
             let profile = Profile::from_toml(&text).expect("whole-period profile should parse");
@@ -1399,8 +1427,9 @@ mod tests {
 
     #[test]
     fn direct_transport_period_does_not_reduce_handoff_reserve() {
-        let text = E1X2_PROFILE;
-        let profile = Profile::from_toml(text).expect("Q64 client with P32 transport should parse");
+        let text = E1X2_PROFILE.replace("hardware_period_size = 64", "hardware_period_size = 32");
+        let profile =
+            Profile::from_toml(&text).expect("Q64 client with P32 transport should parse");
         assert!(profile.device.uses_event_driven_linked_pro());
         assert_eq!(profile.device.period_size, 64);
         assert_eq!(profile.device.effective_hardware_period_size(), 32);

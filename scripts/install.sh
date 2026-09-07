@@ -9,6 +9,8 @@ PREFIX="${PREFIX:-/usr/local}"
 DESTDIR="${DESTDIR:-}"
 PROFILE_SOURCE="$ROOT/profiles/topping-e1x2.toml"
 SOCKET_PATH="${SIDEALSA_SOCKET:-/tmp/sidealsad.sock}"
+PROFILE_EXPLICIT=0
+SOCKET_EXPLICIT="${SIDEALSA_SOCKET_EXPLICIT:-${SIDEALSA_SOCKET+x}}"
 ALSA_PLUGIN_DIR="${ALSA_PLUGIN_DIR:-}"
 NO_BUILD=0
 WITH_ASIO=0
@@ -31,6 +33,7 @@ if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != root \
         PREFIX="$PREFIX" \
         DESTDIR="$DESTDIR" \
         SIDEALSA_SOCKET="$SOCKET_PATH" \
+        SIDEALSA_SOCKET_EXPLICIT="${SOCKET_EXPLICIT:-0}" \
         ALSA_PLUGIN_DIR="$ALSA_PLUGIN_DIR" \
         "$ROOT/scripts/install.sh" "$@"
 fi
@@ -135,7 +138,7 @@ Options:
   --no-build                Use existing target/release artifacts
   --with-asio               Build and install Wine ASIO binaries
   --force                   Replace files not owned by previous install
-  --replace-profile         Replace existing device profile
+  --replace-profile         Replace existing device profile; requires explicit --profile
   --no-start                Enable service without starting it
   --no-pipewire             Skip PipeWire adapter configuration
   --preserve-pipewire       Keep PipeWire files and user services untouched
@@ -144,6 +147,9 @@ Options:
 
 DESTDIR may be set for staged package installation. System services are not
 changed when DESTDIR is non-empty.
+--preserve-pipewire requires a verified integration-profile.toml snapshot from
+a previous install. Legacy installs must first reinstall without this flag to
+regenerate PipeWire configuration and establish the snapshot.
 EOF
 }
 
@@ -157,11 +163,13 @@ while (($# > 0)); do
         --profile)
             (($# >= 2)) || die "--profile requires a path"
             PROFILE_SOURCE=$2
+            PROFILE_EXPLICIT=1
             shift 2
             ;;
         --socket)
             (($# >= 2)) || die "--socket requires a path"
             SOCKET_PATH=$2
+            SOCKET_EXPLICIT=1
             shift 2
             ;;
         --alsa-plugin-dir)
@@ -211,6 +219,8 @@ while (($# > 0)); do
     esac
 done
 
+((REPLACE_PROFILE == 0 || PROFILE_EXPLICIT == 1)) || \
+    die "--replace-profile requires explicit --profile"
 [[ "$PREFIX" == /* ]] || die "prefix must be absolute"
 [[ "$SOCKET_PATH" == /* ]] || die "socket path must be absolute"
 [[ "$DESTDIR" == /* || -z "$DESTDIR" ]] || die "DESTDIR must be absolute"
@@ -222,24 +232,6 @@ if [[ "$DESTDIR" == "/" ]]; then
     DESTDIR=
 fi
 DESTDIR="${DESTDIR%/}"
-
-if [[ "$PROFILE_SOURCE" != /* ]]; then
-    PROFILE_SOURCE="$ROOT/$PROFILE_SOURCE"
-fi
-[[ -f "$PROFILE_SOURCE" ]] || die "profile not found: $PROFILE_SOURCE"
-PROFILE_NAME="$(basename -- "$PROFILE_SOURCE")"
-[[ "$PROFILE_NAME" != "." && "$PROFILE_NAME" != ".." ]] || die "invalid profile name"
-[[ "$PROFILE_NAME" == *.toml ]] || die "profile filename must end in .toml"
-for service_value in "$PREFIX" "$SOCKET_PATH" "$PROFILE_NAME"; do
-    [[ "$service_value" != *[[:space:]]* ]] || \
-        die "systemd service paths must not contain whitespace: $service_value"
-done
-profile_text="$(<"$PROFILE_SOURCE")"
-for adapter_port in line1 line2 line3 line4 mic1 mic2 input34 input56 input78 input910; do
-    [[ "$profile_text" == *"id = \"$adapter_port\""* ]] || \
-        die "profile lacks port '$adapter_port' required by the installed ALSA/PipeWire adapters"
-done
-unset profile_text
 
 USE_SUDO=0
 if [[ -z "$DESTDIR" && "$EUID" -ne 0 ]]; then
@@ -329,6 +321,7 @@ if ((INSTALL_GUI == 1)); then
 fi
 
 BINARIES=(
+    sidealsa-config-gen
     sidealsad
     sidealsa-hw-test
     sidealsa-pro-test
@@ -348,7 +341,113 @@ PIPEWIRE_CONFIG_PATH=/etc/pipewire/pipewire.conf.d/99-sidealsa.conf
 PIPEWIRE_PULSE_CONFIG_PATH=/etc/pipewire/pipewire-pulse.conf.d/99-sidealsa.conf
 WIREPLUMBER_CONFIG_PATH=/etc/wireplumber/wireplumber.conf.d/99-sidealsa.conf
 SERVICE_PATH=/etc/systemd/system/sidealsad.service
-PROFILE_PATH=/etc/sidealsa/profiles/$PROFILE_NAME
+SELECTION_PATH=/etc/sidealsa/active.toml
+INTEGRATION_PROFILE_PATH=/etc/sidealsa/integration-profile.toml
+GENERATOR="$ROOT/target/release/sidealsa-config-gen"
+
+safe_service_path() {
+    local value=$1
+    [[ "$value" == /* && "$value" != *[[:space:]\"\'\\\$\%\`\;\&\(\)\<\>\|\*\?\#\~]* ]] || \
+        die "unsafe systemd/desktop path (absolute path without whitespace or Exec reserved characters required): $value"
+}
+
+managed_profile_path() {
+    local path=$1 name=${1#/etc/sidealsa/profiles/}
+    [[ "$path" == /etc/sidealsa/profiles/* && "$name" != */* \
+        && "$name" == ?*.toml ]] || \
+        die "selected profile must be a direct child of /etc/sidealsa/profiles with a nonempty .toml stem: $path"
+    safe_service_path "$path"
+}
+
+# Check every existing path component without following links. DESTDIR permits
+# fixture ownership, but never links or lexical traversal. Live trust is root-only.
+trusted_installed_path() {
+    local actual="$(destination "$1")" kind=$2 current owner mode
+    [[ "$actual/" != */../* && "$actual/" != */./* ]] || die "installed path contains traversal: $actual"
+    current=$actual
+    while [[ -n "$current" ]]; do
+        [[ ! -L "$current" ]] || die "installed path must not contain symlinks: $current"
+        if [[ -e "$current" ]]; then
+            if [[ "$current" == "$actual" && "$kind" == file ]]; then
+                [[ -f "$current" ]] || die "installed file must be regular: $current"
+            else
+                [[ -d "$current" ]] || die "installed parent must be a directory: $current"
+            fi
+            if [[ -z "$DESTDIR" ]]; then
+                read -r owner mode < <(stat -c '%u %a' -- "$current")
+                [[ "$owner" == 0 ]] && (( (8#$mode & 8#022) == 0 )) || \
+                    die "installed path must be root-owned and not group/world writable: $current"
+            fi
+        fi
+        current=${current%/*}
+    done
+}
+
+trusted_installed_path /etc/sidealsa/profiles directory
+trusted_installed_path "$SELECTION_PATH" file
+trusted_installed_path "$INTEGRATION_PROFILE_PATH" file
+PREVIOUS_PROFILE=
+PREVIOUS_SOCKET=
+if [[ -e "$(destination "$SELECTION_PATH")" ]]; then
+    PREVIOUS_PROFILE="$("$GENERATOR" --selected-profile "$(destination "$SELECTION_PATH")")"
+    PREVIOUS_SOCKET="$("$GENERATOR" --selected-socket "$(destination "$SELECTION_PATH")")"
+elif [[ -e "$(destination "$SERVICE_PATH")" || -L "$(destination "$SERVICE_PATH")" ]]; then
+    trusted_installed_path "$SERVICE_PATH" file
+    # Accept only the old generated command, never evaluate systemd/shell syntax.
+    legacy_pattern='^ExecStart=(/[^[:space:]]+)/bin/sidealsad --profile (/[^[:space:]]+) --socket (/[^[:space:]]+)$'
+    exec_count=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*ExecStart[[:space:]]*= ]]; then
+            exec_count=$((exec_count + 1))
+            if [[ "$line" =~ $legacy_pattern ]]; then
+                PREVIOUS_PROFILE=${BASH_REMATCH[2]}
+                PREVIOUS_SOCKET=${BASH_REMATCH[3]}
+            fi
+        fi
+    done < "$(destination "$SERVICE_PATH")"
+    if ((exec_count != 1)); then
+        PREVIOUS_PROFILE=
+        PREVIOUS_SOCKET=
+    fi
+    if [[ -z "$PREVIOUS_PROFILE" && "$PROFILE_EXPLICIT" -eq 0 ]]; then
+        die "cannot determine legacy service selection; specify --profile explicitly"
+    fi
+fi
+
+if [[ -n "$PREVIOUS_PROFILE" ]]; then
+    managed_profile_path "$PREVIOUS_PROFILE"
+    safe_service_path "$PREVIOUS_SOCKET"
+fi
+if ((PROFILE_EXPLICIT == 0)) && [[ -n "$PREVIOUS_PROFILE" ]]; then
+    PROFILE_PATH=$PREVIOUS_PROFILE
+    PROFILE_SOURCE="$(destination "$PROFILE_PATH")"
+else
+    [[ "$PROFILE_SOURCE" == /* ]] || PROFILE_SOURCE="$ROOT/$PROFILE_SOURCE"
+    PROFILE_PATH="/etc/sidealsa/profiles/$(basename -- "$PROFILE_SOURCE")"
+fi
+if [[ -z "$SOCKET_EXPLICIT" || "$SOCKET_EXPLICIT" == 0 ]] && [[ -n "$PREVIOUS_SOCKET" ]]; then
+    SOCKET_PATH=$PREVIOUS_SOCKET
+fi
+for service_value in "$PREFIX" "$SOCKET_PATH" "$PROFILE_PATH"; do
+    safe_service_path "$service_value"
+done
+managed_profile_path "$PROFILE_PATH"
+PROFILE_ACTUAL="$(destination "$PROFILE_PATH")"
+[[ ! -L "$PROFILE_ACTUAL" ]] || die "installed profile must not be a symlink: $PROFILE_ACTUAL"
+EFFECTIVE_PROFILE=$PROFILE_SOURCE
+if [[ -e "$PROFILE_ACTUAL" && "$REPLACE_PROFILE" -eq 0 ]]; then
+    trusted_installed_path "$PROFILE_PATH" file
+    EFFECTIVE_PROFILE=$PROFILE_ACTUAL
+fi
+[[ -f "$EFFECTIVE_PROFILE" ]] || die "profile not found: $EFFECTIVE_PROFILE"
+TMP_DIR="$(mktemp -d)"
+# Snapshot the exact input that is validated and, if requested, installed.
+cp -- "$EFFECTIVE_PROFILE" "$TMP_DIR/profile.toml"
+generator_args=(--profile "$TMP_DIR/profile.toml" --socket "$SOCKET_PATH"
+    --output-dir "$TMP_DIR" --installed-profile "$PROFILE_PATH")
+if ((INSTALL_PIPEWIRE == 0)); then
+    generator_args+=(--alsa-only)
+fi
 LICENSE_PATH="$PREFIX/share/sidealsa/LICENSE"
 DOC_PREFIX="$PREFIX/share/doc/sidealsa"
 MANIFEST_PATH="$PREFIX/share/sidealsa/install-manifest"
@@ -362,6 +461,7 @@ if ((INSTALL_PIPEWIRE == 0)); then
         "$PIPEWIRE_CONFIG_PATH"
         "$PIPEWIRE_PULSE_CONFIG_PATH"
         "$WIREPLUMBER_CONFIG_PATH"
+        "$INTEGRATION_PROFILE_PATH"
     )
 fi
 if ((WITH_ASIO == 0)); then
@@ -390,16 +490,19 @@ MANAGED_PATHS+=(
     "$ALSA_PLUGIN_DIR/libasound_module_pcm_sidealsa.so"
     "$ALSA_CONFIG_PATH"
     "$SERVICE_PATH"
+    "$SELECTION_PATH"
     "$LICENSE_PATH"
 )
 if ((INSTALL_PIPEWIRE == 1)); then
     MANAGED_PATHS+=(
+        "$INTEGRATION_PROFILE_PATH"
         "$PIPEWIRE_CONFIG_PATH"
         "$PIPEWIRE_PULSE_CONFIG_PATH"
         "$WIREPLUMBER_CONFIG_PATH"
     )
     if ((PRESERVE_PIPEWIRE == 1)); then
         PRESERVED_MANAGED_PATHS+=(
+            "$INTEGRATION_PROFILE_PATH"
             "$PIPEWIRE_CONFIG_PATH"
             "$PIPEWIRE_PULSE_CONFIG_PATH"
             "$WIREPLUMBER_CONFIG_PATH"
@@ -429,6 +532,9 @@ if ((INSTALL_GUI == 1)); then
 fi
 
 MANIFEST_ACTUAL="$(destination "$MANIFEST_PATH")"
+if ((PRESERVE_PIPEWIRE == 1)); then
+    trusted_installed_path "$MANIFEST_PATH" file
+fi
 declare -A OLD_HASHES=()
 if [[ -f "$MANIFEST_ACTUAL" ]]; then
     while IFS=$'\t' read -r hash path; do
@@ -436,6 +542,17 @@ if [[ -f "$MANIFEST_ACTUAL" ]]; then
         OLD_HASHES["$path"]=$hash
     done < "$MANIFEST_ACTUAL"
 fi
+
+if ((PRESERVE_PIPEWIRE == 1)); then
+    snapshot="$(destination "$INTEGRATION_PROFILE_PATH")"
+    [[ -f "$snapshot" && -n "${OLD_HASHES[$INTEGRATION_PROFILE_PATH]+owned}" ]] || \
+        die "cannot preserve PipeWire without a managed integration profile snapshot; migrate by reinstalling without --preserve-pipewire to regenerate configuration"
+    [[ "$(file_hash "$snapshot")" == "${OLD_HASHES[$INTEGRATION_PROFILE_PATH]}" ]] || \
+        die "integration profile snapshot hash mismatch; --force cannot bypass snapshot verification"
+    cp -- "$snapshot" "$TMP_DIR/previous-integration.toml"
+    generator_args+=(--check-compatible-profile "$TMP_DIR/previous-integration.toml")
+fi
+"$GENERATOR" "${generator_args[@]}"
 
 declare -A PRESERVED_PATHS=()
 for path in "${PRESERVED_MANAGED_PATHS[@]}"; do
@@ -465,72 +582,27 @@ for path in "${RETIRED_MANAGED_PATHS[@]}"; do
         die "retired managed file changed since install: $actual (use --force to remove)"
     fi
 done
-for path in "${RETIRED_MANAGED_PATHS[@]}"; do
-    actual="$(destination "$path")"
-    [[ -e "$actual" && -n "${OLD_HASHES[$path]+owned}" ]] || continue
-    run_privileged rm -f -- "$actual"
-done
-
-TMP_DIR="$(mktemp -d)"
-
-install_managed_copy() {
+stage_managed_copy() {
     local source=$1
-    local path=$2
-    local mode=$3
-    local temp="$TMP_DIR/$(basename -- "$path").tmp"
+    local temp=$2
     {
         printf '# Managed by SideALSA installer.\n'
         cat "$source"
     } > "$temp"
-    run_privileged install -D -m "$mode" "$temp" "$(destination "$path")"
 }
 
-run_privileged install -D -m 0755 "$ROOT/target/release/sidealsad" "$(destination "$PREFIX/bin/sidealsad")"
-for binary in sidealsa-hw-test sidealsa-pro-test sidealsa-loopback-test sidealsa-stats sidealsa-pro-client-test sidealsa-shared-test; do
-    run_privileged install -D -m 0755 "$ROOT/target/release/$binary" "$(destination "$PREFIX/bin/$binary")"
-done
-run_privileged install -D -m 0755 "$PLUGIN_SOURCE" "$(destination "$ALSA_PLUGIN_DIR/libasound_module_pcm_sidealsa.so")"
-PROFILE_ACTUAL="$(destination "$PROFILE_PATH")"
-if [[ -e "$PROFILE_ACTUAL" && "$REPLACE_PROFILE" -eq 0 ]]; then
-    info "preserving existing profile: $PROFILE_ACTUAL"
-else
-    run_privileged install -D -m 0644 "$PROFILE_SOURCE" "$PROFILE_ACTUAL"
-    info "installed profile: $PROFILE_ACTUAL"
-fi
-run_privileged install -D -m 0644 "$ROOT/LICENSE" "$(destination "$LICENSE_PATH")"
-
 if ((INSTALL_GUI == 1)); then
-    run_privileged install -D -m 0755 "$ROOT/build-gui/sidealsa-control" \
-        "$(destination "$GUI_PATH")"
-    run_privileged install -D -m 0755 "$ROOT/target/release/sidealsa-admin" \
-        "$(destination "$ADMIN_PATH")"
-
     desktop_temp="$TMP_DIR/org.sidealsa.Control.desktop"
     sed \
         -e "s|@PREFIX@|$(sed_escape "$PREFIX")|g" \
         -e "s|@PROFILE@|$(sed_escape "$PROFILE_PATH")|g" \
         -e "s|@SOCKET@|$(sed_escape "$SOCKET_PATH")|g" \
         "$ROOT/packaging/sidealsa-control.desktop.in" > "$desktop_temp"
-    run_privileged install -D -m 0644 "$desktop_temp" "$(destination "$DESKTOP_PATH")"
 
     policy_temp="$TMP_DIR/org.sidealsa.configure.policy"
     sed "s|@HELPER_PATH@|$(sed_escape "$ADMIN_PATH")|g" \
         "$ROOT/packaging/org.sidealsa.configure.policy.in" > "$policy_temp"
-    run_privileged install -D -m 0644 "$policy_temp" "$(destination "$POLKIT_PATH")"
 fi
-
-for doc in "$ROOT"/docs/*.md; do
-    run_privileged install -D -m 0644 "$doc" "$(destination "$DOC_PREFIX/$(basename -- "$doc")")"
-done
-
-escaped_socket="$(sed_escape "$SOCKET_PATH")"
-alsa_temp="$TMP_DIR/asound.conf"
-{
-    printf '# Managed by SideALSA installer.\n'
-    sed "s|socket \".*\"|socket \"$escaped_socket\"|g" \
-        "$ROOT/configs/asound.sidealsa.conf"
-} > "$alsa_temp"
-run_privileged install -D -m 0644 "$alsa_temp" "$(destination "$ALSA_CONFIG_PATH")"
 
 service_temp="$TMP_DIR/sidealsad.service"
 SERVICE_GROUP_DIRECTIVE=
@@ -548,21 +620,49 @@ sed \
     -e "s|@GROUP_DIRECTIVE@|$(sed_escape "$SERVICE_GROUP_DIRECTIVE")|g" \
     -e "s|@SOCKET_UMASK@|$SOCKET_UMASK|g" \
     "$ROOT/packaging/sidealsad.service.in" > "$service_temp"
+stage_managed_copy "$TMP_DIR/asound.sidealsa.conf" "$TMP_DIR/alsa.managed"
+stage_managed_copy "$TMP_DIR/active.toml" "$TMP_DIR/active.managed"
+if ((INSTALL_PIPEWIRE == 1 && PRESERVE_PIPEWIRE == 0)); then
+    stage_managed_copy "$TMP_DIR/pipewire.conf" "$TMP_DIR/pipewire.managed"
+    stage_managed_copy "$ROOT/configs/pipewire/pipewire-pulse.conf.d/sidealsa.conf" "$TMP_DIR/pulse.managed"
+    stage_managed_copy "$ROOT/configs/wireplumber/wireplumber.conf.d/sidealsa.conf" "$TMP_DIR/wireplumber.managed"
+fi
+
+# No installed files are changed until selection, validation and rendering succeed.
+for path in "${RETIRED_MANAGED_PATHS[@]}"; do
+    actual="$(destination "$path")"
+    [[ -e "$actual" && -n "${OLD_HASHES[$path]+owned}" ]] || continue
+    run_privileged rm -f -- "$actual"
+done
+for binary in "${BINARIES[@]}"; do
+    run_privileged install -D -m 0755 "$ROOT/target/release/$binary" "$(destination "$PREFIX/bin/$binary")"
+done
+run_privileged install -D -m 0755 "$PLUGIN_SOURCE" "$(destination "$ALSA_PLUGIN_DIR/libasound_module_pcm_sidealsa.so")"
+if [[ -e "$PROFILE_ACTUAL" && "$REPLACE_PROFILE" -eq 0 ]]; then
+    info "preserving existing profile: $PROFILE_ACTUAL"
+else
+    run_privileged install -D -m 0644 "$TMP_DIR/profile.toml" "$PROFILE_ACTUAL"
+    info "installed profile: $PROFILE_ACTUAL"
+fi
+run_privileged install -D -m 0644 "$ROOT/LICENSE" "$(destination "$LICENSE_PATH")"
+for doc in "$ROOT"/docs/*.md; do
+    run_privileged install -D -m 0644 "$doc" "$(destination "$DOC_PREFIX/$(basename -- "$doc")")"
+done
+if ((INSTALL_GUI == 1)); then
+    run_privileged install -D -m 0755 "$ROOT/build-gui/sidealsa-control" "$(destination "$GUI_PATH")"
+    run_privileged install -D -m 0755 "$ROOT/target/release/sidealsa-admin" "$(destination "$ADMIN_PATH")"
+    run_privileged install -D -m 0644 "$desktop_temp" "$(destination "$DESKTOP_PATH")"
+    run_privileged install -D -m 0644 "$policy_temp" "$(destination "$POLKIT_PATH")"
+fi
+run_privileged install -D -m 0644 "$TMP_DIR/alsa.managed" "$(destination "$ALSA_CONFIG_PATH")"
+run_privileged install -D -m 0644 "$TMP_DIR/active.managed" "$(destination "$SELECTION_PATH")"
 run_privileged install -D -m 0644 "$service_temp" "$(destination "$SERVICE_PATH")"
 
 if ((INSTALL_PIPEWIRE == 1 && PRESERVE_PIPEWIRE == 0)); then
-    install_managed_copy \
-        "$ROOT/configs/pipewire/pipewire.conf.d/sidealsa.conf" \
-        "$PIPEWIRE_CONFIG_PATH" \
-        0644
-    install_managed_copy \
-        "$ROOT/configs/pipewire/pipewire-pulse.conf.d/sidealsa.conf" \
-        "$PIPEWIRE_PULSE_CONFIG_PATH" \
-        0644
-    install_managed_copy \
-        "$ROOT/configs/wireplumber/wireplumber.conf.d/sidealsa.conf" \
-        "$WIREPLUMBER_CONFIG_PATH" \
-        0644
+    run_privileged install -D -m 0644 "$TMP_DIR/profile.toml" "$(destination "$INTEGRATION_PROFILE_PATH")"
+    run_privileged install -D -m 0644 "$TMP_DIR/pipewire.managed" "$(destination "$PIPEWIRE_CONFIG_PATH")"
+    run_privileged install -D -m 0644 "$TMP_DIR/pulse.managed" "$(destination "$PIPEWIRE_PULSE_CONFIG_PATH")"
+    run_privileged install -D -m 0644 "$TMP_DIR/wireplumber.managed" "$(destination "$WIREPLUMBER_CONFIG_PATH")"
 fi
 
 if ((WITH_ASIO == 1)); then
