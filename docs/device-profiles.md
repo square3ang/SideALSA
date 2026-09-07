@@ -34,6 +34,7 @@ when speaker semantics matter. Positions must be canonical, unique and match the
 channel count; `MONO` is only valid alone. PipeWire ports are limited to 64 logical
 channels; a larger physical interface may be split into smaller ports.
 
+`profiles/topping-e2x2.toml` shares the E1x2 OTG port mapping and timing; select it when using the E2x2 OTG hardware.
 `profiles/example-6x6.toml` is an **unmeasured example**, with a different port
 inventory, mono/stereo/discrete views, 44.1 kHz and P64. Replace
 `hw:YOUR_INTERFACE,0` with the real ALSA identifiers and validate capabilities
