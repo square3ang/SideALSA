@@ -1,5 +1,24 @@
 # SHARED Timing and Capture Accounting
 
+## Headroom Rollback
+
+The user rejected increased headroom as the optimization strategy. The six
+capture adapters were restored from configured headroom 64 to their original 0,
+in both the installed config and repository template. Existing playback headroom
+128 was not increased or changed. PipeWire's own timer-capture minimum of 32
+frames still applies; configured zero is not a claim of zero internal margin.
+
+The current code and five-period playback offset were re-tested for 60 seconds
+with PRO and background load after this restoration: SHARED underrun/overrun,
+HW XRUN and reset deltas were zero; PRO client misses increased by 7. Digital
+RTT ranged from 1370.000 to 1402.001 frames. Log:
+`target/shared-rtt.zDsvMU`. This supports retaining the original headroom, not
+a claim of zero failures across all domains or consistently lower measured RTT.
+
+Capture storage capacity and the correctness fixes remain separate from headroom;
+this rollback does not establish the independent performance benefit of each.
+The 64-frame results below are historical experiments, not the current setting.
+
 ## Applied Changes
 
 The reference profile now uses `shared_latency_periods = 5`, down from 7. This
@@ -35,11 +54,12 @@ no protocol fields or layout version changed. An installed, older
 change. Extra capture storage can absorb startup/scheduling stalls, but it is
 not a promise of smaller input latency: actual occupancy still matters.
 
-PipeWire capture adapters now request 64 frames of headroom, matching the Q64
+The earlier candidate requested 64 frames of capture headroom, matching the Q64
 publication granularity. The previous configured zero became an effective
-32-frame minimum in PipeWire's timer-driven capture path. The new setting adds
+32-frame minimum in PipeWire's timer-driven capture path. That candidate added
 32 frames of nominal capture margin while the SHARED playback offset removes
-128 frames. The daemon never waits for SHARED data.
+128 frames. The headroom increase was subsequently removed as described above.
+The daemon never waits for SHARED data.
 
 ## Measurements (2026-09-07)
 
@@ -91,8 +111,8 @@ caused every observed improvement.
 ## Current Installation and Logs
 
 Installed profile: `/etc/sidealsa/profiles/topping-e1x2.toml`, matching the
-reference profile's five-period SHARED offset. Capture headroom is persisted in
-`/etc/pipewire/pipewire.conf.d/99-sidealsa.conf`, not merely a runtime parameter.
+reference profile's five-period SHARED offset. Original capture headroom 0 is
+persisted in `/etc/pipewire/pipewire.conf.d/99-sidealsa.conf`, not merely a runtime parameter.
 The daemon and ALSA plugin were atomically updated; their managed-file hashes
 were updated without rewriting unrelated manifest entries. Audio services were
 restarted with the user's permission. ASIO binaries and application launch

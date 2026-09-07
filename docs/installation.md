@@ -100,8 +100,9 @@ PipeWire playback negotiates B768, uses `api.alsa.start-delay = 256`, and keeps
 `128` frames of headroom. This preserves the Q256 graph cadence while raising
 the steady playback target to Q384, adding 2.67 ms of SHARED-only scheduling
 margin. SHARED capture reserves twice the configured base storage (16 slots /
-1024 frames here), but retains Q256 transfers and a 64-frame capture headroom
-target. This extra storage is not an additional fixed delay. SideALSA SHARED playback
+1024 frames here), but retains Q256 transfers and the original configured capture
+headroom of 0 (PipeWire's timer-driven capture still imposes its own minimum).
+This extra storage is not an additional fixed delay. SideALSA SHARED playback
 consumes data after five internal periods (`320` frames), so desktop scheduling
 remains isolated from the physical B256 timeline. Playback and capture adapters
 keep PipeWire timer scheduling enabled.
