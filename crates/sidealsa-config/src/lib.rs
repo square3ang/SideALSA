@@ -963,7 +963,7 @@ mod tests {
         assert_eq!(profile.device.effective_pro_output_latency_frames(), 64);
         assert_eq!(profile.device.linked_phase_max_attempts, 0);
         assert_eq!(profile.device.effective_shared_buffer_size(), 512);
-        assert_eq!(profile.device.shared_latency_periods, 7);
+        assert_eq!(profile.device.shared_latency_periods, 5);
         assert!(profile.device.shared_playback_repeat_on_underrun);
         assert_eq!(profile.device.startup_loopback, None);
     }

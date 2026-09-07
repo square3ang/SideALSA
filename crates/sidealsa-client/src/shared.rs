@@ -53,11 +53,25 @@ impl SharedRegion {
         playback_channels: u32,
         capture_channels: u32,
     ) -> Result<Self, SharedError> {
-        let layout = SharedRegionLayout::new(
+        Self::create_with_slot_count(
             period_frames,
             playback_channels,
             capture_channels,
             sidealsa_protocol::SHARED_SLOT_COUNT,
+        )
+    }
+
+    pub fn create_with_slot_count(
+        period_frames: u32,
+        playback_channels: u32,
+        capture_channels: u32,
+        slot_count: u32,
+    ) -> Result<Self, SharedError> {
+        let layout = SharedRegionLayout::new(
+            period_frames,
+            playback_channels,
+            capture_channels,
+            slot_count,
         )?;
         let name = CString::new("sidealsa-pro").expect("static name has no nul");
         let fd = unsafe {
@@ -956,6 +970,34 @@ mod tests {
         assert_eq!(output, [17]);
     }
     use super::*;
+
+    #[test]
+    fn sixteen_slot_layout_maps_and_reuses_full_capture_reserve() {
+        assert_eq!(SharedRegion::create(1, 0, 1).unwrap().info().slot_count, 8);
+        let server = SharedRegion::create_with_slot_count(1, 0, 1, 16).unwrap();
+        let fd = unsafe { libc::dup(server.fd()) };
+        assert!(fd >= 0);
+        let client = SharedRegion::map_fd(fd, server.info()).unwrap();
+        assert_eq!(client.info().slot_count, 16);
+        let mut producer = 0;
+        let mut consumer = 0;
+        let mut samples = [0];
+        for base in [0, 16] {
+            for sequence in base..base + 16 {
+                assert!(server.try_publish_capture(&mut producer, sequence, &[sequence as i32]));
+            }
+            assert_eq!(client.ready_capture_slots(), 16);
+            assert!(!server.try_publish_capture(&mut producer, base + 16, &[0]));
+            for sequence in base..base + 16 {
+                assert_eq!(
+                    client.try_client_read_capture(&mut consumer, &mut samples),
+                    Some(sequence)
+                );
+                assert_eq!(samples, [sequence as i32]);
+            }
+            assert_eq!(client.ready_capture_slots(), 0);
+        }
+    }
 
     #[test]
     fn mapped_region_exchanges_capture_and_playback_slots() {

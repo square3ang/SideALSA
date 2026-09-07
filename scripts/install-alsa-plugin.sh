@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Update only an existing, main-installer-owned ALSA plugin. No build or services.
+# Update an existing main-installer-owned file; defaults to the ALSA plugin.
+# Explicit path overrides also support managed config fragments. No services.
 set -Eeuo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 SOURCE=${SIDEALSA_ALSA_SOURCE:-$ROOT/target/release/libasound_module_pcm_sidealsa.so}
@@ -48,7 +49,7 @@ done < "$MANIFEST"
 matches "$MANIFEST" "$manifest_hash" || die 'manifest changed during verification'
 if [[ "$source_hash" == "$old_hash" ]]; then
     matches "$SOURCE" "$source_hash" && matches "$DEST" "$old_hash" || die 'files changed during verification'
-    printf 'ALSA plugin already verified; no changes\n'
+    printf 'Managed file already verified; no changes: %s\n' "$DEST"
     exit 0
 fi
 
@@ -62,7 +63,7 @@ cleanup() {
         if matches "$DEST" "$source_hash" && matches "$MANIFEST" "$manifest_hash" \
             && matches "$rollback_stage" "$old_hash"; then
             if destination_op "$dest_dir" mv -Tf -- "$rollback_stage" "$DEST"; then
-                printf 'Restored previous ALSA plugin atomically\n' >&2
+                printf 'Restored previous managed file atomically: %s\n' "$DEST" >&2
             else
                 printf 'error: rollback failed; backup: %s\n' "$backup" >&2
             fi
@@ -117,4 +118,4 @@ matches "$SOURCE" "$source_hash" && matches "$DEST" "$source_hash" \
 destination_op "$manifest_dir" mv -Tf -- "$manifest_stage" "$MANIFEST" \
     || die 'manifest replacement failed'
 swapped=0
-printf 'Updated ALSA plugin and its manifest entry; backup: %s\n' "$backup"
+printf 'Updated managed file %s and its manifest entry; backup: %s\n' "$DEST" "$backup"

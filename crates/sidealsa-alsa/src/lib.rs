@@ -62,6 +62,8 @@ pub struct SideAlsaStream {
     playback_fifo_frames: usize,
     capture_frames: usize,
     capture_offset: usize,
+    capture_retired_frames: u64,
+    capture_error: Option<c_int>,
     nonblock: bool,
     playback_latency_periods: u64,
     next_playback_sequence: Option<u64>,
@@ -153,11 +155,13 @@ pub unsafe extern "C" fn sidealsa_stream_open(
             device_info.buffer_size,
             device_info.shared_buffer_size,
         );
-        let buffer_size = plugin_buffer_size(device_info.period_size, requested_buffer_size);
-        let alsa_period_size = plugin_period_size(mode, device_info.period_size, buffer_size);
-        let buffer_size = plugin_buffer_size(alsa_period_size, buffer_size);
-        let buffer_size =
-            playback_startup_buffer_size(mode, direction, alsa_period_size, buffer_size);
+        let (alsa_period_size, buffer_size) = plugin_stream_geometry(
+            mode,
+            direction,
+            info.period_frames,
+            requested_buffer_size,
+            info.slot_count,
+        );
         let minimum_buffer_size = minimum_plugin_buffer_size(
             mode,
             direction,
@@ -191,6 +195,8 @@ pub unsafe extern "C" fn sidealsa_stream_open(
             playback_fifo_frames: 0,
             capture_frames: 0,
             capture_offset: 0,
+            capture_retired_frames: 0,
+            capture_error: None,
             nonblock: nonblock != 0,
             playback_latency_periods,
             next_playback_sequence: None,
@@ -249,6 +255,7 @@ pub unsafe extern "C" fn sidealsa_stream_prepare(stream: *mut SideAlsaStream) ->
         let stream = stream.as_mut().ok_or(libc::EINVAL)?;
         stream.stream.prepare().map_err(client_error_code)?;
         stream.reset_transfer_state();
+        stream.capture_error = None;
         stream.running = false;
         Ok(())
     })
@@ -314,6 +321,68 @@ pub unsafe extern "C" fn sidealsa_stream_record_playback_xrun(stream: *mut SideA
 
 #[unsafe(no_mangle)]
 /// # Safety
+/// `stream` must be a live, exclusively borrowed stream handle.
+pub unsafe extern "C" fn sidealsa_stream_capture_sync(
+    stream: *mut SideAlsaStream,
+    expected: u64,
+    current: u64,
+    boundary: u64,
+    buffer: u64,
+) -> c_int {
+    ffi_status(|| unsafe {
+        let stream = stream.as_mut().ok_or(libc::EINVAL)?;
+        if stream.pro || stream.playback {
+            return Err(libc::EINVAL);
+        }
+        let result = (|| {
+            stream.validate_capture()?;
+            if boundary == 0
+                || buffer == 0
+                || buffer >= boundary / 2
+                || expected >= boundary
+                || current >= boundary
+            {
+                return Err(libc::EPIPE);
+            }
+            let skip = if current >= expected {
+                current - expected
+            } else {
+                boundary - expected + current
+            };
+            if skip > buffer
+                || skip > stream.buffer_frames as u64
+                || skip > stream.capture_frames as u64 + stream.stream.capture_frames_ready()
+            {
+                return Err(libc::EPIPE);
+            }
+            let mut remaining = skip as usize;
+            while remaining > 0 {
+                if stream.capture_frames == 0 {
+                    stream.acquire_shared_capture()?;
+                }
+                let chunk = remaining.min(stream.capture_frames);
+                stream.capture_offset += chunk;
+                stream.capture_frames -= chunk;
+                stream.capture_retired_frames =
+                    stream.capture_retired_frames.wrapping_add(chunk as u64);
+                remaining -= chunk;
+            }
+            stream.validate_capture()
+        })();
+        if let Err(error) = result {
+            stream.capture_error = Some(if error == libc::EAGAIN {
+                libc::EPIPE
+            } else {
+                error
+            });
+            return Err(stream.capture_error.unwrap());
+        }
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
 ///
 /// `stream` must be null or a live handle returned by `sidealsa_stream_open`.
 pub unsafe extern "C" fn sidealsa_stream_position(stream: *const SideAlsaStream) -> u64 {
@@ -358,6 +427,13 @@ impl SideAlsaStream {
         if !self.running {
             return self.position;
         }
+        if !self.playback && !self.pro {
+            return capture_production_position(
+                self.capture_retired_frames,
+                self.capture_frames as u64,
+                self.stream.capture_frames_ready(),
+            );
+        }
         if let Some(origin) = self
             .start_sequence
             .or_else(|| self.stream.activation_sequence())
@@ -374,6 +450,7 @@ impl SideAlsaStream {
         self.playback_fifo_frames = 0;
         self.capture_frames = 0;
         self.capture_offset = 0;
+        self.capture_retired_frames = 0;
         self.next_playback_sequence = None;
         self.playback_cycle_sequence = None;
         self.last_observed_playback_sequence = None;
@@ -664,6 +741,9 @@ impl SideAlsaStream {
         offset: usize,
         frames: usize,
     ) -> Result<isize, c_int> {
+        if !self.pro {
+            return self.transfer_shared_capture(areas, offset, frames);
+        }
         if !self.running {
             return Err(libc::EPIPE);
         }
@@ -713,12 +793,94 @@ impl SideAlsaStream {
             }
             self.capture_offset += chunk;
             self.capture_frames -= chunk;
+            self.capture_retired_frames = self.capture_retired_frames.wrapping_add(chunk as u64);
             consumed += chunk;
             if self.capture_frames == 0 {
                 self.capture_offset = 0;
             }
         }
         isize::try_from(consumed).map_err(|_| libc::EOVERFLOW)
+    }
+
+    fn validate_capture(&mut self) -> Result<(), c_int> {
+        if let Some(error) = self.capture_error {
+            return Err(error);
+        }
+        let result = self
+            .stream
+            .validate_shared_capture()
+            .map_err(client_error_code);
+        if let Err(error) = result {
+            self.capture_error = Some(error);
+        }
+        result
+    }
+
+    fn acquire_shared_capture(&mut self) -> Result<(), c_int> {
+        self.validate_capture()?;
+        if self
+            .stream
+            .try_capture_buffer(&mut self.scratch)
+            .map_err(client_error_code)?
+            .is_none()
+        {
+            return Err(libc::EAGAIN);
+        }
+        self.capture_frames = self.period_frames;
+        self.capture_offset = 0;
+        self.validate_capture()
+    }
+
+    fn transfer_shared_capture(
+        &mut self,
+        areas: *const SideAlsaChannelArea,
+        offset: usize,
+        frames: usize,
+    ) -> Result<isize, c_int> {
+        let mut copied = 0;
+        let result = (|| {
+            self.validate_capture()?;
+            if !self.running {
+                return Err(libc::EPIPE);
+            }
+            while copied < frames {
+                self.validate_capture()?;
+                if self.capture_frames == 0 {
+                    if !self.nonblock {
+                        self.wait_period()?;
+                    }
+                    self.acquire_shared_capture()?;
+                }
+                let chunk = self.capture_frames.min(frames - copied);
+                let destination = offset.checked_add(copied).ok_or(libc::EOVERFLOW)?;
+                let start = self.capture_offset * self.channels;
+                unsafe {
+                    copy_to_area(
+                        areas,
+                        destination,
+                        chunk,
+                        self.channels,
+                        &self.scratch[start..start + chunk * self.channels],
+                    )?;
+                }
+                self.capture_offset += chunk;
+                self.capture_frames -= chunk;
+                self.capture_retired_frames =
+                    self.capture_retired_frames.wrapping_add(chunk as u64);
+                copied += chunk;
+            }
+            self.validate_capture()
+        })();
+        if let Err(error) = result {
+            if error != libc::EAGAIN {
+                self.capture_error = Some(error);
+            }
+            // ALSA advances appl_ptr only by the returned prefix, after this callback.
+            if copied == 0 {
+                return Err(error);
+            }
+        }
+        isize::try_from(copied).map_err(|_| libc::EOVERFLOW)
     }
 
     fn wait_period(&mut self) -> Result<u64, c_int> {
@@ -758,6 +920,10 @@ impl SideAlsaStream {
             .ok_or(libc::EOVERFLOW)?;
         Ok(())
     }
+}
+
+fn capture_production_position(retired: u64, buffered: u64, ready: u64) -> u64 {
+    retired.wrapping_add(buffered).wrapping_add(ready)
 }
 
 fn wait_timeout(nonblock: bool) -> Duration {
@@ -1019,6 +1185,26 @@ fn playback_startup_buffer_size(
     }
 }
 
+fn plugin_stream_geometry(
+    mode: c_int,
+    direction: c_int,
+    internal_period_size: u32,
+    requested_buffer_size: u32,
+    slot_count: u32,
+) -> (u32, u32) {
+    let buffer_size = plugin_buffer_size(internal_period_size, requested_buffer_size);
+    let period_size = plugin_period_size(mode, internal_period_size, buffer_size);
+    let buffer_size = plugin_buffer_size(period_size, buffer_size);
+    // Derive aggregation from the base shared_buffer_size before exposing the
+    // daemon's automatic capture reserve. This does not change the steady target.
+    let buffer_size = if mode == MODE_SHARED && direction == STREAM_CAPTURE {
+        internal_period_size.saturating_mul(slot_count)
+    } else {
+        playback_startup_buffer_size(mode, direction, period_size, buffer_size)
+    };
+    (period_size, buffer_size)
+}
+
 fn minimum_plugin_buffer_size(
     mode: c_int,
     direction: c_int,
@@ -1027,7 +1213,8 @@ fn minimum_plugin_buffer_size(
     shared_latency_periods: u32,
     maximum_buffer_size: u32,
 ) -> u32 {
-    if mode != MODE_SHARED {
+    // Require the full capture reserve so negotiation cannot discard it.
+    if mode != MODE_SHARED || direction == STREAM_CAPTURE {
         return maximum_buffer_size;
     }
     let internal_periods = if direction == STREAM_PLAYBACK {
@@ -1221,7 +1408,20 @@ where
 }
 
 #[cfg(test)]
+mod capture_tests;
+
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn shared_capture_pointer_counts_only_published_or_delivered_frames() {
+        assert_eq!(super::capture_production_position(0, 0, 0), 0);
+        assert_eq!(super::capture_production_position(0, 0, 64), 64);
+        assert_eq!(super::capture_production_position(0, 64, 0), 64);
+        assert_eq!(super::capture_production_position(16, 48, 0), 64);
+        assert_eq!(super::capture_production_position(16, 48, 64), 128);
+        assert_eq!(super::capture_production_position(64, 0, 64), 128);
+        assert_eq!(super::capture_production_position(u64::MAX - 15, 16, 0), 0);
+    }
     #[test]
     fn playback_only_clock_cannot_hide_already_consumed_output() {
         let plan = super::PlaybackSequencePlan {
@@ -1266,6 +1466,23 @@ mod tests {
     ) -> PlaybackSequencePlan {
         plan_playback_sequence_with_queue(next, observed, latency, same_cycle, queued_periods)
             .expect("test sequence should have an unambiguous order")
+    }
+
+    #[test]
+    fn capture_reserve_preserves_aggregation_and_other_stream_geometry() {
+        for (mode, direction, internal, requested, slots, period, buffer, minimum) in [
+            (MODE_SHARED, STREAM_CAPTURE, 64, 512, 16, 256, 1024, 1024),
+            (MODE_SHARED, STREAM_PLAYBACK, 64, 512, 8, 256, 768, 768),
+            (MODE_PRO, STREAM_CAPTURE, 64, 64, 8, 64, 128, 128),
+            (MODE_PRO, STREAM_PLAYBACK, 32, 32, 8, 32, 64, 64),
+        ] {
+            let geometry = plugin_stream_geometry(mode, direction, internal, requested, slots);
+            assert_eq!(geometry, (period, buffer));
+            assert_eq!(
+                minimum_plugin_buffer_size(mode, direction, internal, geometry.0, 6, geometry.1),
+                minimum
+            );
+        }
     }
 
     #[test]

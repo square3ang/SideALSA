@@ -31,6 +31,7 @@ struct SessionState {
     period_frames: u32,
     playback_channels: u32,
     capture_channels: u32,
+    slot_count: u32,
 }
 
 struct SessionEndpoint {
@@ -45,10 +46,16 @@ impl SessionEndpoint {
         period_frames: u32,
         playback_channels: u32,
         capture_channels: u32,
+        slot_count: u32,
     ) -> Result<Box<Self>, SharedError> {
         Ok(Box::new(Self {
             session_id,
-            region: SharedRegion::create(period_frames, playback_channels, capture_channels)?,
+            region: SharedRegion::create_with_slot_count(
+                period_frames,
+                playback_channels,
+                capture_channels,
+                slot_count,
+            )?,
             events: SharedEvents::new()?,
         }))
     }
@@ -277,6 +284,7 @@ impl SessionState {
         period_frames: u32,
         playback_channels: u32,
         capture_channels: u32,
+        slot_count: u32,
         playback_epoch: Option<Arc<AtomicU64>>,
         playback_commits: Option<Arc<PlaybackCommitBarrier>>,
     ) -> Result<Self, SharedError> {
@@ -286,6 +294,7 @@ impl SessionState {
                 period_frames,
                 playback_channels,
                 capture_channels,
+                slot_count,
             )?)),
             owner: Arc::new(AtomicU64::new(0)),
             active: Arc::new(AtomicU64::new(0)),
@@ -299,6 +308,7 @@ impl SessionState {
             period_frames,
             playback_channels,
             capture_channels,
+            slot_count,
         })
     }
 
@@ -319,6 +329,7 @@ impl SessionState {
             self.period_frames,
             self.playback_channels,
             self.capture_channels,
+            self.slot_count,
         ) {
             Ok(endpoint) => endpoint,
             Err(error) => {
@@ -467,6 +478,7 @@ impl SharedPortState {
         port: &PortConfig,
         direction: PortDirection,
         period_frames: u32,
+        slot_count: u32,
         playback_epoch: Option<Arc<AtomicU64>>,
         playback_commits: Option<Arc<PlaybackCommitBarrier>>,
     ) -> Result<Self, SharedError> {
@@ -498,6 +510,7 @@ impl SharedPortState {
                 period_frames,
                 playback_channels,
                 capture_channels,
+                slot_count,
                 playback_epoch,
                 playback_commits,
             )?,
@@ -557,6 +570,7 @@ impl DaemonState {
             profile.device.period_size,
             profile.device.playback.channels,
             profile.device.capture.channels,
+            sidealsa_protocol::SHARED_SLOT_COUNT,
             Some(Arc::clone(&playback_epoch)),
             Some(Arc::clone(&playback_commits)),
         )?;
@@ -567,15 +581,20 @@ impl DaemonState {
                 port,
                 PortDirection::Playback,
                 profile.device.period_size,
+                sidealsa_protocol::SHARED_SLOT_COUNT,
                 Some(Arc::clone(&playback_epoch)),
                 Some(Arc::clone(&playback_commits)),
             )?);
         }
         for port in &profile.ports.capture {
+            // shared_buffer_size remains the base transport geometry. Capture gets
+            // automatic storage reserve, not a larger steady-state latency target.
+            let slot_count = (shared_buffer_periods.saturating_mul(2)).clamp(4, 16) as u32;
             shared.push(SharedPortState::new(
                 port,
                 PortDirection::Capture,
                 profile.device.period_size,
+                slot_count,
                 None,
                 None,
             )?);
@@ -731,7 +750,7 @@ impl DaemonState {
                     self.period_frames,
                     self.playback_channels,
                     self.capture_channels,
-                    self.shared_buffer_periods,
+                    port.session.slot_count as usize,
                     self.shared_latency_periods,
                     self.shared_playback_repeat_on_underrun,
                 )
@@ -1659,6 +1678,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_shared_capture_reserves_slots_and_reopen_preserves_geometry() {
+        for (base_periods, capture_slots) in [(2, 4), (4, 8), (8, 16)] {
+            let mut profile = Profile::from_toml(PROFILE).unwrap();
+            profile.device.shared_buffer_size = Some(profile.device.period_size * base_periods);
+            let state = DaemonState::new(&profile, Arc::new(HardwareTimeline::default())).unwrap();
+            assert_eq!(state.pro.current().info().slot_count, 8);
+            assert_eq!(state.shared[0].session.current().info().slot_count, 8);
+            assert_eq!(
+                state.shared[1].session.current().info().slot_count,
+                capture_slots
+            );
+            let (capture, _) = state.bridges();
+            assert_eq!(
+                capture.shared[0].capture_capacity_slots,
+                capture_slots as usize
+            );
+            for _ in 0..2 {
+                let (pro, info, _) = open_pro(&state);
+                assert_eq!(info.slot_count, 8);
+                assert!(state.close(pro));
+                for (port, slots) in [("line1", 8), ("mic1", capture_slots)] {
+                    let opened = state.open_shared(port).unwrap().unwrap();
+                    assert_eq!(opened.shared.slot_count, slots);
+                    assert!(state.close(opened.session_id));
+                }
+            }
+        }
+    }
+
     fn open_pro(state: &DaemonState) -> (u64, SharedRegionInfo, [std::os::fd::RawFd; 4]) {
         state
             .open_pro()
@@ -1699,7 +1748,8 @@ mod tests {
 
     #[test]
     fn opening_session_seeds_current_hardware_generation() {
-        let session = SessionState::new(4, 2, 2, None, None).expect("session state should create");
+        let session =
+            SessionState::new(4, 2, 2, 8, None, None).expect("session state should create");
 
         session
             .try_open(7, 23)
@@ -2093,7 +2143,7 @@ mod tests {
     #[test]
     fn endpoint_drain_does_not_wait_for_later_readers() {
         let endpoint = Arc::new(EndpointSlot::new(
-            SessionEndpoint::create(0, 4, 2, 2).expect("endpoint should create"),
+            SessionEndpoint::create(0, 4, 2, 2, 8).expect("endpoint should create"),
         ));
         let earlier = endpoint.load();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -3139,10 +3189,11 @@ mod tests {
         activate_session(&state, shared.session_id, u64::MAX);
 
         let (mut capture, _) = state.bridges();
-        let capacity = state.shared_buffer_periods as u64;
+        let capacity = u64::from(shared.shared.slot_count);
         for sequence in 0..capacity {
             capture.process_capture(sequence, &[sequence as i32; 8]);
         }
+        assert_eq!(timeline.snapshot().shared_overruns, 0);
         state.shared[1].session.current().events.drain();
         let failed_sequence = capacity;
         capture.process_capture(failed_sequence, &[0; 8]);

@@ -50,6 +50,10 @@ end-to-end latency claims, and should be rerun on each deployment CPU.
 
 ## Audio-load benchmarks
 
+The [SHARED tuning results](shared-tuning.md) separate playback sequence lead,
+capture storage capacity, actual capture accounting and measured round-trip
+latency. They include rejected settings and remaining measurement limitations.
+
 The [ALSA PRO playback-only optimization](alsa-pro-playback.md) removes an
 unnecessary dependency on still-valid capture for playback scheduling. It is
 distinct from ASIO spinning and includes blocking/external-poll probe results.

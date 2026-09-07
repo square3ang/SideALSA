@@ -95,12 +95,14 @@ before the first valid block and after lifecycle or hardware-generation changes.
 Current SHARED playback is mixed after the PRO selection.
 
 The ALSA ioplug keeps SideALSA SHARED transfers at Q64 and uses the independent
-B512 daemon ring. It aggregates four internal blocks per Q256 external period.
+B512 playback ring. It aggregates four internal blocks per Q256 external period.
 PipeWire playback negotiates B768, uses `api.alsa.start-delay = 256`, and keeps
 `128` frames of headroom. This preserves the Q256 graph cadence while raising
 the steady playback target to Q384, adding 2.67 ms of SHARED-only scheduling
-margin. Capture does not add this playback margin. SideALSA SHARED playback
-consumes data after seven internal periods (`448` frames), so desktop scheduling
+margin. SHARED capture reserves twice the configured base storage (16 slots /
+1024 frames here), but retains Q256 transfers and a 64-frame capture headroom
+target. This extra storage is not an additional fixed delay. SideALSA SHARED playback
+consumes data after five internal periods (`320` frames), so desktop scheduling
 remains isolated from the physical B256 timeline. Playback and capture adapters
 keep PipeWire timer scheduling enabled.
 PipeWire's global clock quantum stays distribution-managed. The installed

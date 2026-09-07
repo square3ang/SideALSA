@@ -27,6 +27,9 @@ extern ssize_t sidealsa_stream_transfer(sidealsa_stream_t *stream,
 extern void sidealsa_stream_record_playback_xrun(sidealsa_stream_t *stream);
 extern uint64_t sidealsa_stream_position(const sidealsa_stream_t *stream);
 extern int sidealsa_stream_close(sidealsa_stream_t *stream);
+extern int sidealsa_stream_capture_sync(sidealsa_stream_t *stream,
+                                        uint64_t expected, uint64_t current,
+                                        uint64_t boundary, uint64_t buffer);
 
 typedef struct {
 	snd_pcm_ioplug_t io;
@@ -39,6 +42,7 @@ typedef struct {
 	snd_pcm_uframes_t minimum_buffer_size;
 	snd_pcm_uframes_t buffer_size;
 	snd_pcm_uframes_t boundary;
+	snd_pcm_uframes_t capture_expected_appl_ptr;
 	int shared;
 } sidealsa_pcm_t;
 
@@ -89,6 +93,9 @@ static int sidealsa_prepare(snd_pcm_ioplug_t *io)
 
 	if (result >= 0)
 		result = sidealsa_stream_prepare(pcm->stream);
+	/* libasound resets its pointers before calling prepare. */
+	if (result >= 0)
+		pcm->capture_expected_appl_ptr = io->appl_ptr;
 	sidealsa_set_error_state(io, result);
 	return result;
 }
@@ -104,6 +111,20 @@ static int sidealsa_drain(snd_pcm_ioplug_t *io)
 	return result;
 }
 
+static int sidealsa_capture_sync(snd_pcm_ioplug_t *io)
+{
+	sidealsa_pcm_t *pcm = io->private_data;
+	if (!pcm->shared || io->stream != SND_PCM_STREAM_CAPTURE ||
+	    io->state != SND_PCM_STATE_RUNNING)
+		return 0;
+	int result = sidealsa_stream_capture_sync(pcm->stream,
+		pcm->capture_expected_appl_ptr, io->appl_ptr,
+		pcm->boundary, io->buffer_size);
+	if (result >= 0)
+		pcm->capture_expected_appl_ptr = io->appl_ptr;
+	return result;
+}
+
 static snd_pcm_sframes_t sidealsa_transfer(snd_pcm_ioplug_t *io,
 						   const snd_pcm_channel_area_t *areas,
 						   snd_pcm_uframes_t offset,
@@ -113,7 +134,13 @@ static snd_pcm_sframes_t sidealsa_transfer(snd_pcm_ioplug_t *io,
 	snd_pcm_sframes_t result = sidealsa_sync_nonblock(io);
 
 	if (result >= 0)
+		result = sidealsa_capture_sync(io);
+	if (result >= 0)
 		result = sidealsa_stream_transfer(pcm->stream, areas, offset, size);
+	/* The transfer callback sees the old appl_ptr; ALSA advances it on return. */
+	if (result > 0 && pcm->shared && io->stream == SND_PCM_STREAM_CAPTURE)
+		pcm->capture_expected_appl_ptr =
+			(io->appl_ptr + (snd_pcm_uframes_t)result) % pcm->boundary;
 	sidealsa_set_error_state(io, result);
 	return result;
 }
@@ -121,6 +148,9 @@ static snd_pcm_sframes_t sidealsa_transfer(snd_pcm_ioplug_t *io,
 static snd_pcm_sframes_t sidealsa_pointer(snd_pcm_ioplug_t *io)
 {
 	sidealsa_pcm_t *pcm = io->private_data;
+	int result = sidealsa_capture_sync(io);
+	if (result < 0)
+		return result;
 	uint64_t position = sidealsa_stream_position(pcm->stream);
 	snd_pcm_uframes_t boundary = pcm->boundary ? pcm->boundary : io->buffer_size;
 	if (!boundary)

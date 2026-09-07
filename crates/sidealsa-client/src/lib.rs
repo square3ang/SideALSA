@@ -311,6 +311,11 @@ impl AudioStream {
             session_id: self.session_id,
         })? {
             Response::Ack => {
+                // START establishes a new lifecycle before its ACK. Adopt that
+                // rebase only here, without hiding capture loss during START.
+                if self.mode == StreamMode::Shared(PortDirection::Capture) {
+                    self.lifecycle_generation = self.region.lifecycle_generation();
+                }
                 self.started = true;
                 Ok(())
             }
@@ -492,6 +497,22 @@ impl AudioStream {
                     continue;
                 }
             } else if self.info.playback_channels > 0 {
+                if self.mode == StreamMode::Shared(PortDirection::Playback) {
+                    // Timer-driven clients may observe the new hardware cycle
+                    // before its eventfd notification. Do not hold a ready batch
+                    // for another graph quantum merely because the hint is late.
+                    self.playback_event.drain();
+                    let generation = self.lifecycle_generation;
+                    let sequence = self.region.cycle_sequence();
+                    if self.region.activation_ready() && self.last_sequence != Some(sequence) {
+                        self.check_hardware_generation()?;
+                        if self.region.lifecycle_generation() != generation {
+                            continue;
+                        }
+                        self.last_sequence = Some(sequence);
+                        return Ok(sequence);
+                    }
+                }
                 let wait = self
                     .playback_event
                     .wait_until(self.control.as_raw_fd(), deadline);
@@ -527,6 +548,30 @@ impl AudioStream {
         }
         let minimum = matches!(self.mode, StreamMode::Pro).then(|| self.region.playback_sequence());
         self.region.has_ready_capture_since(minimum)
+    }
+
+    /// Complete capture frames currently published in shared memory, excluding
+    /// any caller-owned scratch buffer. This is not a generation/expiry check.
+    pub fn capture_frames_ready(&self) -> u64 {
+        if self.info.capture_channels == 0 {
+            return 0;
+        }
+        (self.region.ready_capture_slots() as u64)
+            .saturating_mul(u64::from(self.info.period_frames))
+    }
+
+    /// Validates shared capture without acquiring samples or waiting. Callers
+    /// retaining partial blocks must invalidate them on error, until prepare.
+    pub fn validate_shared_capture(&mut self) -> Result<(), ClientError> {
+        self.ensure_open()?;
+        if self.mode != StreamMode::Shared(PortDirection::Capture) {
+            return Err(ClientError::Unsupported);
+        }
+        if !self.started {
+            return Ok(());
+        }
+        self.check_hardware_generation()?;
+        self.check_capture_discontinuity()
     }
 
     /// Acquires capture without polling, for callers with their own event loop.
@@ -665,6 +710,11 @@ impl AudioStream {
     }
 
     fn refresh_generation(&mut self) {
+        // Shared capture must report a rebase, not silently adopt it while an
+        // adapter may still hold samples from the old generation.
+        if self.mode == StreamMode::Shared(PortDirection::Capture) {
+            return;
+        }
         let generation = self.region.lifecycle_generation();
         if generation != self.lifecycle_generation {
             self.lifecycle_generation = generation;
@@ -675,6 +725,11 @@ impl AudioStream {
     }
 
     fn check_capture_discontinuity(&mut self) -> Result<(), ClientError> {
+        if self.mode == StreamMode::Shared(PortDirection::Capture)
+            && self.region.lifecycle_generation() != self.lifecycle_generation
+        {
+            return Err(ClientError::CaptureDiscontinuity);
+        }
         if self.info.capture_channels == 0 {
             return Ok(());
         }
@@ -1715,6 +1770,47 @@ mod tests {
         assert_eq!(capture, [25]);
         assert_eq!(server_region.client_expired_capture_blocks(), 4);
         assert_eq!(server_region.oldest_valid_client_capture_sequence(25), None);
+        stream.closed = true;
+    }
+
+    #[test]
+    fn shared_playback_observes_a_new_clock_without_waiting_for_its_notification() {
+        let region = SharedRegion::create(1, 1, 0).unwrap();
+        let client_fd = unsafe { libc::dup(region.fd()) };
+        assert!(client_fd >= 0);
+        let (_peer, control) = UnixStream::pair().unwrap();
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Shared(PortDirection::Playback),
+            region.info(),
+            owned_fds([client_fd, event_fd(), event_fd(), event_fd()]),
+        )
+        .unwrap();
+        stream.started = true;
+        region.reset_activation();
+        region.set_cycle_sequence(40);
+        assert!(matches!(
+            stream.wait_period(Duration::ZERO),
+            Err(ClientError::Timeout)
+        ));
+        assert!(region.establish_activation(40));
+        assert_eq!(stream.wait_period(Duration::ZERO).unwrap(), 40);
+        assert!(matches!(
+            stream.wait_period(Duration::ZERO),
+            Err(ClientError::Timeout)
+        ));
+        stream.playback_event.notify().unwrap();
+        assert!(matches!(
+            stream.wait_period(Duration::ZERO),
+            Err(ClientError::Timeout)
+        ));
+        region.set_cycle_sequence(41);
+        assert_eq!(stream.wait_period(Duration::ZERO).unwrap(), 41);
+        assert!(stream.playback_buffer(&[17]).unwrap());
+        let mut output = [0];
+        assert!(region.try_consume_playback(42, &mut output));
+        assert_eq!(output, [17]);
         stream.closed = true;
     }
 
