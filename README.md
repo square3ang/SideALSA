@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/sidealsa-logo.svg" alt="SideALSA" width="720">
+</p>
+
 # SideALSA
 
 **One audio interface, with PRO for production and SHARED for desktop audio.**

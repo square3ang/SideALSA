@@ -13,15 +13,18 @@ trap 'rm -rf -- "$TMP"' EXIT
 trap 'printf "Fixture failed at line %s\n" "$LINENO" >&2; [[ ! -f "$TMP/install.log" ]] || cat "$TMP/install.log" >&2' ERR
 CHECKOUT="$TMP/mock-checkout"
 STAGE="$TMP/dest"
-mkdir -p "$CHECKOUT/scripts" "$CHECKOUT/target/release" "$STAGE" "$TMP/guard"
+mkdir -p "$CHECKOUT/scripts" "$CHECKOUT/target/release" "$CHECKOUT/build-gui" "$CHECKOUT/assets" "$STAGE" "$TMP/guard"
 cp "$ROOT/scripts/install.sh" "$CHECKOUT/scripts/"
+cp "$ROOT/scripts/uninstall.sh" "$CHECKOUT/scripts/"
+cp "$ROOT/assets/sidealsa-icon.png" "$CHECKOUT/assets/"
 cp -a "$ROOT/packaging" "$ROOT/configs" "$ROOT/profiles" "$ROOT/docs" "$ROOT/LICENSE" "$CHECKOUT/"
 cp "$GENERATOR" "$CHECKOUT/target/release/"
 for binary in sidealsa-setup sidealsad sidealsa-hw-test sidealsa-pro-test sidealsa-loopback-test \
-    sidealsa-stats sidealsa-pro-client-test sidealsa-shared-test; do
+    sidealsa-stats sidealsa-pro-client-test sidealsa-shared-test sidealsa-admin; do
     printf '#!/usr/bin/env bash\n# MOCK artifact, never executed by these tests.\nexit 97\n' > "$CHECKOUT/target/release/$binary"
     chmod +x "$CHECKOUT/target/release/$binary"
 done
+cp "$CHECKOUT/target/release/sidealsa-admin" "$CHECKOUT/build-gui/sidealsa-control"
 printf 'MOCK plugin, not loadable\n' > "$CHECKOUT/target/release/libasound_module_pcm_sidealsa.so"
 for command in sudo systemctl; do
     printf '#!/usr/bin/env bash\nprintf "forbidden service command\\n" >> "$SERVICE_GUARD_LOG"\nexit 98\n' > "$TMP/guard/$command"
@@ -34,9 +37,10 @@ unset SIDEALSA_SOCKET SIDEALSA_SOCKET_EXPLICIT SUDO_USER SIDEALSA_INSTALL_REEXEC
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 contains() { grep -Fq -- "$2" "$1" || fail "$1 lacks $2"; }
 absent() { if grep -Fq -- "$2" "$1"; then fail "$1 unexpectedly contains $2"; fi; }
+GUI_ARGS=(--no-gui)
 install_fixture() {
     DESTDIR="$STAGE" PREFIX=/usr/local ALSA_PLUGIN_DIR=/usr/lib/alsa-lib \
-        bash "$CHECKOUT/scripts/install.sh" --no-build --no-gui --no-start "$@" > "$TMP/install.log" 2>&1
+        bash "$CHECKOUT/scripts/install.sh" --no-build "${GUI_ARGS[@]}" --no-start "$@" > "$TMP/install.log" 2>&1
 }
 expect_unchanged_failure() {
     local diagnostic=$1
@@ -263,5 +267,38 @@ mkdir "$STAGE"
 expect_unchanged_failure 'managed integration profile snapshot' --preserve-pipewire
 install_fixture
 [[ "$(selection --selected-profile)" == /etc/sidealsa/profiles/topping-e1x2.toml ]] || fail 'fresh default'
+
+# GUI icon ownership, retirement, and uninstall at default and custom prefixes.
+GUI_ARGS=()
+for prefix in /usr/local /opt/sidealsa; do
+    STAGE="$TMP/gui${prefix//\//-}"
+    mkdir "$STAGE"
+    icon_path="$prefix/share/icons/hicolor/512x512/apps/org.sidealsa.Control.png"
+    icon="$STAGE$icon_path"
+    MANIFEST="$STAGE$prefix/share/sidealsa/install-manifest"
+    install_fixture --prefix "$prefix"
+    cmp "$ROOT/assets/sidealsa-icon.png" "$icon"
+    [[ $(stat -c '%a' "$icon") == 644 ]] || fail 'icon permissions'
+    contains "$STAGE$prefix/share/applications/org.sidealsa.Control.desktop" "Icon=$icon_path"
+    read -r icon_hash _ < <(sha256sum "$icon")
+    contains "$MANIFEST" "$icon_hash"$'\t'"$icon_path"
+    printf 'modified icon\n' >> "$icon"
+    expect_unchanged_failure 'managed file changed' --prefix "$prefix"
+    expect_unchanged_failure 'retired managed file changed' --prefix "$prefix" --no-gui
+    install_fixture --prefix "$prefix" --force
+    install_fixture --prefix "$prefix" --no-gui
+    [[ ! -e "$icon" ]] || fail 'icon retirement'
+    absent "$MANIFEST" "$icon_path"
+    install_fixture --prefix "$prefix"
+    DESTDIR="$STAGE" bash "$CHECKOUT/scripts/uninstall.sh" --prefix "$prefix" > "$TMP/uninstall.log" 2>&1
+    [[ ! -e "$icon" && ! -e "$MANIFEST" ]] || fail 'icon uninstall'
+    install_fixture --prefix "$prefix"
+    printf 'modified icon\n' >> "$icon"
+    DESTDIR="$STAGE" bash "$CHECKOUT/scripts/uninstall.sh" --prefix "$prefix" > "$TMP/uninstall.log" 2>&1
+    [[ -f "$icon" ]] || fail 'modified icon not preserved'
+    contains "$MANIFEST" "$icon_path"
+    DESTDIR="$STAGE" bash "$CHECKOUT/scripts/uninstall.sh" --prefix "$prefix" --force > "$TMP/uninstall.log" 2>&1
+    [[ ! -e "$icon" && ! -e "$MANIFEST" ]] || fail 'forced icon uninstall'
+done
 [[ ! -e "$SERVICE_GUARD_LOG" ]] || fail 'service command invoked'
 printf 'PASS: offline installer fixtures (real generator; MOCK runtime/plugin artifacts; no hardware or services)\n'

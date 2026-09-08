@@ -11,6 +11,7 @@
 #include <QGridLayout>
 #include <QHash>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
@@ -938,6 +939,8 @@ int main(int argc, char **argv)
     QCoreApplication::setApplicationName(QStringLiteral("SideALSA Control"));
     QCoreApplication::setApplicationVersion(QStringLiteral("0.1.0"));
     QCoreApplication::setOrganizationName(QStringLiteral("SideALSA"));
+    QGuiApplication::setDesktopFileName(QStringLiteral("org.sidealsa.Control"));
+    QApplication::setWindowIcon(QIcon(QStringLiteral(":/icons/sidealsa-icon.png")));
 
     QCommandLineParser parser;
     parser.setApplicationDescription(QStringLiteral("SideALSA hardware timing control panel"));

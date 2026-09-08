@@ -326,6 +326,8 @@ if ((INSTALL_GUI == 1)); then
         die "missing Qt control panel: $ROOT/build-gui/sidealsa-control"
     [[ -x "$ROOT/target/release/sidealsa-admin" ]] || \
         die "missing privileged helper: $ROOT/target/release/sidealsa-admin"
+    [[ -f "$ROOT/assets/sidealsa-icon.png" ]] || \
+        die "missing GUI icon: $ROOT/assets/sidealsa-icon.png"
 fi
 
 BINARIES=(
@@ -463,6 +465,7 @@ MANIFEST_PATH="$PREFIX/share/sidealsa/install-manifest"
 GUI_PATH="$PREFIX/bin/sidealsa-control"
 ADMIN_PATH=/usr/libexec/sidealsa-admin
 DESKTOP_PATH="$PREFIX/share/applications/org.sidealsa.Control.desktop"
+ICON_PATH="$PREFIX/share/icons/hicolor/512x512/apps/org.sidealsa.Control.png"
 POLKIT_PATH=/usr/share/polkit-1/actions/org.sidealsa.configure.policy
 RETIRED_MANAGED_PATHS=()
 if ((INSTALL_PIPEWIRE == 0)); then
@@ -486,6 +489,7 @@ if ((INSTALL_GUI == 0)); then
         "$GUI_PATH"
         "$ADMIN_PATH"
         "$DESKTOP_PATH"
+        "$ICON_PATH"
         "$POLKIT_PATH"
     )
 fi
@@ -536,6 +540,7 @@ if ((INSTALL_GUI == 1)); then
         "$GUI_PATH"
         "$ADMIN_PATH"
         "$DESKTOP_PATH"
+        "$ICON_PATH"
         "$POLKIT_PATH"
     )
 fi
@@ -661,6 +666,7 @@ if ((INSTALL_GUI == 1)); then
     run_privileged install -D -m 0755 "$ROOT/build-gui/sidealsa-control" "$(destination "$GUI_PATH")"
     run_privileged install -D -m 0755 "$ROOT/target/release/sidealsa-admin" "$(destination "$ADMIN_PATH")"
     run_privileged install -D -m 0644 "$desktop_temp" "$(destination "$DESKTOP_PATH")"
+    run_privileged install -D -m 0644 "$ROOT/assets/sidealsa-icon.png" "$(destination "$ICON_PATH")"
     run_privileged install -D -m 0644 "$policy_temp" "$(destination "$POLKIT_PATH")"
 fi
 run_privileged install -D -m 0644 "$TMP_DIR/alsa.managed" "$(destination "$ALSA_CONFIG_PATH")"
