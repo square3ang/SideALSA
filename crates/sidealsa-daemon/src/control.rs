@@ -15,8 +15,8 @@ use std::{
 };
 
 use sidealsa_protocol::{
-    ErrorCode, FEATURE_PRO, FEATURE_SHARED, PROTOCOL_VERSION, ProtocolError, Request, Response,
-    write_response,
+    ErrorCode, FEATURE_PRO, FEATURE_PRO_DIRECTIONS, FEATURE_SHARED, PROTOCOL_VERSION,
+    ProtocolError, Request, Response, write_response,
 };
 use thiserror::Error;
 
@@ -121,6 +121,9 @@ fn remove_stale_socket(path: &Path) -> Result<(), io::Error> {
 }
 
 fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
+    let Ok(peer) = peer_credentials(&stream) else {
+        return;
+    };
     if stream
         .set_read_timeout(Some(CONTROL_HANDSHAKE_TIMEOUT))
         .is_err()
@@ -181,13 +184,54 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
                     (
                         Response::Hello {
                             version: PROTOCOL_VERSION,
-                            features: FEATURE_PRO | FEATURE_SHARED,
+                            features: FEATURE_PRO | FEATURE_SHARED | FEATURE_PRO_DIRECTIONS,
                         },
                         Vec::new(),
                     )
                 }
             }
             Request::GetInfo => (Response::Info(state.info()), Vec::new()),
+            Request::OpenProDirection {
+                direction,
+                group_token,
+            } => {
+                if session.is_some() {
+                    (
+                        Response::Error {
+                            code: ErrorCode::BadState,
+                            message: "client already owns a session".into(),
+                        },
+                        Vec::new(),
+                    )
+                } else {
+                    match state.open_pro_direction(
+                        peer.pid as u32,
+                        peer.uid,
+                        group_token,
+                        direction,
+                    ) {
+                        Ok(Some((session_id, shared, fds))) => {
+                            session = Some(session_id);
+                            (
+                                Response::OpenProDirection {
+                                    session_id,
+                                    direction,
+                                    shared,
+                                },
+                                fds.to_vec(),
+                            )
+                        }
+                        Ok(None) => (Response::Busy, Vec::new()),
+                        Err(error) => (
+                            Response::Error {
+                                code: ErrorCode::Internal,
+                                message: error.to_string(),
+                            },
+                            Vec::new(),
+                        ),
+                    }
+                }
+            }
             Request::OpenPro => {
                 if session.is_some() {
                     (
@@ -287,6 +331,31 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
     if let Some(session_id) = session {
         state.close(session_id);
     }
+}
+
+fn peer_credentials(stream: &UnixStream) -> io::Result<libc::ucred> {
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: the output buffer and its length describe a writable ucred.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if length as usize != std::mem::size_of::<libc::ucred>() || credentials.pid <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid peer credentials",
+        ));
+    }
+    Ok(credentials)
 }
 
 fn not_owner() -> Response {
@@ -461,6 +530,124 @@ mod tests {
         let response =
             decode_response(&bytes[..received as usize]).expect("response should decode");
         (response, fds)
+    }
+
+    #[test]
+    fn directional_control_uses_kernel_credentials_and_connection_owned_ids() {
+        use sidealsa_protocol::PortDirection;
+        let state = Arc::new(
+            DaemonState::new(
+                &Profile::from_toml(PROFILE).unwrap(),
+                Arc::new(HardwareTimeline::default()),
+            )
+            .unwrap(),
+        );
+        let (mut p, server_p) = UnixStream::pair().unwrap();
+        let (mut c, server_c) = UnixStream::pair().unwrap();
+        let credentials = peer_credentials(&server_p).unwrap();
+        assert_eq!(credentials.pid as u32, std::process::id());
+        assert_eq!(credentials.uid, unsafe { libc::getuid() });
+        let p_state = Arc::clone(&state);
+        let c_state = Arc::clone(&state);
+        let p_thread = thread::spawn(move || handle_client(server_p, p_state));
+        let c_thread = thread::spawn(move || handle_client(server_c, c_state));
+        for stream in [&mut p, &mut c] {
+            assert!(
+                matches!(request(stream, Request::Hello { version: 16 }), Response::Hello { version: 16, features } if features & FEATURE_PRO_DIRECTIONS != 0)
+            );
+        }
+        let (response, fds) = request_with_fds(
+            &mut p,
+            Request::OpenProDirection {
+                direction: PortDirection::Playback,
+                group_token: [1, 2],
+            },
+        );
+        let p_id = match response {
+            Response::OpenProDirection {
+                session_id,
+                direction: PortDirection::Playback,
+                shared,
+            } => {
+                assert_eq!((shared.playback_channels, shared.capture_channels), (2, 0));
+                session_id
+            }
+            other => panic!("unexpected response {other:?}"),
+        };
+        assert_eq!(fds.len(), 4);
+        for fd in fds {
+            unsafe { libc::close(fd) };
+        }
+        assert_eq!(
+            request(
+                &mut c,
+                Request::OpenProDirection {
+                    direction: PortDirection::Capture,
+                    group_token: [1, 3]
+                }
+            ),
+            Response::Busy
+        );
+        let (response, fds) = request_with_fds(
+            &mut c,
+            Request::OpenProDirection {
+                direction: PortDirection::Capture,
+                group_token: [1, 2],
+            },
+        );
+        let c_id = match response {
+            Response::OpenProDirection {
+                session_id,
+                direction: PortDirection::Capture,
+                shared,
+            } => {
+                assert_eq!((shared.playback_channels, shared.capture_channels), (0, 2));
+                session_id
+            }
+            other => panic!("unexpected response {other:?}"),
+        };
+        assert_eq!(fds.len(), 4);
+        for fd in fds {
+            unsafe { libc::close(fd) };
+        }
+        for forbidden in [
+            Request::Start { session_id: c_id },
+            Request::Stop { session_id: c_id },
+            Request::Close { session_id: c_id },
+        ] {
+            assert!(matches!(
+                request(&mut p, forbidden),
+                Response::Error {
+                    code: ErrorCode::NotOwner,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(
+            request(&mut p, Request::Start { session_id: p_id }),
+            Response::Ack
+        );
+        assert_eq!(
+            request(&mut c, Request::Start { session_id: c_id }),
+            Response::Ack
+        );
+        drop(p);
+        p_thread.join().unwrap();
+        assert!(!state.owns(p_id));
+        assert!(state.owns(c_id));
+        assert!(state.open_pro().unwrap().is_none());
+        assert_eq!(
+            request(&mut c, Request::Stop { session_id: c_id }),
+            Response::Ack
+        );
+        assert_eq!(
+            request(&mut c, Request::Start { session_id: c_id }),
+            Response::Ack
+        );
+        drop(c);
+        c_thread.join().unwrap();
+        assert!(!state.owns(c_id));
+        assert!(state.open_pro().unwrap().is_some());
     }
 
     #[test]

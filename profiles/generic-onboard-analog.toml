@@ -1,0 +1,37 @@
+# Unverified starting point, not a hardware capability declaration.
+# Select playback and capture independently; replace both placeholders.
+# No analog/HDMI aggregation or independent-clock synchronization.
+[device]
+name = "Generic onboard analog (unverified draft)"
+rate = 48000
+period_size = 64
+hardware_period_size = 64
+buffer_size = 256
+shared_buffer_size = 512
+duplex_link = false
+pro_latency_periods = 1
+shared_latency_periods = 5
+realtime = true
+realtime_priority = 50
+pro_realtime_priority = 48
+# Desktop PipeWire priority remains the integration default, 10.
+
+[device.playback]
+device = "hw:YOUR_PLAYBACK_CARD,0"
+channels = 2
+format = "S32_LE"
+
+[device.capture]
+device = "hw:YOUR_CAPTURE_CARD,0"
+channels = 2
+format = "S32_LE"
+
+[[ports.playback]]
+id = "output"
+name = "Output"
+channels = [0, 1]
+
+[[ports.capture]]
+id = "input"
+name = "Input"
+channels = [0, 1]

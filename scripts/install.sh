@@ -5,6 +5,13 @@
 set -Eeuo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+if [[ ${1:-} == --interactive ]]; then
+    (($# == 1)) || { printf 'Use --interactive alone; select options in the menu.\n' >&2; exit 2; }
+    exec bash "$ROOT/scripts/setup.sh"
+fi
+if (($# == 0)); then
+    exec bash "$ROOT/scripts/setup.sh"
+fi
 PREFIX="${PREFIX:-/usr/local}"
 DESTDIR="${DESTDIR:-}"
 PROFILE_SOURCE="$ROOT/profiles/topping-e1x2.toml"
@@ -131,6 +138,7 @@ Usage: scripts/install.sh [options]
 Build and install SideALSA system files.
 
 Options:
+  --interactive             Terminal device/profile setup (use alone; default with no args)
   --prefix PATH             Binary and data prefix (default: /usr/local)
   --profile PATH            Profile seed for first install; existing config is preserved
   --socket PATH             Daemon socket (default: /tmp/sidealsad.sock)
@@ -321,6 +329,7 @@ if ((INSTALL_GUI == 1)); then
 fi
 
 BINARIES=(
+    sidealsa-setup
     sidealsa-config-gen
     sidealsad
     sidealsa-hw-test

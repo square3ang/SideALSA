@@ -9,16 +9,85 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
     os::unix::net::UnixStream,
     path::Path,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use sidealsa_protocol::{
-    DeviceInfo, ErrorCode, MAX_FRAME_PAYLOAD, PROTOCOL_MAGIC, PROTOCOL_VERSION, PortDirection,
-    ProtocolError, Request, Response, SHARED_CLIENT_IDLE, SharedRegionInfo, Stats, write_request,
+    DeviceInfo, ErrorCode, FEATURE_PRO_DIRECTIONS, MAX_FRAME_PAYLOAD, PROTOCOL_MAGIC,
+    PROTOCOL_VERSION, PortDirection, ProtocolError, Request, Response, SHARED_CLIENT_IDLE,
+    SharedRegionInfo, Stats, write_request,
 };
 use thiserror::Error;
 
 const EVENTFD_IO_ATTEMPTS: usize = 2;
+
+struct ProTokenState {
+    owner_pid: AtomicU32,
+    token: OnceLock<Result<[u64; 2], i32>>,
+}
+
+impl ProTokenState {
+    const fn new() -> Self {
+        Self {
+            owner_pid: AtomicU32::new(0),
+            token: OnceLock::new(),
+        }
+    }
+
+    fn get(&self, pid: u32) -> Result<[u64; 2], ClientError> {
+        // Establish ownership BEFORE touching OnceLock: a fork may inherit an
+        // initializer locked by a thread that does not exist in the child.
+        let owner = self
+            .owner_pid
+            .compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire)
+            .unwrap_or_else(|owner| owner);
+        if owner != 0 && owner != pid {
+            return Err(ClientError::ForkedProcess);
+        }
+        match *self.token.get_or_init(|| {
+            loop {
+                let mut bytes = [0_u8; 16];
+                let mut filled = 0;
+                while filled < bytes.len() {
+                    let count = unsafe {
+                        libc::getrandom(
+                            bytes[filled..].as_mut_ptr().cast(),
+                            bytes.len() - filled,
+                            0,
+                        )
+                    };
+                    if count < 0 {
+                        let error = io::Error::last_os_error();
+                        if error.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return Err(error.raw_os_error().unwrap_or(libc::EIO));
+                    }
+                    if count == 0 {
+                        return Err(libc::EIO);
+                    }
+                    filled += count as usize;
+                }
+                let token = [
+                    u64::from_ne_bytes(bytes[..8].try_into().unwrap()),
+                    u64::from_ne_bytes(bytes[8..].try_into().unwrap()),
+                ];
+                if token != [0; 2] {
+                    return Ok(token);
+                }
+            }
+        }) {
+            Ok(token) => Ok(token),
+            Err(errno) => Err(io::Error::from_raw_os_error(errno).into()),
+        }
+    }
+}
+
+static PRO_TOKEN: ProTokenState = ProTokenState::new();
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -32,6 +101,8 @@ pub enum ClientError {
     Busy,
     #[error("daemon does not support requested operation")]
     Unsupported,
+    #[error("directional PRO client cannot be used after fork; exec a new process")]
+    ForkedProcess,
     #[error("daemon rejected request: {code:?}: {message}")]
     Daemon { code: ErrorCode, message: String },
     #[error("unexpected daemon response: {0:?}")]
@@ -68,6 +139,7 @@ pub struct PeerCredentials {
 pub struct SideAlsaClient {
     control: UnixStream,
     features: u32,
+    creator_pid: u32,
 }
 
 impl SideAlsaClient {
@@ -83,6 +155,7 @@ impl SideAlsaClient {
     }
 
     fn connect_inner(path: &Path, timeout: Option<Duration>) -> Result<Self, ClientError> {
+        let creator_pid = std::process::id();
         let mut control = UnixStream::connect(path)?;
         control.set_read_timeout(timeout)?;
         control.set_write_timeout(timeout)?;
@@ -96,7 +169,11 @@ impl SideAlsaClient {
             Response::Hello { version, features } if version == PROTOCOL_VERSION => features,
             response => return Err(response_error(response)),
         };
-        Ok(Self { control, features })
+        Ok(Self {
+            control,
+            features,
+            creator_pid,
+        })
     }
 
     pub fn connect_default() -> Result<Self, ClientError> {
@@ -163,6 +240,52 @@ impl SideAlsaClient {
         AudioStream::from_parts(control, session_id, StreamMode::Pro, shared, fds)
     }
 
+    /// Opens an independent PRO direction, grouped with other directional opens
+    /// in this process. Unsupported daemons receive no open request. After fork,
+    /// exec is required if the parent has initialized the process capability.
+    /// Inherited connections are always rejected; reconnect after exec.
+    pub fn open_pro_direction(self, direction: PortDirection) -> Result<AudioStream, ClientError> {
+        let creator_pid = std::process::id();
+        // SO_PEERCRED still identifies the process that created the connection,
+        // even when no token had been initialized before the fork.
+        if self.creator_pid != creator_pid {
+            return Err(ClientError::ForkedProcess);
+        }
+        if self.features & FEATURE_PRO_DIRECTIONS == 0 {
+            return Err(ClientError::Unsupported);
+        }
+        let group_token = PRO_TOKEN.get(creator_pid)?;
+        let mut control = self.control;
+        write_request(
+            &mut control,
+            &Request::OpenProDirection {
+                direction,
+                group_token,
+            },
+        )?;
+        let (response, fds) = receive_with_fds(&control)?;
+        let (session_id, shared) = match response {
+            Response::OpenProDirection {
+                session_id,
+                direction: reply_direction,
+                shared,
+            } if reply_direction == direction => (session_id, shared),
+            response => return Err(response_error(response)),
+        };
+        let valid = match direction {
+            PortDirection::Playback => shared.playback_channels > 0 && shared.capture_channels == 0,
+            PortDirection::Capture => shared.capture_channels > 0 && shared.playback_channels == 0,
+        };
+        if !valid {
+            return Err(ProtocolError::MalformedPayload.into());
+        }
+        let mut stream =
+            AudioStream::from_parts(control, session_id, StreamMode::Pro, shared, fds)?;
+        stream.pro_direction = Some(direction);
+        stream.creator_pid = creator_pid;
+        Ok(stream)
+    }
+
     pub fn open_shared(self, port_id: impl Into<String>) -> Result<AudioStream, ClientError> {
         let mut control = self.control;
         write_request(
@@ -194,6 +317,8 @@ pub struct AudioStream {
     control: UnixStream,
     session_id: u64,
     mode: StreamMode,
+    pro_direction: Option<PortDirection>,
+    creator_pid: u32,
     info: SharedRegionInfo,
     region: SharedRegion,
     capture_event: EventFd,
@@ -233,6 +358,8 @@ impl AudioStream {
             control,
             session_id,
             mode,
+            pro_direction: None,
+            creator_pid: std::process::id(),
             info,
             region,
             capture_event: EventFd::from_owned(capture_event),
@@ -251,6 +378,20 @@ impl AudioStream {
 
     pub fn mode(&self) -> StreamMode {
         self.mode
+    }
+
+    /// Direction for an independent PRO session; None for classic PRO and SHARED.
+    pub fn pro_direction(&self) -> Option<PortDirection> {
+        self.pro_direction
+    }
+
+    fn inherited_direction(&self) -> bool {
+        self.pro_direction.is_some() && self.creator_pid != std::process::id()
+    }
+
+    fn buffered_capture(&self) -> bool {
+        self.mode == StreamMode::Shared(PortDirection::Capture)
+            || self.pro_direction == Some(PortDirection::Capture)
     }
 
     pub fn info(&self) -> SharedRegionInfo {
@@ -276,19 +417,31 @@ impl AudioStream {
     }
 
     pub fn record_realtime_failure(&self) {
+        if self.inherited_direction() {
+            return;
+        }
         self.region.record_client_realtime_failure();
     }
 
     pub fn record_callback_timing(&self, duration_nanos: u64, period_nanos: u64) {
+        if self.inherited_direction() {
+            return;
+        }
         self.region
             .record_client_callback_timing(duration_nanos, period_nanos);
     }
 
     pub fn record_expired_playback_periods(&self, periods: u64) {
+        if self.inherited_direction() {
+            return;
+        }
         self.region.record_client_expired_playback_periods(periods);
     }
 
     pub fn record_playback_xrun(&self) {
+        if self.inherited_direction() {
+            return;
+        }
         self.region.record_client_playback_xrun();
     }
 
@@ -313,7 +466,7 @@ impl AudioStream {
             Response::Ack => {
                 // START establishes a new lifecycle before its ACK. Adopt that
                 // rebase only here, without hiding capture loss during START.
-                if self.mode == StreamMode::Shared(PortDirection::Capture) {
+                if self.buffered_capture() {
                     self.lifecycle_generation = self.region.lifecycle_generation();
                 }
                 self.started = true;
@@ -388,6 +541,9 @@ impl AudioStream {
     }
 
     pub fn notification_fd(&self) -> Result<RawFd, ClientError> {
+        if self.inherited_direction() {
+            return Err(ClientError::ForkedProcess);
+        }
         let fd = if self.info.capture_channels > 0 {
             self.capture_event.as_raw_fd()
         } else if self.info.playback_channels > 0 {
@@ -399,6 +555,9 @@ impl AudioStream {
     }
 
     pub fn control_fd(&self) -> Result<RawFd, ClientError> {
+        if self.inherited_direction() {
+            return Err(ClientError::ForkedProcess);
+        }
         Ok(duplicate_cloexec(self.control.as_raw_fd())?)
     }
 
@@ -430,8 +589,10 @@ impl AudioStream {
             let sequence = self.region.cycle_sequence();
             // Free unused input even when startup cannot accept this cycle;
             // otherwise a full capture ring can suppress all subsequent wakes.
-            self.region
-                .discard_capture_through(sequence, self.region.playback_sequence());
+            if self.info.capture_channels > 0 {
+                self.region
+                    .discard_capture_through(sequence, self.region.playback_sequence());
+            }
             if self
                 .activation_sequence()
                 .is_some_and(|start| sequence_is_before(start, sequence))
@@ -468,14 +629,39 @@ impl AudioStream {
             self.refresh_generation();
             self.check_hardware_generation()?;
             self.check_capture_discontinuity()?;
+            if self.pro_direction == Some(PortDirection::Playback) {
+                self.playback_event.drain();
+                let generation = self.lifecycle_generation;
+                if self.has_ready_pro_playback() {
+                    let sequence = self.region.cycle_sequence();
+                    self.check_hardware_generation()?;
+                    if self.region.lifecycle_generation() != generation
+                        || self.last_sequence == Some(sequence)
+                        || !self
+                            .activation_sequence()
+                            .is_some_and(|start| sequence_is_before(start, sequence))
+                        || sequence_is_before(sequence, self.region.playback_sequence())
+                    {
+                        continue;
+                    }
+                    self.last_sequence = Some(sequence);
+                    return Ok(sequence);
+                }
+                let wait = self
+                    .playback_event
+                    .wait_until(self.control.as_raw_fd(), deadline);
+                if matches!(&wait, Err(ClientError::Closed)) {
+                    self.poison_control();
+                }
+                wait?;
+                continue;
+            }
             if self.info.capture_channels > 0 {
                 let ready_sequence = match self.mode {
-                    StreamMode::Pro => self
+                    StreamMode::Pro if !self.buffered_capture() => self
                         .region
                         .oldest_valid_client_capture_sequence(self.region.playback_sequence()),
-                    StreamMode::Shared(_) => {
-                        self.region.next_client_capture_sequence(self.capture_index)
-                    }
+                    _ => self.region.next_client_capture_sequence(self.capture_index),
                 };
                 if let Some(sequence) = ready_sequence
                     && self.last_sequence != Some(sequence)
@@ -543,17 +729,42 @@ impl AudioStream {
     /// Shared-memory readiness hint only; no notification I/O. Acquisition must
     /// still use the normal generation/expiry checks and monitor daemon control.
     pub fn has_ready_capture(&self) -> bool {
-        if !self.started || self.closed || self.info.capture_channels == 0 {
+        if self.inherited_direction()
+            || !self.started
+            || self.closed
+            || self.info.capture_channels == 0
+        {
             return false;
         }
-        let minimum = matches!(self.mode, StreamMode::Pro).then(|| self.region.playback_sequence());
+        let minimum = (self.mode == StreamMode::Pro && !self.buffered_capture())
+            .then(|| self.region.playback_sequence());
         self.region.has_ready_capture_since(minimum)
+    }
+
+    /// Nonblocking shared-memory hint for directional PRO playback's strict
+    /// current clock. Never reports an already-consumed or previously returned
+    /// cycle at the time of observation. No eventfd I/O; callers must still use
+    /// wait_period for acquisition and generation checks, and monitor control_fd
+    /// for daemon disconnects.
+    pub fn has_ready_pro_playback(&self) -> bool {
+        if self.inherited_direction()
+            || !self.started
+            || self.closed
+            || self.pro_direction != Some(PortDirection::Playback)
+        {
+            return false;
+        }
+        let sequence = self.region.cycle_sequence();
+        self.activation_sequence()
+            .is_some_and(|start| sequence_is_before(start, sequence))
+            && self.last_sequence != Some(sequence)
+            && !sequence_is_before(sequence, self.region.playback_sequence())
     }
 
     /// Complete capture frames currently published in shared memory, excluding
     /// any caller-owned scratch buffer. This is not a generation/expiry check.
     pub fn capture_frames_ready(&self) -> u64 {
-        if self.info.capture_channels == 0 {
+        if self.inherited_direction() || self.info.capture_channels == 0 {
             return 0;
         }
         (self.region.ready_capture_slots() as u64)
@@ -565,6 +776,16 @@ impl AudioStream {
     pub fn validate_shared_capture(&mut self) -> Result<(), ClientError> {
         self.ensure_open()?;
         if self.mode != StreamMode::Shared(PortDirection::Capture) {
+            return Err(ClientError::Unsupported);
+        }
+        self.validate_buffered_capture()
+    }
+
+    /// Validates SHARED or directional PRO buffered capture, including retained
+    /// partial blocks. Invalidate retained samples on error, until prepare.
+    pub fn validate_buffered_capture(&mut self) -> Result<(), ClientError> {
+        self.ensure_open()?;
+        if !self.buffered_capture() {
             return Err(ClientError::Unsupported);
         }
         if !self.started {
@@ -583,10 +804,10 @@ impl AudioStream {
         self.capture_event.drain();
         let sequence = self.capture_buffer(samples)?;
         let next = match self.mode {
-            StreamMode::Pro => self
+            StreamMode::Pro if !self.buffered_capture() => self
                 .region
                 .oldest_valid_client_capture_sequence(self.region.playback_sequence()),
-            StreamMode::Shared(_) => self.region.next_client_capture_sequence(self.capture_index),
+            _ => self.region.next_client_capture_sequence(self.capture_index),
         };
         if next.is_some() {
             self.capture_event.notify()?;
@@ -603,7 +824,7 @@ impl AudioStream {
             return Err(ClientError::MissingDirection("capture"));
         }
         let sequence = match self.mode {
-            StreamMode::Pro => loop {
+            StreamMode::Pro if !self.buffered_capture() => loop {
                 let minimum_sequence = self.region.playback_sequence();
                 let sequence = self.region.try_client_read_valid_capture(
                     &mut self.capture_index,
@@ -669,6 +890,9 @@ impl AudioStream {
     }
 
     fn ensure_open(&self) -> Result<(), ClientError> {
+        if self.inherited_direction() {
+            return Err(ClientError::ForkedProcess);
+        }
         if self.closed {
             Err(ClientError::Closed)
         } else {
@@ -710,9 +934,9 @@ impl AudioStream {
     }
 
     fn refresh_generation(&mut self) {
-        // Shared capture must report a rebase, not silently adopt it while an
+        // Buffered capture must report a rebase, not silently adopt it while an
         // adapter may still hold samples from the old generation.
-        if self.mode == StreamMode::Shared(PortDirection::Capture) {
+        if self.buffered_capture() {
             return;
         }
         let generation = self.region.lifecycle_generation();
@@ -725,7 +949,7 @@ impl AudioStream {
     }
 
     fn check_capture_discontinuity(&mut self) -> Result<(), ClientError> {
-        if self.mode == StreamMode::Shared(PortDirection::Capture)
+        if self.buffered_capture()
             && self.region.lifecycle_generation() != self.lifecycle_generation
         {
             return Err(ClientError::CaptureDiscontinuity);
@@ -762,6 +986,9 @@ impl AudioStream {
 
 impl Drop for AudioStream {
     fn drop(&mut self) {
+        if self.inherited_direction() {
+            return;
+        }
         if !self.closed {
             self.region.set_client_state(SHARED_CLIENT_IDLE);
             let _ = write_request(
@@ -1121,6 +1348,418 @@ mod tests {
             response_error(Response::Unsupported),
             ClientError::Unsupported
         ));
+    }
+
+    fn directional_stream(direction: PortDirection) -> (AudioStream, SharedRegion, UnixStream) {
+        let (playback, capture) = match direction {
+            PortDirection::Playback => (2, 0),
+            PortDirection::Capture => (0, 2),
+        };
+        let region = SharedRegion::create(1, playback, capture).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "sidealsa-direction-test-{}-{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let info = region.info();
+        let descriptors = owned_fds([
+            duplicate_cloexec(region.fd()).unwrap(),
+            event_fd(),
+            event_fd(),
+            event_fd(),
+        ]);
+        let server = thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            assert_eq!(
+                sidealsa_protocol::read_request(&mut peer).unwrap(),
+                Request::Hello {
+                    version: PROTOCOL_VERSION
+                }
+            );
+            sidealsa_protocol::write_response(
+                &mut peer,
+                &Response::Hello {
+                    version: PROTOCOL_VERSION,
+                    features: FEATURE_PRO_DIRECTIONS,
+                },
+            )
+            .unwrap();
+            let Request::OpenProDirection {
+                direction: requested,
+                group_token,
+            } = sidealsa_protocol::read_request(&mut peer).unwrap()
+            else {
+                panic!("expected directional open")
+            };
+            assert_eq!(requested, direction);
+            assert_eq!(group_token, PRO_TOKEN.get(std::process::id()).unwrap());
+            assert_ne!(group_token, [0; 2]);
+            let frame = sidealsa_protocol::encode_response(&Response::OpenProDirection {
+                session_id: if direction == PortDirection::Playback {
+                    19
+                } else {
+                    20
+                },
+                direction,
+                shared: info,
+            })
+            .unwrap();
+            let raw: Vec<_> = descriptors.iter().map(AsRawFd::as_raw_fd).collect();
+            send_with_fds(&peer, &frame, &raw);
+            peer
+        });
+        let stream = SideAlsaClient::connect(&path)
+            .unwrap()
+            .open_pro_direction(direction)
+            .unwrap();
+        let peer = server.join().unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(stream.mode(), StreamMode::Pro);
+        assert_eq!(stream.pro_direction(), Some(direction));
+        (stream, region, peer)
+    }
+
+    #[test]
+    fn directional_open_feature_gate_sends_nothing() {
+        let (mut peer, control) = UnixStream::pair().unwrap();
+        assert!(matches!(
+            SideAlsaClient {
+                control,
+                features: 3,
+                creator_pid: std::process::id(),
+            }
+            .open_pro_direction(PortDirection::Playback),
+            Err(ClientError::Unsupported)
+        ));
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+    }
+
+    #[test]
+    fn directional_open_rejects_wrong_direction_and_geometry() {
+        use PortDirection::{Capture, Playback};
+        for (requested, reply_direction, playback, capture) in [
+            (Playback, Capture, 0, 2),
+            (Playback, Playback, 2, 2),
+            (Playback, Playback, 0, 2),
+            (Capture, Playback, 2, 0),
+            (Capture, Capture, 2, 2),
+            (Capture, Capture, 2, 0),
+        ] {
+            let (mut peer, control) = UnixStream::pair().unwrap();
+            let server = thread::spawn(move || {
+                assert!(matches!(
+                    sidealsa_protocol::read_request(&mut peer).unwrap(),
+                    Request::OpenProDirection { .. }
+                ));
+                let region = SharedRegion::create(1, playback, capture).unwrap();
+                sidealsa_protocol::write_response(
+                    &mut peer,
+                    &Response::OpenProDirection {
+                        session_id: 19,
+                        direction: reply_direction,
+                        shared: region.info(),
+                    },
+                )
+                .unwrap();
+            });
+            let result = SideAlsaClient {
+                control,
+                features: FEATURE_PRO_DIRECTIONS,
+                creator_pid: std::process::id(),
+            }
+            .open_pro_direction(requested);
+            if reply_direction != requested {
+                assert!(matches!(result, Err(ClientError::UnexpectedResponse(_))));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ClientError::Protocol(ProtocolError::MalformedPayload))
+                ));
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn inherited_preopen_connection_is_rejected_before_token_initialization() {
+        const CHILD: &str = "SIDEALSA_TEST_PREOPEN_EXEC_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // A fresh test executable isolates the uninitialized global token
+            // from parallel tests, without forking with inherited Rust locks.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::inherited_preopen_connection_is_rejected_before_token_initialization",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert_eq!(PRO_TOKEN.owner_pid.load(Ordering::Acquire), 0);
+        let (mut peer, control) = UnixStream::pair().unwrap();
+        control
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut parent_control = control.try_clone().unwrap();
+        let inherited = SideAlsaClient {
+            control,
+            features: FEATURE_PRO_DIRECTIONS,
+            creator_pid: std::process::id().wrapping_add(1),
+        };
+        assert!(matches!(
+            inherited.open_pro_direction(PortDirection::Playback),
+            Err(ClientError::ForkedProcess)
+        ));
+        assert_eq!(PRO_TOKEN.owner_pid.load(Ordering::Acquire), 0);
+        assert!(PRO_TOKEN.token.get().is_none());
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(
+            peer.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        // Consuming the inherited client must only close its descriptor, not
+        // send an open/CLOSE frame or shut down the parent's shared socket.
+        parent_control.write_all(&[123]).unwrap();
+        let mut byte = [0];
+        peer.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [123]);
+
+        // This exec-created process can still establish fresh connections and
+        // initialize its own token after rejecting the simulated inherited one.
+        let (_playback, _output, _playback_peer) = directional_stream(PortDirection::Playback);
+        let (_capture, _input, _capture_peer) = directional_stream(PortDirection::Capture);
+        assert_eq!(
+            PRO_TOKEN.owner_pid.load(Ordering::Acquire),
+            std::process::id()
+        );
+    }
+
+    #[test]
+    fn directional_capability_is_process_local_and_fork_guard_precedes_once_lock() {
+        let state = ProTokenState::new();
+        let token = state.get(123).unwrap();
+        assert_ne!(token, [0; 2]);
+        assert_eq!(state.get(123).unwrap(), token);
+        assert!(matches!(state.get(456), Err(ClientError::ForkedProcess)));
+        // Simulate a fork while the parent's initializer is still in progress.
+        let initializing = ProTokenState::new();
+        initializing.owner_pid.store(123, Ordering::Release);
+        assert!(matches!(
+            initializing.get(456),
+            Err(ClientError::ForkedProcess)
+        ));
+        assert!(initializing.token.get().is_none());
+        let threads: Vec<_> = (0..8)
+            .map(|_| thread::spawn(|| PRO_TOKEN.get(std::process::id()).unwrap()))
+            .collect();
+        let tokens: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(tokens.iter().all(|token| *token == tokens[0]));
+    }
+
+    #[test]
+    fn inherited_direction_rejects_io_and_drop_preserves_parent_socket() {
+        let (mut stream, region, mut peer) = directional_stream(PortDirection::Playback);
+        let mut parent_control = stream.control.try_clone().unwrap();
+        stream.started = true;
+        stream.creator_pid = std::process::id().wrapping_add(1);
+        assert!(matches!(stream.start(), Err(ClientError::ForkedProcess)));
+        assert!(matches!(stream.stop(), Err(ClientError::ForkedProcess)));
+        assert!(matches!(stream.prepare(), Err(ClientError::ForkedProcess)));
+        assert!(matches!(stream.close(), Err(ClientError::ForkedProcess)));
+        assert!(matches!(
+            stream.get_stats(),
+            Err(ClientError::ForkedProcess)
+        ));
+        assert!(matches!(
+            stream.notification_fd(),
+            Err(ClientError::ForkedProcess)
+        ));
+        assert!(matches!(
+            stream.control_fd(),
+            Err(ClientError::ForkedProcess)
+        ));
+        assert!(matches!(
+            stream.wait_period(Duration::ZERO),
+            Err(ClientError::ForkedProcess)
+        ));
+        assert!(matches!(
+            stream.wait_pro_playback_period(Duration::ZERO),
+            Err(ClientError::ForkedProcess)
+        ));
+        assert!(matches!(
+            stream.capture_buffer(&mut [0; 2]),
+            Err(ClientError::ForkedProcess)
+        ));
+        assert!(matches!(
+            stream.submit_playback(1, &[0; 2]),
+            Err(ClientError::ForkedProcess)
+        ));
+        assert!(!stream.has_ready_pro_playback());
+        stream.record_playback_xrun();
+        assert_eq!(region.client_playback_xruns(), 0);
+        drop(stream);
+        parent_control.write_all(&[123]).unwrap();
+        let mut byte = [0];
+        peer.read_exact(&mut byte).unwrap();
+        assert_eq!(
+            byte,
+            [123],
+            "drop must neither send CLOSE nor shutdown the socket"
+        );
+    }
+
+    #[test]
+    fn directional_capture_is_buffered_and_maps_have_independent_lifecycles() {
+        let (mut playback, output, mut playback_peer) = directional_stream(PortDirection::Playback);
+        let (mut capture, input, _capture_peer) = directional_stream(PortDirection::Capture);
+        playback.started = true;
+        capture.started = true;
+        let mut index = 0;
+        for sequence in 1..=3 {
+            assert!(input.try_publish_capture(&mut index, sequence, &[sequence as i32; 2]));
+        }
+        output.set_playback_sequence(100);
+        input.set_playback_sequence(100);
+        let server = thread::spawn(move || {
+            for expected in [
+                Request::Stop { session_id: 19 },
+                Request::Start { session_id: 19 },
+                Request::Close { session_id: 19 },
+            ] {
+                assert_eq!(
+                    sidealsa_protocol::read_request(&mut playback_peer).unwrap(),
+                    expected
+                );
+                sidealsa_protocol::write_response(&mut playback_peer, &Response::Ack).unwrap();
+            }
+        });
+        playback.stop().unwrap();
+        playback.start().unwrap();
+        playback.close().unwrap();
+        server.join().unwrap();
+        assert_eq!(input.ready_capture_slots(), 3);
+        assert!(matches!(
+            capture.validate_shared_capture(),
+            Err(ClientError::Unsupported)
+        ));
+        capture.validate_buffered_capture().unwrap();
+        assert!(matches!(
+            capture.wait_pro_playback_period(Duration::ZERO),
+            Err(ClientError::MissingDirection("playback"))
+        ));
+        for sequence in 1..=3 {
+            assert!(capture.has_ready_capture());
+            assert_eq!(capture.wait_period(Duration::ZERO).unwrap(), sequence);
+            let mut samples = [0; 2];
+            assert_eq!(
+                capture.try_capture_buffer(&mut samples).unwrap(),
+                Some(sequence)
+            );
+            assert_eq!(samples, [sequence as i32; 2]);
+        }
+        assert!(!capture.has_ready_capture());
+        assert_eq!(input.client_expired_capture_blocks(), 0);
+        input.record_capture_discontinuity();
+        assert!(matches!(
+            capture.validate_buffered_capture(),
+            Err(ClientError::CaptureDiscontinuity)
+        ));
+        input.set_hardware_generation(1);
+        assert!(matches!(
+            capture.capture_buffer(&mut [0; 2]),
+            Err(ClientError::CaptureDiscontinuity)
+        ));
+        input.set_lifecycle_generation(1);
+        assert!(matches!(
+            capture.wait_period(Duration::ZERO),
+            Err(ClientError::CaptureDiscontinuity)
+        ));
+        assert!(matches!(
+            capture.validate_buffered_capture(),
+            Err(ClientError::CaptureDiscontinuity)
+        ));
+    }
+
+    #[test]
+    fn directional_playback_strict_clock_rejects_consumed_cycles_but_fifo_wait_does_not() {
+        let (mut stream, region, _peer) = directional_stream(PortDirection::Playback);
+        stream.started = true;
+        region.reset_activation();
+        assert!(region.establish_activation(8));
+        region.set_cycle_sequence(8);
+        assert!(!stream.has_ready_pro_playback());
+        assert!(matches!(
+            stream.wait_period(Duration::ZERO),
+            Err(ClientError::Timeout)
+        ));
+        region.set_cycle_sequence(9);
+        region.set_playback_sequence(9);
+        // The early playback event represents capture-ready, before consumption.
+        stream.playback_event.notify().unwrap();
+        assert!(stream.has_ready_pro_playback());
+        assert_eq!(stream.wait_period(Duration::ZERO).unwrap(), 9);
+        assert!(!stream.has_ready_pro_playback());
+        region.set_cycle_sequence(10);
+        region.set_playback_sequence(11);
+        stream.playback_event.notify().unwrap();
+        assert!(!stream.has_ready_pro_playback());
+        assert!(matches!(
+            stream.wait_period(Duration::ZERO),
+            Err(ClientError::Timeout)
+        ));
+        assert_eq!(stream.wait_pro_playback_period(Duration::ZERO).unwrap(), 10);
+        region.set_cycle_sequence(11);
+        // Clock state, not the eventfd hint, is authoritative.
+        assert!(stream.has_ready_pro_playback());
+        assert_eq!(stream.wait_period(Duration::ZERO).unwrap(), 11);
+        region.set_hardware_generation(1);
+        assert!(matches!(
+            stream.wait_period(Duration::ZERO),
+            Err(ClientError::CaptureDiscontinuity)
+        ));
+    }
+
+    #[test]
+    fn directional_playback_waits_on_early_output_event_for_both_clock_apis() {
+        for fifo in [false, true] {
+            let (mut stream, region, _peer) = directional_stream(PortDirection::Playback);
+            stream.started = true;
+            region.reset_activation();
+            assert!(region.establish_activation(8));
+            region.set_cycle_sequence(8);
+            let event = unsafe { OwnedFd::from_raw_fd(stream.notification_fd().unwrap()) };
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let waiter = thread::spawn(move || {
+                ready_tx.send(()).unwrap();
+                let result = if fifo {
+                    stream.wait_pro_playback_period(Duration::from_secs(1))
+                } else {
+                    stream.wait_period(Duration::from_secs(1))
+                };
+                (stream, result)
+            });
+            ready_rx.recv().unwrap();
+            thread::sleep(Duration::from_millis(20));
+            region.set_cycle_sequence(9);
+            region.set_playback_sequence(9);
+            signal_event(event.as_raw_fd());
+            let (_stream, result) = waiter.join().unwrap();
+            assert_eq!(result.unwrap(), 9);
+        }
     }
 
     #[test]

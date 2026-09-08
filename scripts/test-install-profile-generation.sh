@@ -17,7 +17,7 @@ mkdir -p "$CHECKOUT/scripts" "$CHECKOUT/target/release" "$STAGE" "$TMP/guard"
 cp "$ROOT/scripts/install.sh" "$CHECKOUT/scripts/"
 cp -a "$ROOT/packaging" "$ROOT/configs" "$ROOT/profiles" "$ROOT/docs" "$ROOT/LICENSE" "$CHECKOUT/"
 cp "$GENERATOR" "$CHECKOUT/target/release/"
-for binary in sidealsad sidealsa-hw-test sidealsa-pro-test sidealsa-loopback-test \
+for binary in sidealsa-setup sidealsad sidealsa-hw-test sidealsa-pro-test sidealsa-loopback-test \
     sidealsa-stats sidealsa-pro-client-test sidealsa-shared-test; do
     printf '#!/usr/bin/env bash\n# MOCK artifact, never executed by these tests.\nexit 97\n' > "$CHECKOUT/target/release/$binary"
     chmod +x "$CHECKOUT/target/release/$binary"

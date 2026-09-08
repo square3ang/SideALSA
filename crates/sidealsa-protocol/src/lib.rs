@@ -11,6 +11,7 @@ pub const PROTOCOL_MAGIC: [u8; 4] = *b"SALS";
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 pub const FEATURE_PRO: u32 = 1 << 0;
 pub const FEATURE_SHARED: u32 = 1 << 1;
+pub const FEATURE_PRO_DIRECTIONS: u32 = 1 << 2;
 
 pub const SHARED_MAGIC: u32 = u32::from_le_bytes(*b"SASH");
 pub const SHARED_VERSION: u16 = 9;
@@ -29,18 +30,37 @@ pub const SHARED_ALIGNMENT: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
-    Hello { version: u16 },
+    Hello {
+        version: u16,
+    },
     GetInfo,
     OpenPro,
-    OpenShared { port_id: String },
-    Start { session_id: u64 },
-    Stop { session_id: u64 },
-    Close { session_id: u64 },
+    OpenProDirection {
+        direction: PortDirection,
+        group_token: [u64; 2],
+    },
+    OpenShared {
+        port_id: String,
+    },
+    Start {
+        session_id: u64,
+    },
+    Stop {
+        session_id: u64,
+    },
+    Close {
+        session_id: u64,
+    },
     GetStats,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Response {
+    OpenProDirection {
+        session_id: u64,
+        direction: PortDirection,
+        shared: SharedRegionInfo,
+    },
     Hello {
         version: u16,
         features: u32,
@@ -202,6 +222,7 @@ enum RequestCode {
     Stop = 6,
     Close = 7,
     GetStats = 8,
+    OpenProDirection = 9,
 }
 
 impl TryFrom<u16> for RequestCode {
@@ -217,6 +238,7 @@ impl TryFrom<u16> for RequestCode {
             6 => Ok(Self::Stop),
             7 => Ok(Self::Close),
             8 => Ok(Self::GetStats),
+            9 => Ok(Self::OpenProDirection),
             _ => Err(ProtocolError::UnknownRequest(value)),
         }
     }
@@ -225,6 +247,7 @@ impl TryFrom<u16> for RequestCode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
 enum ResponseCode {
+    OpenProDirection = 10,
     Hello = 1,
     Info = 2,
     OpenPro = 3,
@@ -245,6 +268,7 @@ impl TryFrom<u16> for ResponseCode {
             2 => Ok(Self::Info),
             3 => Ok(Self::OpenPro),
             9 => Ok(Self::OpenShared),
+            10 => Ok(Self::OpenProDirection),
             4 => Ok(Self::Ack),
             5 => Ok(Self::Busy),
             6 => Ok(Self::Unsupported),
@@ -409,6 +433,15 @@ fn encode_request_payload(request: &Request) -> Result<(RequestCode, Vec<u8>), P
         }
         Request::GetInfo => RequestCode::GetInfo,
         Request::OpenPro => RequestCode::OpenPro,
+        Request::OpenProDirection {
+            direction,
+            group_token,
+        } => {
+            put_u8(&mut payload, *direction as u8);
+            put_u64(&mut payload, group_token[0]);
+            put_u64(&mut payload, group_token[1]);
+            RequestCode::OpenProDirection
+        }
         Request::OpenShared { port_id } => {
             put_string(&mut payload, port_id)?;
             RequestCode::OpenShared
@@ -438,6 +471,10 @@ fn decode_request_payload(code: RequestCode, payload: &[u8]) -> Result<Request, 
         },
         RequestCode::GetInfo => Request::GetInfo,
         RequestCode::OpenPro => Request::OpenPro,
+        RequestCode::OpenProDirection => Request::OpenProDirection {
+            direction: PortDirection::try_from(decoder.u8()?)?,
+            group_token: [decoder.u64()?, decoder.u64()?],
+        },
         RequestCode::OpenShared => Request::OpenShared {
             port_id: decoder.string()?,
         },
@@ -459,6 +496,16 @@ fn decode_request_payload(code: RequestCode, payload: &[u8]) -> Result<Request, 
 fn encode_response_payload(response: &Response) -> Result<(ResponseCode, Vec<u8>), ProtocolError> {
     let mut payload = Vec::new();
     let code = match response {
+        Response::OpenProDirection {
+            session_id,
+            direction,
+            shared,
+        } => {
+            put_u64(&mut payload, *session_id);
+            put_u8(&mut payload, *direction as u8);
+            encode_shared_info(&mut payload, shared);
+            ResponseCode::OpenProDirection
+        }
         Response::Hello { version, features } => {
             put_u16(&mut payload, *version);
             put_u32(&mut payload, *features);
@@ -502,6 +549,11 @@ fn encode_response_payload(response: &Response) -> Result<(ResponseCode, Vec<u8>
 fn decode_response_payload(code: ResponseCode, payload: &[u8]) -> Result<Response, ProtocolError> {
     let mut decoder = Decoder::new(payload);
     let response = match code {
+        ResponseCode::OpenProDirection => Response::OpenProDirection {
+            session_id: decoder.u64()?,
+            direction: PortDirection::try_from(decoder.u8()?)?,
+            shared: decode_shared_info(&mut decoder)?,
+        },
         ResponseCode::Hello => Response::Hello {
             version: decoder.u16()?,
             features: decoder.u32()?,
@@ -1078,6 +1130,40 @@ pub fn shared_slot_header_alignment() -> usize {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn directional_pro_round_trips_without_changing_classic_wire() {
+        assert_eq!(PROTOCOL_VERSION, 16);
+        assert_eq!(FEATURE_PRO_DIRECTIONS, 4);
+        assert_eq!(
+            encode_request(&Request::OpenPro).unwrap(),
+            b"SALS\x10\0\x03\0\0\0\0\0"
+        );
+        for direction in [PortDirection::Playback, PortDirection::Capture] {
+            let request = Request::OpenProDirection {
+                direction,
+                group_token: [0x123456789abcdef0, u64::MAX],
+            };
+            let bytes = encode_request(&request).unwrap();
+            assert_eq!(&bytes[6..8], &9_u16.to_le_bytes());
+            assert_eq!(bytes.len(), 29);
+            assert_eq!(decode_request(&bytes).unwrap(), request);
+            let mut invalid = bytes.clone();
+            invalid[12] = 3;
+            assert!(matches!(
+                decode_request(&invalid),
+                Err(ProtocolError::UnknownDirection(3))
+            ));
+            let response = Response::OpenProDirection {
+                session_id: 17,
+                direction,
+                shared: SharedRegionLayout::new(64, 8, 0, 8).unwrap().info(),
+            };
+            let bytes = encode_response(&response).unwrap();
+            assert_eq!(&bytes[6..8], &10_u16.to_le_bytes());
+            assert_eq!(decode_response(&bytes).unwrap(), response);
+        }
+    }
 
     #[test]
     fn request_round_trip() {

@@ -5,6 +5,11 @@ SideALSA PRO client, double-buffered float32 host buffers, worker lifecycle,
 sequence handling, and callback dispatch. The C shim supplies the Wine COM,
 registration, DLL ABI, and `CreateThread` bridge required for Wine TEB setup.
 
+Input-only and output-only objects can now use [directional PRO groups](pro-directions.md).
+`Init` performs discovery; `CreateBuffers` reserves the selected direction(s).
+The paired COM topology has a hardware-free Wine integration test, not an actual
+RTL Utility or physical-device acceptance result.
+
 The reference output-0/input-4 route is the E1x2's internal digital loopback,
 confirmed by the user and USB sample inspection. Historical "analog" labels
 for this route below do not establish DAC/ADC converter latency. The reference

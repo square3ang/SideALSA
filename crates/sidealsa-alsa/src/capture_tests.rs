@@ -48,6 +48,10 @@ fn c_shim_tracks_post_callback_cursor_without_opening_pcm() {
 
 impl Fixture {
     fn new(disconnect_on_stats: bool) -> Self {
+        Self::new_mode(disconnect_on_stats, MODE_SHARED, STREAM_CAPTURE, false)
+    }
+
+    fn new_mode(disconnect_on_stats: bool, mode: c_int, direction: c_int, split: bool) -> Self {
         static ID: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "sidealsa-capture-{}-{}.sock",
@@ -55,7 +59,15 @@ impl Fixture {
             ID.fetch_add(1, AtomicOrdering::Relaxed)
         ));
         let listener = UnixListener::bind(&path).unwrap();
-        let region = Arc::new(SharedRegion::create(64, 0, 1).unwrap());
+        let playback = direction == STREAM_PLAYBACK;
+        let region = Arc::new(
+            SharedRegion::create(
+                64,
+                u32::from(playback || (mode == MODE_PRO && !split)),
+                u32::from(!playback || (mode == MODE_PRO && !split)),
+            )
+            .unwrap(),
+        );
         let shared = Arc::clone(&region);
         let server = thread::spawn(move || {
             let (mut peer, _) = listener.accept().unwrap();
@@ -67,14 +79,47 @@ impl Fixture {
                 &mut peer,
                 &Response::Hello {
                     version: PROTOCOL_VERSION,
-                    features: 0,
+                    features: if split { FEATURE_PRO_DIRECTIONS } else { 0 },
                 },
             )
             .unwrap();
-            assert!(matches!(
-                read_request(&mut peer).unwrap(),
-                Request::OpenShared { .. }
-            ));
+            assert_eq!(read_request(&mut peer).unwrap(), Request::GetInfo);
+            write_response(&mut peer, &Response::Info(test_device_info())).unwrap();
+            let port_direction = if playback {
+                PortDirection::Playback
+            } else {
+                PortDirection::Capture
+            };
+            let request = read_request(&mut peer).unwrap();
+            let response = if mode == MODE_SHARED {
+                assert!(matches!(request, Request::OpenShared { .. }));
+                Response::OpenShared {
+                    session_id: 1,
+                    direction: port_direction,
+                    shared: shared.info(),
+                }
+            } else if split {
+                let Request::OpenProDirection {
+                    direction,
+                    group_token,
+                } = request
+                else {
+                    panic!("expected directional PRO open, got {request:?}");
+                };
+                assert_eq!(direction, port_direction);
+                assert_ne!(group_token, [0; 2]);
+                Response::OpenProDirection {
+                    session_id: 1,
+                    direction,
+                    shared: shared.info(),
+                }
+            } else {
+                assert_eq!(request, Request::OpenPro);
+                Response::OpenPro {
+                    session_id: 1,
+                    shared: shared.info(),
+                }
+            };
             let events: [OwnedFd; 3] = std::array::from_fn(|_| unsafe {
                 let fd = libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC);
                 assert!(fd >= 0);
@@ -86,32 +131,7 @@ impl Fixture {
                 events[1].as_raw_fd(),
                 events[2].as_raw_fd(),
             ];
-            let frame = sidealsa_protocol::encode_response(&Response::OpenShared {
-                session_id: 1,
-                direction: PortDirection::Capture,
-                shared: shared.info(),
-            })
-            .unwrap();
-            let len = unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&fds) as u32) as usize };
-            let mut control = vec![0_usize; len.div_ceil(size_of::<usize>())];
-            let mut iov = libc::iovec {
-                iov_base: frame.as_ptr().cast_mut().cast(),
-                iov_len: 1,
-            };
-            let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-            message.msg_iov = &mut iov;
-            message.msg_iovlen = 1;
-            message.msg_control = control.as_mut_ptr().cast();
-            message.msg_controllen = len;
-            unsafe {
-                let cmsg = libc::CMSG_FIRSTHDR(&message);
-                (*cmsg).cmsg_level = libc::SOL_SOCKET;
-                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-                (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&fds) as u32) as usize;
-                ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(cmsg).cast(), fds.len());
-                assert_eq!(libc::sendmsg(peer.as_raw_fd(), &message, 0), 1);
-            }
-            peer.write_all(&frame[1..]).unwrap();
+            send_open_response(&mut peer, &response, &fds);
             while let Ok(request) = read_request(&mut peer) {
                 if disconnect_on_stats && matches!(request, Request::GetStats) {
                     write_response(&mut peer, &Response::Stats(Box::default())).unwrap();
@@ -131,35 +151,40 @@ impl Fixture {
                 }
             }
         });
-        let stream = SideAlsaClient::connect(&path)
-            .unwrap()
-            .open_shared("capture")
-            .unwrap();
-        std::fs::remove_file(path).unwrap();
-        let mut adapter = SideAlsaStream {
-            stream,
-            pro: false,
-            playback: false,
-            channels: 1,
-            period_frames: 64,
-            buffer_frames: 512,
-            scratch: vec![0; 64],
-            playback_fifo: Vec::new(),
-            playback_fifo_frames: 0,
-            capture_frames: 0,
-            capture_offset: 0,
-            capture_retired_frames: 0,
-            capture_error: None,
-            nonblock: true,
-            playback_latency_periods: 0,
-            next_playback_sequence: None,
-            playback_cycle_sequence: None,
-            last_observed_playback_sequence: None,
-            last_playback_sequence: None,
-            start_sequence: None,
-            position: 0,
-            running: false,
+        let socket = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let mut handle = ptr::null_mut();
+        let (mut rate, mut channels, mut period, mut minimum, mut buffer) = (0, 0, 0, 0, 0);
+        let (mut poll_fd, mut control_fd) = (-1, -1);
+        assert_eq!(
+            unsafe {
+                sidealsa_stream_open(
+                    socket.as_ptr(),
+                    mode,
+                    c"capture".as_ptr(),
+                    direction,
+                    1,
+                    &mut handle,
+                    &mut rate,
+                    &mut channels,
+                    &mut period,
+                    &mut minimum,
+                    &mut buffer,
+                    &mut poll_fd,
+                    &mut control_fd,
+                )
+            },
+            0
+        );
+        let mut adapter = unsafe {
+            libc::close(poll_fd);
+            libc::close(control_fd);
+            *Box::from_raw(handle)
         };
+        assert_eq!(
+            (rate, channels, period),
+            (48000, 1, if mode == MODE_SHARED { 256 } else { 64 })
+        );
+        std::fs::remove_file(path).unwrap();
         assert_eq!(unsafe { sidealsa_stream_prepare(&mut adapter) }, 0);
         adapter.start().unwrap();
         Self {
@@ -199,6 +224,86 @@ impl Fixture {
         assert_eq!(self.adapter.position(), 0);
         self.adapter.start().unwrap();
     }
+}
+
+pub(super) fn test_device_info() -> sidealsa_protocol::DeviceInfo {
+    sidealsa_protocol::DeviceInfo {
+        name: "Fake duplex".into(),
+        profile_fingerprint: 0,
+        rate: 48000,
+        period_size: 64,
+        hardware_period_size: 64,
+        buffer_size: 64,
+        shared_buffer_size: 512,
+        pro_latency_periods: 0,
+        pro_output_latency_frames: 0,
+        pro_realtime_priority: 0,
+        shared_latency_periods: 6,
+        playback_channels: 1,
+        capture_channels: 1,
+        playback_ports: vec![],
+        capture_ports: vec![],
+    }
+}
+
+pub(super) fn send_open_response(
+    peer: &mut std::os::unix::net::UnixStream,
+    response: &Response,
+    fds: &[c_int; 4],
+) {
+    let frame = sidealsa_protocol::encode_response(response).unwrap();
+    let len = unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds) as u32) as usize };
+    let mut control = vec![0_usize; len.div_ceil(size_of::<usize>())];
+    let mut iov = libc::iovec {
+        iov_base: frame.as_ptr().cast_mut().cast(),
+        iov_len: 1,
+    };
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = len;
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&message);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(fds) as u32) as usize;
+        ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(cmsg).cast(), fds.len());
+        assert_eq!(libc::sendmsg(peer.as_raw_fd(), &message, 0), 1);
+    }
+    peer.write_all(&frame[1..]).unwrap();
+}
+
+#[test]
+fn pro_open_selects_feature_and_capture_query_excludes_classic_and_playback() {
+    for split in [false, true] {
+        for direction in [STREAM_CAPTURE, STREAM_PLAYBACK] {
+            let mut f = Fixture::new_mode(false, MODE_PRO, direction, split);
+            assert_eq!(
+                unsafe { sidealsa_stream_is_buffered_capture(&f.adapter) },
+                c_int::from(split && direction == STREAM_CAPTURE)
+            );
+            if split && direction == STREAM_CAPTURE {
+                f.region.set_cycle_sequence(1000);
+                assert_eq!(f.adapter.position(), 0);
+                assert!(f.publish(0));
+                assert!(f.publish(64));
+                assert_eq!(f.adapter.position(), 128);
+                assert_eq!(f.read(16), (16, (0..16).collect()));
+                assert_eq!(f.sync(16, 80, 4096), 0);
+                assert_eq!(f.read(48), (48, (80..128).collect()));
+                f.region.record_capture_discontinuity();
+                assert_eq!(f.sync(128, 128, 4096), -libc::EPIPE);
+                assert_eq!(f.read(1).0, -(libc::EPIPE as isize));
+                f.prepare();
+                assert!(f.publish(200));
+                assert_eq!(f.read(1), (1, vec![200]));
+            } else {
+                assert_eq!(f.sync(0, 0, 4096), -libc::EINVAL);
+            }
+        }
+    }
+    assert_eq!(client_error_code(ClientError::ForkedProcess), libc::ECHILD);
 }
 
 impl Drop for Fixture {

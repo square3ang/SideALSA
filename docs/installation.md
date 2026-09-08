@@ -7,6 +7,17 @@ PipeWire adapter configuration system-wide:
 scripts/install.sh
 ```
 
+With no arguments this always dispatches to the device/profile setup menus,
+including with redirected input/output. Without terminal stdin and stdout, setup
+fails before invoking Cargo, never falling through to installation. Explicit
+installer flags retain noninteractive behavior and should be used for automation. Use
+`scripts/install.sh --interactive` or `scripts/setup.sh` to request the menus
+explicitly. Supported USB selection binds the matching vendor profile to the
+actual card's DEV0 in both directions, preserving routing and timing, and proposes
+install `--no-start`; explicit `SAVE` then `INSTALL` are still required. Manual
+setup defaults to save only. See
+[onboard setup](onboard-setup.md) and [ASIO setup](asio-setup.md).
+
 Script builds as invoking user, then requests `sudo` only for protected install
 paths and systemd actions. Run the script as the normal desktop user so Wine,
 PipeWire, and build paths retain that user's environment.
@@ -30,7 +41,8 @@ Installer defaults:
 
 The profile is seeded only on first install. Reinstalling or upgrading never
 overwrites it, including when `--force` is used. Uninstall also preserves it.
-Fresh installations use the E1x2 reference seed unless `--profile` is supplied.
+Explicit noninteractive fresh installations use the E1x2 reference seed unless
+`--profile` is supplied; the setup menu instead uses the user's selection.
 Subsequent installs reuse the active selection instead of switching devices.
 Profile defaults therefore do not migrate an existing installation. Review the
 profile diff first, then explicitly install the repository version when wanted.
@@ -194,6 +206,9 @@ scripts/install.sh --with-asio
 This installs the system Wine artifacts only. Register them in each Wine or
 Proton prefix with `scripts/install-asio.sh --no-build --wine-prefix PATH` (or
 the corresponding Steam-prefix options).
+`scripts/install-asio.sh` with no arguments always dispatches to its wizard,
+even with redirected input. EOF cancels safely without installation or Wine;
+only explicit `INSTALL` confirmation authorizes the wizard's final command.
 
 Remove files owned by the installer:
 

@@ -7,7 +7,7 @@ use std::{
 };
 
 use sidealsa_client::{AudioStream, ClientError, SideAlsaClient, StreamMode};
-use sidealsa_protocol::PortDirection;
+use sidealsa_protocol::{FEATURE_PRO_DIRECTIONS, PortDirection};
 
 const MODE_PRO: c_int = 0;
 const MODE_SHARED: c_int = 1;
@@ -125,6 +125,13 @@ pub unsafe extern "C" fn sidealsa_stream_open(
         let mut client = SideAlsaClient::connect(socket).map_err(client_error_code)?;
         let device_info = client.get_info().map_err(client_error_code)?;
         let stream = match (mode, port) {
+            (MODE_PRO, None) if client.features() & FEATURE_PRO_DIRECTIONS != 0 => client
+                .open_pro_direction(if direction == STREAM_PLAYBACK {
+                    PortDirection::Playback
+                } else {
+                    PortDirection::Capture
+                })
+                .map_err(client_error_code)?,
             (MODE_PRO, None) => client.open_pro().map_err(client_error_code)?,
             (MODE_SHARED, Some(port)) => client.open_shared(port).map_err(client_error_code)?,
             _ => return Err(libc::EINVAL),
@@ -321,6 +328,22 @@ pub unsafe extern "C" fn sidealsa_stream_record_playback_xrun(stream: *mut SideA
 
 #[unsafe(no_mangle)]
 /// # Safety
+/// `stream` must be null or a live handle returned by `sidealsa_stream_open`.
+pub unsafe extern "C" fn sidealsa_stream_is_buffered_capture(
+    stream: *const SideAlsaStream,
+) -> c_int {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        c_int::from(
+            stream
+                .as_ref()
+                .is_some_and(SideAlsaStream::is_buffered_capture),
+        )
+    }))
+    .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
 /// `stream` must be a live, exclusively borrowed stream handle.
 pub unsafe extern "C" fn sidealsa_stream_capture_sync(
     stream: *mut SideAlsaStream,
@@ -331,7 +354,7 @@ pub unsafe extern "C" fn sidealsa_stream_capture_sync(
 ) -> c_int {
     ffi_status(|| unsafe {
         let stream = stream.as_mut().ok_or(libc::EINVAL)?;
-        if stream.pro || stream.playback {
+        if !stream.is_buffered_capture() {
             return Err(libc::EINVAL);
         }
         let result = (|| {
@@ -407,6 +430,10 @@ pub unsafe extern "C" fn sidealsa_stream_close(stream: *mut SideAlsaStream) -> c
 }
 
 impl SideAlsaStream {
+    fn is_buffered_capture(&self) -> bool {
+        !self.playback && (!self.pro || self.stream.pro_direction() == Some(PortDirection::Capture))
+    }
+
     fn start(&mut self) -> Result<(), c_int> {
         self.stream.start().map_err(client_error_code)?;
         if self.running {
@@ -427,7 +454,7 @@ impl SideAlsaStream {
         if !self.running {
             return self.position;
         }
-        if !self.playback && !self.pro {
+        if self.is_buffered_capture() {
             return capture_production_position(
                 self.capture_retired_frames,
                 self.capture_frames as u64,
@@ -741,7 +768,7 @@ impl SideAlsaStream {
         offset: usize,
         frames: usize,
     ) -> Result<isize, c_int> {
-        if !self.pro {
+        if self.is_buffered_capture() {
             return self.transfer_shared_capture(areas, offset, frames);
         }
         if !self.running {
@@ -808,7 +835,7 @@ impl SideAlsaStream {
         }
         let result = self
             .stream
-            .validate_shared_capture()
+            .validate_buffered_capture()
             .map_err(client_error_code);
         if let Err(error) = result {
             self.capture_error = Some(error);
@@ -1376,6 +1403,7 @@ fn client_error_code(error: ClientError) -> c_int {
         ClientError::Protocol(_) | ClientError::UnexpectedResponse(_) => libc::EPROTO,
         ClientError::Shared(_) => libc::EIO,
         ClientError::Busy => libc::EBUSY,
+        ClientError::ForkedProcess => libc::ECHILD,
         ClientError::Unsupported => libc::ENOTSUP,
         ClientError::Daemon { code, .. } => match code {
             sidealsa_protocol::ErrorCode::InvalidRequest => libc::EINVAL,
@@ -1409,6 +1437,10 @@ where
 
 #[cfg(test)]
 mod capture_tests;
+
+#[cfg(test)]
+#[path = "../tests/split/plugin.rs"]
+mod split_plugin;
 
 #[cfg(test)]
 mod tests {

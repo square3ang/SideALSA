@@ -41,6 +41,7 @@ int sidealsa_stream_start(sidealsa_stream_t *s) { (void)s; return 0; }
 int sidealsa_stream_stop(sidealsa_stream_t *s) { (void)s; return 0; }
 int sidealsa_stream_drain(sidealsa_stream_t *s) { (void)s; return 0; }
 int sidealsa_stream_close(sidealsa_stream_t *s) { (void)s; return 0; }
+int sidealsa_stream_is_buffered_capture(const sidealsa_stream_t *s) { (void)s; return 1; }
 void sidealsa_stream_record_playback_xrun(sidealsa_stream_t *s) { (void)s; }
 int sidealsa_stream_open(const char *socket, int mode, const char *port,
 	int direction, int nonblock, sidealsa_stream_t **stream,
@@ -56,7 +57,8 @@ int sidealsa_stream_open(const char *socket, int mode, const char *port,
 int main(void)
 {
 	sidealsa_stream_t stream = { .position = 128, .transfer_result = 16 };
-	sidealsa_pcm_t pcm = { .stream = &stream, .shared = 1, .boundary = 4096 };
+	sidealsa_pcm_t pcm = { .stream = &stream, .shared = 1,
+		.buffered_capture = 1, .boundary = 4096 };
 	snd_pcm_ioplug_t *io = &pcm.io;
 	io->private_data = &pcm;
 	io->stream = SND_PCM_STREAM_CAPTURE;
@@ -92,9 +94,17 @@ int main(void)
 	assert(sidealsa_pointer(io) == 128);
 	int calls = stream.sync_calls;
 	pcm.shared = 0;
+	io->state = SND_PCM_STATE_RUNNING;
+	assert(sidealsa_transfer(io, NULL, 0, 64) == 16);
+	assert(stream.sync_calls == calls + 1); /* directional PRO capture */
+	assert(pcm.capture_expected_appl_ptr == 16);
+	pcm.buffered_capture = 0; /* classic PRO capture */
+	pcm.capture_expected_appl_ptr = 0;
+	calls = stream.sync_calls;
 	assert(sidealsa_transfer(io, NULL, 0, 64) == 16);
 	assert(sidealsa_pointer(io) == 128);
 	pcm.shared = 1;
+	pcm.buffered_capture = 1; /* direction check is defensive too */
 	io->stream = SND_PCM_STREAM_PLAYBACK;
 	assert(sidealsa_transfer(io, NULL, 0, 64) == 16);
 	assert(sidealsa_pointer(io) == 128);

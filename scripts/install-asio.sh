@@ -6,6 +6,12 @@
 set -Eeuo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+if [[ "${1:-}" == --interactive ]]; then
+    shift
+    exec bash "$ROOT/scripts/setup-asio.sh" "$@"
+elif (($# == 0)); then
+    exec bash "$ROOT/scripts/setup-asio.sh"
+fi
 INSTALL_ROOT="${SIDEALSA_ASIO_INSTALL_ROOT:-$HOME/.local}"
 BUILD_DIR="${SIDEALSA_ASIO_BUILD_DIR:-$ROOT/build-asio}"
 WINE_BIN="${WINE:-wine}"
@@ -46,6 +52,7 @@ Usage: scripts/install-asio.sh [options]
 Build and install SideALSA ASIO for Wine/Proton, then register it in Wine prefixes.
 
 Options:
+  --interactive         Guided setup (use alone; also default with no args)
   --install-root PATH   Wine library install root (default: $HOME/.local)
   --build-dir PATH      CMake build directory (default: build-asio)
   --steam-prefix PATH   Register one Wine/Proton prefix (repeatable)

@@ -317,6 +317,21 @@ impl SessionState {
         session_id: u64,
         hardware_generation: u64,
     ) -> Result<Option<(SharedRegionInfo, [std::os::fd::RawFd; 4])>, SharedError> {
+        self.try_open_layout(
+            session_id,
+            hardware_generation,
+            self.playback_channels,
+            self.capture_channels,
+        )
+    }
+
+    fn try_open_layout(
+        &self,
+        session_id: u64,
+        hardware_generation: u64,
+        playback_channels: u32,
+        capture_channels: u32,
+    ) -> Result<Option<(SharedRegionInfo, [std::os::fd::RawFd; 4])>, SharedError> {
         if self
             .owner
             .compare_exchange(0, session_id, Ordering::AcqRel, Ordering::Acquire)
@@ -327,8 +342,8 @@ impl SessionState {
         let endpoint = match SessionEndpoint::create(
             session_id,
             self.period_frames,
-            self.playback_channels,
-            self.capture_channels,
+            playback_channels,
+            capture_channels,
             self.slot_count,
         ) {
             Ok(endpoint) => endpoint,
@@ -518,12 +533,26 @@ impl SharedPortState {
     }
 }
 
+enum ProOwnership {
+    None,
+    Classic(u64),
+    Split {
+        peer_pid: u32,
+        peer_uid: u32,
+        token: [u64; 2],
+        playback: Option<u64>,
+        capture: Option<u64>,
+    },
+}
+
 pub struct DaemonState {
     pro_diagnostics: Arc<ProDiagnostics>,
     info: DeviceInfo,
     timeline: Arc<HardwareTimeline>,
     hardware_ready: Arc<AtomicBool>,
     pro: SessionState,
+    pro_capture: SessionState,
+    pro_ownership: Mutex<ProOwnership>,
     shared: Box<[SharedPortState]>,
     next_session: AtomicU64,
     period_frames: usize,
@@ -605,6 +634,15 @@ impl DaemonState {
             timeline,
             hardware_ready: Arc::new(AtomicBool::new(false)),
             pro,
+            pro_capture: SessionState::new(
+                profile.device.period_size,
+                0,
+                profile.device.capture.channels,
+                sidealsa_protocol::SHARED_SLOT_COUNT,
+                None,
+                None,
+            )?,
+            pro_ownership: Mutex::new(ProOwnership::None),
             shared: shared.into_boxed_slice(),
             next_session: AtomicU64::new(1),
             period_frames,
@@ -633,7 +671,22 @@ impl DaemonState {
     }
 
     pub fn stats(&self) -> Stats {
+        // Diagnostics are non-RT; hold group membership stable while combining
+        // the independently owned input/output client counters.
+        let ownership = self
+            .pro_ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let endpoint = self.pro.endpoint.load();
+        let input = self.pro_capture.endpoint.load();
+        let (capture_owned, capture_only) = match &*ownership {
+            ProOwnership::Split {
+                playback,
+                capture: Some(id),
+                ..
+            } if *id == input.session_id => (true, playback.is_none()),
+            _ => (false, false),
+        };
         let shared_playback_ports = self
             .shared
             .iter()
@@ -653,11 +706,30 @@ impl DaemonState {
                 }
             })
             .collect();
-        stats_from_core(
+        let mut stats = stats_from_core(
             self.timeline.snapshot(),
-            &endpoint.region,
+            if capture_only {
+                &input.region
+            } else {
+                &endpoint.region
+            },
             shared_playback_ports,
-        )
+        );
+        if capture_owned && !capture_only {
+            stats.pro_expired_capture_blocks = stats
+                .pro_expired_capture_blocks
+                .saturating_add(input.region.client_expired_capture_blocks());
+            stats.pro_realtime_failures = stats
+                .pro_realtime_failures
+                .saturating_add(input.region.client_realtime_failures());
+            stats.pro_callback_overruns = stats
+                .pro_callback_overruns
+                .saturating_add(input.region.client_callback_overruns());
+            stats.pro_callback_max_nanos = stats
+                .pro_callback_max_nanos
+                .max(input.region.client_callback_max_nanos());
+        }
+        stats
     }
 
     pub fn hardware_ready(&self) -> bool {
@@ -671,11 +743,86 @@ impl DaemonState {
     pub fn open_pro(
         &self,
     ) -> Result<Option<(u64, SharedRegionInfo, [std::os::fd::RawFd; 4])>, SharedError> {
+        let mut ownership = self
+            .pro_ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(*ownership, ProOwnership::None) {
+            return Ok(None);
+        }
         let session_id = self.next_session_id();
-        Ok(self
-            .pro
-            .try_open(session_id, self.timeline.generation())?
-            .map(|(shared, fds)| (session_id, shared, fds)))
+        let opened = self.pro.try_open(session_id, self.timeline.generation())?;
+        if opened.is_some() {
+            *ownership = ProOwnership::Classic(session_id);
+        }
+        Ok(opened.map(|(shared, fds)| (session_id, shared, fds)))
+    }
+
+    /// Credentials must come from SO_PEERCRED on the owning control connection.
+    pub fn open_pro_direction(
+        &self,
+        peer_pid: u32,
+        peer_uid: u32,
+        token: [u64; 2],
+        direction: PortDirection,
+    ) -> Result<Option<(u64, SharedRegionInfo, [std::os::fd::RawFd; 4])>, SharedError> {
+        let mut ownership = self
+            .pro_ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if token == [0; 2] || peer_pid == 0 {
+            return Ok(None);
+        }
+        match &*ownership {
+            ProOwnership::None => {}
+            ProOwnership::Split {
+                peer_pid: pid,
+                peer_uid: uid,
+                token: capability,
+                playback,
+                capture,
+            } if *pid == peer_pid
+                && *uid == peer_uid
+                && *capability == token
+                && match direction {
+                    PortDirection::Playback => playback.is_none(),
+                    PortDirection::Capture => capture.is_none(),
+                } => {}
+            _ => return Ok(None),
+        }
+        let session_id = self.next_session_id();
+        let opened = match direction {
+            PortDirection::Playback => self.pro.try_open_layout(
+                session_id,
+                self.timeline.generation(),
+                self.pro.playback_channels,
+                0,
+            )?,
+            PortDirection::Capture => self
+                .pro_capture
+                .try_open(session_id, self.timeline.generation())?,
+        };
+        if opened.is_some() {
+            if matches!(*ownership, ProOwnership::None) {
+                *ownership = ProOwnership::Split {
+                    peer_pid,
+                    peer_uid,
+                    token,
+                    playback: None,
+                    capture: None,
+                };
+            }
+            if let ProOwnership::Split {
+                playback, capture, ..
+            } = &mut *ownership
+            {
+                *match direction {
+                    PortDirection::Playback => playback,
+                    PortDirection::Capture => capture,
+                } = Some(session_id);
+            }
+        }
+        Ok(opened.map(|(shared, fds)| (session_id, shared, fds)))
     }
 
     pub fn open_shared(&self, port_id: &str) -> Result<Option<SharedOpen>, OpenSharedError> {
@@ -697,7 +844,17 @@ impl DaemonState {
     }
 
     pub fn start(&self, session_id: u64) -> bool {
+        if session_id == 0 || session_id == SESSION_CLOSING {
+            return false;
+        }
+        let _ownership = self
+            .pro_ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let hardware_generation = self.timeline.generation();
+        if self.pro_capture.owner.load(Ordering::Acquire) == session_id {
+            return self.pro_capture.start(session_id, hardware_generation);
+        }
         if self.pro.owner.load(Ordering::Acquire) == session_id {
             if self.pro.active.load(Ordering::SeqCst) != 0 {
                 return false;
@@ -710,6 +867,16 @@ impl DaemonState {
     }
 
     pub fn stop(&self, session_id: u64) -> bool {
+        if session_id == 0 || session_id == SESSION_CLOSING {
+            return false;
+        }
+        let _ownership = self
+            .pro_ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.pro_capture.stop(session_id) {
+            return true;
+        }
         if self.pro.stop(session_id) {
             return true;
         }
@@ -717,7 +884,31 @@ impl DaemonState {
     }
 
     pub fn close(&self, session_id: u64) -> bool {
-        if self.pro.close(session_id) {
+        if session_id == 0 || session_id == SESSION_CLOSING {
+            return false;
+        }
+        let mut ownership = self
+            .pro_ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.pro.close(session_id) || self.pro_capture.close(session_id) {
+            match &mut *ownership {
+                ProOwnership::Classic(id) if *id == session_id => *ownership = ProOwnership::None,
+                ProOwnership::Split {
+                    playback, capture, ..
+                } => {
+                    if *playback == Some(session_id) {
+                        *playback = None;
+                    }
+                    if *capture == Some(session_id) {
+                        *capture = None;
+                    }
+                    if playback.is_none() && capture.is_none() {
+                        *ownership = ProOwnership::None;
+                    }
+                }
+                _ => {}
+            }
             return true;
         }
         self.shared
@@ -726,7 +917,11 @@ impl DaemonState {
     }
 
     pub fn owns(&self, session_id: u64) -> bool {
+        if session_id == 0 || session_id == SESSION_CLOSING {
+            return false;
+        }
         self.pro.owner.load(Ordering::Acquire) == session_id
+            || self.pro_capture.owner.load(Ordering::Acquire) == session_id
             || self
                 .shared
                 .iter()
@@ -775,6 +970,13 @@ impl DaemonState {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let capture = DaemonCaptureBridge {
+            directional_endpoint: Arc::clone(&self.pro_capture.endpoint),
+            directional_active: Arc::clone(&self.pro_capture.active),
+            directional_hardware_generation: Arc::clone(
+                &self.pro_capture.lifecycle_hardware_generation,
+            ),
+            directional_capture_index: 0,
+            pro_hardware_generation: Arc::clone(&self.pro.lifecycle_hardware_generation),
             pro_endpoint: Arc::clone(&self.pro.endpoint),
             pro_active: Arc::clone(&self.pro.active),
             pro_capture_index: 0,
@@ -821,6 +1023,11 @@ impl DaemonState {
 }
 
 pub struct DaemonCaptureBridge {
+    directional_endpoint: Arc<EndpointSlot>,
+    directional_active: Arc<AtomicU64>,
+    directional_hardware_generation: Arc<AtomicU64>,
+    directional_capture_index: usize,
+    pro_hardware_generation: Arc<AtomicU64>,
     pro_endpoint: Arc<EndpointSlot>,
     pro_active: Arc<AtomicU64>,
     pro_capture_index: usize,
@@ -1184,6 +1391,19 @@ impl DaemonCaptureBridge {
             .set_hardware_generation(self.timeline.generation());
         endpoint.region.set_cycle_sequence(playback_sequence);
         let session_id = self.pro_active.load(Ordering::SeqCst);
+        if endpoint.info().capture_channels == 0 {
+            if session_id != 0 && endpoint.session_id == session_id {
+                if self.pro_hardware_generation.load(Ordering::Acquire)
+                    == self.timeline.generation()
+                    && endpoint.region.client_state() != SHARED_CLIENT_IDLE
+                {
+                    endpoint.region.establish_activation(playback_sequence);
+                }
+                // Playback-only clients wake at capture-ready, before the hardware waits.
+                endpoint.events.notify_playback();
+            }
+            return;
+        }
         if session_id != 0
             && endpoint.session_id == session_id
             && !endpoint.region.establish_activation(playback_sequence)
@@ -1206,11 +1426,41 @@ impl DaemonCaptureBridge {
             port.process_capture(hardware_sequence, capture, &self.timeline);
         }
     }
+
+    fn publish_directional_capture(&mut self, sequence: u64, capture: &[i32]) {
+        let endpoint = self.directional_endpoint.load();
+        let hardware_generation = self.timeline.generation();
+        endpoint.region.set_hardware_generation(hardware_generation);
+        endpoint.region.set_cycle_sequence(sequence);
+        let session_id = self.directional_active.load(Ordering::SeqCst);
+        if session_id == 0
+            || endpoint.session_id != session_id
+            || endpoint.region.client_state() == SHARED_CLIENT_IDLE
+        {
+            return;
+        }
+        if self.directional_hardware_generation.load(Ordering::Acquire) != hardware_generation {
+            endpoint.events.notify_capture();
+            return;
+        }
+        if endpoint.region.establish_activation(sequence) {
+            endpoint.region.set_client_state(SHARED_CLIENT_RUNNING);
+        } else if !endpoint.region.try_publish_capture(
+            &mut self.directional_capture_index,
+            sequence,
+            capture,
+        ) {
+            self.timeline.record_pro_capture_overrun();
+            endpoint.region.record_capture_discontinuity();
+        }
+        endpoint.events.notify_capture();
+    }
 }
 
 impl ProCaptureSink for DaemonCaptureBridge {
     fn process_capture(&mut self, sequence: u64, capture: &[i32]) {
         self.publish_pro_capture(sequence, capture);
+        self.publish_directional_capture(sequence, capture);
         self.publish_shared_capture(sequence, capture);
     }
 
@@ -1220,7 +1470,7 @@ impl ProCaptureSink for DaemonCaptureBridge {
         playback_sequence: u64,
         capture: &[i32],
     ) {
-        let _ = hardware_sequence;
+        self.publish_directional_capture(hardware_sequence, capture);
         self.publish_pro_capture(playback_sequence, capture);
     }
 
@@ -1676,6 +1926,256 @@ mod tests {
         if endpoint.region.info().playback_channels == 0 {
             endpoint.region.set_client_state(SHARED_CLIENT_RUNNING);
         }
+    }
+
+    #[test]
+    fn directional_groups_require_pid_uid_capability_and_release_only_on_last_close() {
+        for first in [PortDirection::Playback, PortDirection::Capture] {
+            let state = DaemonState::new(
+                &Profile::from_toml(PROFILE).unwrap(),
+                Arc::new(HardwareTimeline::default()),
+            )
+            .unwrap();
+            let second = if first == PortDirection::Playback {
+                PortDirection::Capture
+            } else {
+                PortDirection::Playback
+            };
+            assert!(
+                state
+                    .open_pro_direction(10, 20, [0, 0], first)
+                    .unwrap()
+                    .is_none()
+            );
+            let a = state
+                .open_pro_direction(10, 20, [1, 2], first)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (a.1.playback_channels, a.1.capture_channels),
+                if first == PortDirection::Playback {
+                    (2, 0)
+                } else {
+                    (0, 2)
+                }
+            );
+            assert!(state.open_pro().unwrap().is_none());
+            for (pid, uid, token, direction) in [
+                (10, 20, [1, 2], first),
+                (11, 20, [1, 2], second),
+                (10, 21, [1, 2], second),
+                (10, 20, [1, 3], second),
+            ] {
+                assert!(
+                    state
+                        .open_pro_direction(pid, uid, token, direction)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            let b = state
+                .open_pro_direction(10, 20, [1, 2], second)
+                .unwrap()
+                .unwrap();
+            assert_ne!(a.0, b.0);
+            assert_ne!(a.2, b.2);
+            assert!(state.close(a.0));
+            assert!(state.owns(b.0));
+            assert!(state.open_pro().unwrap().is_none());
+            assert!(state.close(b.0));
+            let classic = open_pro(&state);
+            assert_eq!(
+                (classic.1.playback_channels, classic.1.capture_channels),
+                (2, 2)
+            );
+            assert!(
+                state
+                    .open_pro_direction(10, 20, [1, 2], first)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(state.close(classic.0));
+        }
+    }
+
+    #[test]
+    fn directional_lifecycles_capture_overflow_and_playback_close_are_independent() {
+        let timeline = Arc::new(HardwareTimeline::default());
+        let state =
+            DaemonState::new(&Profile::from_toml(PROFILE).unwrap(), Arc::clone(&timeline)).unwrap();
+        let p = state
+            .open_pro_direction(10, 20, [1, 2], PortDirection::Playback)
+            .unwrap()
+            .unwrap();
+        let c = state
+            .open_pro_direction(10, 20, [1, 2], PortDirection::Capture)
+            .unwrap()
+            .unwrap();
+        assert!(state.start(c.0));
+        assert!(state.start(p.0));
+        let mut bridge = state.bridge();
+        bridge.capture.process_capture_for_playback(10, 10, &[3; 8]);
+        assert!(read_event(p.2[2]).is_ok());
+        assert!(read_event(p.2[1]).is_err());
+        assert!(read_event(c.2[1]).is_ok());
+        assert_eq!(
+            state.pro_capture.current().region.client_state(),
+            SHARED_CLIENT_RUNNING
+        );
+        assert!(state.stop(p.0));
+        assert!(state.start(p.0));
+        bridge.capture.process_capture_for_playback(11, 11, &[4; 8]);
+        assert_eq!(state.pro_capture.current().region.ready_capture_slots(), 1);
+        let c_generation = state
+            .pro_capture
+            .lifecycle_generation
+            .load(Ordering::Acquire);
+        assert!(state.close(p.0));
+        let mut output = [99; 8];
+        for sequence in 12..24 {
+            bridge.process(sequence, &[5; 8], &mut output);
+            assert_eq!(output, [0; 8]);
+        }
+        assert_eq!(
+            state
+                .pro_capture
+                .lifecycle_generation
+                .load(Ordering::Acquire),
+            c_generation
+        );
+        assert_eq!(timeline.snapshot().pro_deadline_misses, 0);
+        assert!(timeline.snapshot().pro_capture_overruns > 0);
+        assert!(state.pro_capture.current().region.capture_discontinuities() > 0);
+        read_event(c.2[1]).unwrap();
+        bridge.capture.process_capture(24, &[6; 8]);
+        assert!(read_event(c.2[1]).is_ok(), "overflow must wake capture");
+        let epoch = state.playback_epoch.load(Ordering::Acquire);
+        assert!(state.stop(c.0));
+        assert!(state.start(c.0));
+        assert_eq!(state.playback_epoch.load(Ordering::Acquire), epoch);
+        assert_eq!(state.pro_capture.current().region.ready_capture_slots(), 0);
+        bridge.capture.process_capture(25, &[6; 8]);
+        bridge.capture.process_capture(26, &[6; 8]);
+        assert_eq!(state.pro_capture.current().region.ready_capture_slots(), 1);
+        assert_eq!(timeline.generation(), 0);
+    }
+
+    #[test]
+    fn directional_capture_close_does_not_reset_playback_and_stale_maps_are_isolated() {
+        let state = DaemonState::new(
+            &Profile::from_toml(PROFILE).unwrap(),
+            Arc::new(HardwareTimeline::default()),
+        )
+        .unwrap();
+        let p = state
+            .open_pro_direction(10, 20, [1, 2], PortDirection::Playback)
+            .unwrap()
+            .unwrap();
+        let c = state
+            .open_pro_direction(10, 20, [1, 2], PortDirection::Capture)
+            .unwrap()
+            .unwrap();
+        let stale_p = SharedRegion::map_fd(duplicate_fd(p.2[0]).into_raw_fd(), p.1).unwrap();
+        let stale_c = SharedRegion::map_fd(duplicate_fd(c.2[0]).into_raw_fd(), c.1).unwrap();
+        assert!(state.start(p.0));
+        assert!(state.start(c.0));
+        let mut bridge = state.bridge();
+        bridge.capture.process_capture(10, &[0; 8]);
+        let mut index = 0;
+        let mut output = [0; 8];
+        for sequence in [11, 12] {
+            assert!(stale_p.try_client_publish_playback(&mut index, sequence, &[7; 8]));
+            bridge.playback.process_playback(sequence, &mut output);
+            assert_eq!(output, [7; 8]);
+        }
+        let epoch = state.playback_epoch.load(Ordering::Acquire);
+        assert!(state.stop(c.0));
+        assert!(state.start(c.0));
+        assert!(state.close(c.0));
+        assert_eq!(state.playback_epoch.load(Ordering::Acquire), epoch);
+        assert!(stale_p.try_client_publish_playback(&mut index, 13, &[8; 8]));
+        bridge.playback.process_playback(13, &mut output);
+        assert_eq!(output, [8; 8]);
+        assert!(state.close(p.0));
+        let new_p = state
+            .open_pro_direction(10, 20, [3, 4], PortDirection::Playback)
+            .unwrap()
+            .unwrap();
+        let new_c = state
+            .open_pro_direction(10, 20, [3, 4], PortDirection::Capture)
+            .unwrap()
+            .unwrap();
+        assert!(state.start(new_p.0));
+        assert!(state.start(new_c.0));
+        stale_c.set_client_state(SHARED_CLIENT_IDLE);
+        stale_p.set_client_state(SHARED_CLIENT_RUNNING);
+        assert!(stale_p.try_client_publish_playback(&mut index, 15, &[99; 8]));
+        bridge.process(14, &[1; 8], &mut output);
+        bridge.process(15, &[2; 8], &mut output);
+        assert_eq!(output, [0; 8]);
+        assert_eq!(state.pro_capture.current().region.ready_capture_slots(), 1);
+        assert!(!state.stop(p.0));
+        assert!(!state.close(c.0));
+    }
+
+    #[test]
+    fn directional_hardware_generation_mismatch_requires_independent_restart() {
+        let state = DaemonState::new(
+            &Profile::from_toml(PROFILE).unwrap(),
+            Arc::new(HardwareTimeline::default()),
+        )
+        .unwrap();
+        let p = state
+            .open_pro_direction(10, 20, [1, 2], PortDirection::Playback)
+            .unwrap()
+            .unwrap();
+        let c = state
+            .open_pro_direction(10, 20, [1, 2], PortDirection::Capture)
+            .unwrap()
+            .unwrap();
+        assert!(state.start(p.0));
+        assert!(state.start(c.0));
+        let mut bridge = state.bridge();
+        bridge.capture.process_capture(10, &[1; 8]);
+        state
+            .pro
+            .lifecycle_hardware_generation
+            .store(u64::MAX, Ordering::Release);
+        state
+            .pro_capture
+            .lifecycle_hardware_generation
+            .store(u64::MAX, Ordering::Release);
+        let mut output = [99; 8];
+        bridge.process(11, &[2; 8], &mut output);
+        assert_eq!(output, [0; 8]);
+        assert_eq!(state.pro_capture.current().region.ready_capture_slots(), 0);
+        assert!(read_event(c.2[1]).is_ok());
+        assert!(state.stop(c.0));
+        assert!(state.start(c.0));
+        bridge.process(12, &[3; 8], &mut output);
+        bridge.process(13, &[4; 8], &mut output);
+        assert_eq!(state.pro_capture.current().region.ready_capture_slots(), 1);
+        assert_eq!(
+            state
+                .pro
+                .lifecycle_hardware_generation
+                .load(Ordering::Acquire),
+            u64::MAX
+        );
+        assert!(state.stop(p.0));
+        assert!(state.start(p.0));
+        bridge.capture.process_capture(14, &[5; 8]);
+        let mut index = 0;
+        assert!(
+            state
+                .pro
+                .current()
+                .region
+                .try_client_publish_playback(&mut index, 15, &[8; 8])
+        );
+        bridge.playback.process_playback(15, &mut output);
+        assert_eq!(output, [8; 8]);
+        assert_eq!(state.timeline.snapshot().pro_deadline_misses, 0);
     }
 
     #[test]

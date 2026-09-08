@@ -4,7 +4,7 @@ use std::{
     ffi::{CStr, c_char, c_int, c_void},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     panic::{AssertUnwindSafe, catch_unwind},
-    path::Path,
+    path::{Path, PathBuf},
     ptr, slice,
     sync::{
         Arc, Mutex,
@@ -15,7 +15,7 @@ use std::{
 };
 
 use sidealsa_client::{AudioStream, ClientError, SideAlsaClient};
-use sidealsa_protocol::{DeviceInfo, SharedRegionInfo};
+use sidealsa_protocol::{DeviceInfo, FEATURE_PRO_DIRECTIONS, PortDirection, SharedRegionInfo};
 use thiserror::Error;
 
 pub const ASIO_SUCCESS: c_int = 0;
@@ -230,6 +230,8 @@ pub enum AsioError {
     InvalidParameter,
     #[error("no audio I/O")]
     NoIo,
+    #[error("SideALSA device information changed; reinitialize the ASIO driver")]
+    DeviceChanged,
     #[error("buffer size is not supported")]
     BufferSizeNotSupported,
     #[error("sample rate is not supported")]
@@ -264,7 +266,8 @@ impl AsioError {
             Self::BufferSizeNotSupported => ASIO_BUFFER_SIZE_NOT_SUPPORTED,
             Self::SampleRateNotSupported => ASIO_SAMPLE_RATE_NOT_SUPPORTED,
             Self::NoMemory => ASIO_NO_MEMORY,
-            Self::Client(_)
+            Self::DeviceChanged
+            | Self::Client(_)
             | Self::Worker
             | Self::WorkerTimeout
             | Self::RealtimeScheduling(_)
@@ -279,6 +282,7 @@ impl AsioError {
 struct DriverInner {
     state: DriverState,
     device: Option<DeviceInfo>,
+    socket: Option<PathBuf>,
     shared: Option<SharedRegionInfo>,
     stream: Option<AudioStream>,
     buffers: Option<Arc<HostBuffers>>,
@@ -317,6 +321,7 @@ impl AsioDriver {
             inner: Mutex::new(DriverInner {
                 state: DriverState::Loaded,
                 device: None,
+                socket: None,
                 shared: None,
                 stream: None,
                 buffers: None,
@@ -338,24 +343,17 @@ impl AsioDriver {
 
     pub fn init(&self, socket: impl AsRef<Path>) -> Result<(), AsioError> {
         let result = (|| {
-            let mut client = SideAlsaClient::connect_with_timeout(socket, self.control_timeout)?;
+            let mut client = SideAlsaClient::connect_with_timeout(&socket, self.control_timeout)?;
             let device = client.get_info()?;
-            let stream = client.open_pro()?;
-            let shared = stream.info();
 
             let mut inner = self.lock()?;
             if inner.state != DriverState::Loaded {
                 return Err(AsioError::InvalidState);
             }
-            if shared.period_frames != device.period_size
-                || shared.playback_channels != device.playback_channels
-                || shared.capture_channels != device.capture_channels
-            {
-                return Err(AsioError::NoIo);
-            }
+            // Init only discovers the physical device. PRO ownership begins at
+            // CreateBuffers, once the host has selected its actual directions.
             inner.device = Some(device);
-            inner.shared = Some(shared);
-            inner.stream = Some(stream);
+            inner.socket = Some(socket.as_ref().to_path_buf());
             inner.worker_failure = None;
             inner.last_error = None;
             inner.state = DriverState::Initialized;
@@ -471,7 +469,7 @@ impl AsioDriver {
         if inner.state != DriverState::Initialized {
             return Err(AsioError::InvalidState);
         }
-        if callbacks.buffer_switch.is_none() {
+        if callbacks.buffer_switch.is_none() || infos.is_empty() {
             return Err(AsioError::InvalidParameter);
         }
 
@@ -512,17 +510,6 @@ impl AsioDriver {
             output_count,
             usize::try_from(buffer_size).map_err(|_| AsioError::NoMemory)?,
         )?);
-        for info in infos.iter_mut() {
-            let channel =
-                usize::try_from(info.channel_number).map_err(|_| AsioError::InvalidParameter)?;
-            let buffer = if info.is_input_type != 0 {
-                &buffers.input[channel]
-            } else {
-                &buffers.output[channel]
-            };
-            info.buffers = buffer.pointers();
-        }
-
         drop(inner);
         let time_info = callbacks.asio_message.is_some_and(|message| unsafe {
             message(
@@ -537,6 +524,52 @@ impl AsioDriver {
         if inner.state != DriverState::Initialized {
             return Err(AsioError::InvalidState);
         }
+        let mut client = SideAlsaClient::connect_with_timeout(
+            inner.socket.as_ref().ok_or(AsioError::InvalidState)?,
+            self.control_timeout,
+        )?;
+        let device = inner.device.as_ref().ok_or(AsioError::InvalidState)?;
+        // Reconnection may reach a reconfigured daemon. Validate all metadata on
+        // the reservation connection before claiming PRO or publishing pointers.
+        if client.get_info()? != *device {
+            return Err(AsioError::DeviceChanged);
+        }
+        let direction = buffer_direction(&input_active, &output_active, client.features());
+        // No fallback after an advertised directional open fails: preserve BUSY,
+        // disconnects and other real control errors. Legacy servers remain exclusive.
+        let mut stream = match direction {
+            Some(direction) => client.open_pro_direction(direction)?,
+            None => client.open_pro()?,
+        };
+        let shared = stream.info();
+        if shared.period_frames != device.period_size
+            || shared.playback_channels
+                != if direction == Some(PortDirection::Capture) {
+                    0
+                } else {
+                    device.playback_channels
+                }
+            || shared.capture_channels
+                != if direction == Some(PortDirection::Playback) {
+                    0
+                } else {
+                    device.capture_channels
+                }
+        {
+            stream.close()?;
+            return Err(AsioError::NoIo);
+        }
+        for info in infos.iter_mut() {
+            let channel = info.channel_number as usize;
+            let buffer = if info.is_input_type != 0 {
+                &buffers.input[channel]
+            } else {
+                &buffers.output[channel]
+            };
+            info.buffers = buffer.pointers();
+        }
+        inner.shared = Some(shared);
+        inner.stream = Some(stream);
         inner.buffers = Some(buffers);
         inner.active = Some(Arc::new(ActiveChannels {
             input: input_active,
@@ -687,21 +720,42 @@ impl AsioDriver {
             return Err(AsioError::Reentrant);
         }
         let _lifecycle = self.lifecycle.lock().map_err(|_| AsioError::Worker)?;
-        self.stop_if_running_locked()?;
-        if let Some(error) = self.terminate_worker()? {
-            return Err(error);
-        }
+        let mut failure = match self.stop_if_running_locked() {
+            Ok(()) => None,
+            Err(error) => {
+                if self
+                    .lock()?
+                    .worker
+                    .as_ref()
+                    .is_some_and(|handle| handle.gate.is_alive())
+                {
+                    return Err(error);
+                }
+                Some(error)
+            }
+        };
+        let worker_error = self.terminate_worker()?;
+        failure = failure.or(worker_error);
         let mut inner = self.lock()?;
-        ensure_worker_healthy(&mut inner)?;
         if inner.state != DriverState::Prepared {
             return Err(AsioError::InvalidState);
         }
+        failure = failure.or_else(|| inner.worker_failure.map(WorkerFailure::error));
+        inner.worker_failure = None;
         inner.buffers = None;
         inner.active = None;
         inner.callbacks = None;
         inner.time_info = false;
         inner.state = DriverState::Initialized;
-        Ok(())
+        inner.shared = None;
+        let stream = inner.stream.take();
+        // Keep lifecycle serialization through CLOSE, but never an audio-wait mutex.
+        drop(inner);
+        if let Some(mut stream) = stream {
+            let close_error = stream.close().err().map(AsioError::from);
+            failure = failure.or(close_error);
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     pub fn close(&self) -> Result<(), AsioError> {
@@ -1052,6 +1106,17 @@ impl WorkerContext {
 struct ActiveChannels {
     input: Box<[bool]>,
     output: Box<[bool]>,
+}
+
+fn buffer_direction(input: &[bool], output: &[bool], features: u32) -> Option<PortDirection> {
+    if features & FEATURE_PRO_DIRECTIONS == 0 {
+        return None;
+    }
+    match (input.iter().any(|v| *v), output.iter().any(|v| *v)) {
+        (true, false) => Some(PortDirection::Capture),
+        (false, true) => Some(PortDirection::Playback),
+        _ => None,
+    }
 }
 
 #[repr(C, align(32))]
@@ -1429,6 +1494,7 @@ fn worker_loop(
     spin_nanos: u64,
 ) -> Result<(), AsioError> {
     let mut buffer_index = 0_usize;
+    let has_playback = stream.pro_direction() != Some(PortDirection::Capture);
     let mut previous_sequence = None;
     let mut run_generation = u64::MAX;
     let mut last_active_sequence = None;
@@ -1473,6 +1539,10 @@ fn worker_loop(
             &mut last_active_sequence,
             &mut stopping_after,
         );
+        if !has_playback && !gate.command().1 {
+            // Capture has no pending output to drain before acknowledging Stop.
+            gate.acknowledge(run_generation, false);
+        }
         let acquisition_generation = run_generation;
         let spin_window = capture_spin.window(run_generation, gate.command().1);
         let block_sequence = match recover_discontinuity!(wait_worker_event(
@@ -1502,8 +1572,12 @@ fn worker_loop(
             &mut stopping_after,
         );
         if !running {
-            playback.fill(0);
-            let _ = recover_discontinuity!(stream.submit_playback(block_sequence, playback));
+            if has_playback {
+                playback.fill(0);
+                let _ = recover_discontinuity!(stream.submit_playback(block_sequence, playback));
+            } else {
+                gate.acknowledge(run_generation, false);
+            }
             if stopping_after
                 .is_some_and(|sequence| sequence_is_after(stream.playback_sequence(), sequence))
             {
@@ -1512,8 +1586,10 @@ fn worker_loop(
             continue;
         }
         if !acquired_block_is_current(acquisition_generation, run_generation) {
-            playback.fill(0);
-            let _ = recover_discontinuity!(stream.submit_playback(block_sequence, playback));
+            if has_playback {
+                playback.fill(0);
+                let _ = recover_discontinuity!(stream.submit_playback(block_sequence, playback));
+            }
             continue;
         }
         let (next_buffer_index, samples) = match advance_asio_cycle(
@@ -1528,8 +1604,11 @@ fn worker_loop(
                 sample_position,
             } => (buffer_index, sample_position),
             CycleAdvance::Duplicate => {
-                playback.fill(0);
-                let _ = recover_discontinuity!(stream.submit_playback(block_sequence, playback));
+                if has_playback {
+                    playback.fill(0);
+                    let _ =
+                        recover_discontinuity!(stream.submit_playback(block_sequence, playback));
+                }
                 continue;
             }
             CycleAdvance::Backward => {
@@ -1548,7 +1627,9 @@ fn worker_loop(
         };
         buffer_index = next_buffer_index;
         previous_sequence = Some(block_sequence);
-        copy_capture_to_host(capture, buffers, active, buffer_index, period_frames);
+        if !capture.is_empty() {
+            copy_capture_to_host(capture, buffers, active, buffer_index, period_frames);
+        }
         let stamp = monotonic_nanos();
         position.publish(samples, stamp);
         let callback_start = stamp;
@@ -1556,17 +1637,19 @@ fn worker_loop(
         let callback_duration = monotonic_nanos().saturating_sub(callback_start);
         stream.record_callback_timing(callback_duration, period_nanos);
         // Kernel selection proved its target features and buffer geometry before worker startup.
-        unsafe {
-            (sample_kernels.copy_host_to_playback)(
-                buffers,
-                active,
-                buffer_index,
-                playback,
-                period_frames,
-            )
-        };
-        if !recover_discontinuity!(stream.submit_playback(block_sequence, playback)) {
-            continue;
+        if has_playback {
+            unsafe {
+                (sample_kernels.copy_host_to_playback)(
+                    buffers,
+                    active,
+                    buffer_index,
+                    playback,
+                    period_frames,
+                )
+            };
+            if !recover_discontinuity!(stream.submit_playback(block_sequence, playback)) {
+                continue;
+            }
         }
         last_active_sequence = Some(block_sequence);
     }
@@ -1801,7 +1884,16 @@ fn wait_worker_event(
         if stop.is_requested() {
             return Ok(WorkerEvent::Stop);
         }
-        match stream.try_capture_buffer(capture) {
+        let acquired = if stream.pro_direction() == Some(PortDirection::Playback) {
+            match stream.wait_period(Duration::ZERO) {
+                Ok(sequence) => Ok(Some(sequence)),
+                Err(ClientError::Timeout) => Ok(None),
+                Err(error) => Err(error),
+            }
+        } else {
+            stream.try_capture_buffer(capture)
+        };
+        match acquired {
             Ok(Some(sequence)) => return Ok(WorkerEvent::Cycle(sequence)),
             Ok(None) => {}
             Err(error) => return Err(error.into()),
@@ -1816,9 +1908,13 @@ fn wait_worker_event(
                     tv_nsec: (remaining % 1_000_000_000) as _,
                 });
             } else if now < end {
-                if let Some(event) =
-                    spin_until_capture(end, generation, stop, gate, || stream.has_ready_capture())
-                {
+                if let Some(event) = spin_until_capture(end, generation, stop, gate, || {
+                    if stream.pro_direction() == Some(PortDirection::Playback) {
+                        stream.has_ready_pro_playback()
+                    } else {
+                        stream.has_ready_capture()
+                    }
+                }) {
                     return Ok(event);
                 }
                 // Reacquire with full generation/expiry checks, or block once
@@ -2864,6 +2960,493 @@ mod tests {
         }
     }
 
+    // In-process protocol fixture only: no daemon, Wine or physical audio device.
+    struct ProbeDaemon {
+        socket: PathBuf,
+        device: Arc<Mutex<DeviceInfo>>,
+        stop: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+        regions: mpsc::Receiver<Arc<sidealsa_client::SharedRegion>>,
+    }
+
+    impl ProbeDaemon {
+        fn new(features: u32) -> Self {
+            use sidealsa_protocol::{PROTOCOL_VERSION, Request, Response};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let socket = std::env::temp_dir().join(format!(
+                "sidealsa-asio-{}-{}.sock",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let quit = Arc::clone(&stop);
+            let (tx, regions) = mpsc::channel();
+            let device = Arc::new(Mutex::new(test_device()));
+            let current_device = Arc::clone(&device);
+            let thread = thread::spawn(move || {
+                let owners = Arc::new(Mutex::new([false; 2]));
+                let token = Arc::new(Mutex::new(None));
+                let mut peers = Vec::new();
+                while !quit.load(Ordering::Acquire) {
+                    let (mut peer, _) = match listener.accept() {
+                        Ok(peer) => peer,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    };
+                    let owners = Arc::clone(&owners);
+                    let token = Arc::clone(&token);
+                    let tx = tx.clone();
+                    let device = Arc::clone(&current_device);
+                    peers.push(thread::spawn(move || {
+                        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                        let mut reserved = [false; 2];
+                        let mut region = None;
+                        while let Ok(request) = sidealsa_protocol::read_request(&mut peer) {
+                            let response = match request {
+                                Request::Hello { .. } => Response::Hello {
+                                    version: PROTOCOL_VERSION,
+                                    features,
+                                },
+                                Request::GetInfo => Response::Info(device.lock().unwrap().clone()),
+                                Request::OpenPro | Request::OpenProDirection { .. } => {
+                                    let direction = match request {
+                                        Request::OpenProDirection {
+                                            direction,
+                                            group_token,
+                                        } => {
+                                            assert_ne!(features & FEATURE_PRO_DIRECTIONS, 0);
+                                            let mut token = token.lock().unwrap();
+                                            assert_eq!(
+                                                *token.get_or_insert(group_token),
+                                                group_token
+                                            );
+                                            Some(direction)
+                                        }
+                                        _ => None,
+                                    };
+                                    let wanted = [
+                                        direction != Some(PortDirection::Capture),
+                                        direction != Some(PortDirection::Playback),
+                                    ];
+                                    let mut owners = owners.lock().unwrap();
+                                    if (0..2).any(|i| wanted[i] && owners[i]) {
+                                        Response::Busy
+                                    } else {
+                                        for i in 0..2 {
+                                            owners[i] |= wanted[i];
+                                        }
+                                        reserved = wanted;
+                                        let mapping = Arc::new(
+                                            sidealsa_client::SharedRegion::create(
+                                                64,
+                                                if wanted[0] { 8 } else { 0 },
+                                                if wanted[1] { 10 } else { 0 },
+                                            )
+                                            .unwrap(),
+                                        );
+                                        let response = match direction {
+                                            Some(direction) => Response::OpenProDirection {
+                                                session_id: 1,
+                                                direction,
+                                                shared: mapping.info(),
+                                            },
+                                            None => Response::OpenPro {
+                                                session_id: 1,
+                                                shared: mapping.info(),
+                                            },
+                                        };
+                                        let events: Vec<_> =
+                                            (0..3).map(|_| StopSignal::new().unwrap()).collect();
+                                        let fds = [
+                                            mapping.fd(),
+                                            events[0].fd,
+                                            events[1].fd,
+                                            events[2].fd,
+                                        ];
+                                        send_probe_fds(
+                                            &peer,
+                                            &sidealsa_protocol::encode_response(&response).unwrap(),
+                                            &fds,
+                                        );
+                                        tx.send(Arc::clone(&mapping)).unwrap();
+                                        region = Some(mapping);
+                                        continue;
+                                    }
+                                }
+                                Request::Start { .. } => {
+                                    region.as_ref().unwrap().establish_activation(0);
+                                    Response::Ack
+                                }
+                                Request::Stop { .. } => Response::Ack,
+                                Request::Close { .. } => {
+                                    let mut owners = owners.lock().unwrap();
+                                    for i in 0..2 {
+                                        if reserved[i] {
+                                            owners[i] = false;
+                                        }
+                                    }
+                                    reserved = [false; 2];
+                                    sidealsa_protocol::write_response(&mut peer, &Response::Ack)
+                                        .unwrap();
+                                    break;
+                                }
+                                _ => panic!("unexpected request: {request:?}"),
+                            };
+                            sidealsa_protocol::write_response(&mut peer, &response).unwrap();
+                        }
+                        let mut owners = owners.lock().unwrap();
+                        for i in 0..2 {
+                            if reserved[i] {
+                                owners[i] = false;
+                            }
+                        }
+                    }));
+                }
+                for peer in peers {
+                    peer.join().unwrap();
+                }
+            });
+            Self {
+                socket,
+                device,
+                stop,
+                thread: Some(thread),
+                regions,
+            }
+        }
+    }
+
+    impl Drop for ProbeDaemon {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            self.thread.take().unwrap().join().unwrap();
+            std::fs::remove_file(&self.socket).unwrap();
+        }
+    }
+
+    fn send_probe_fds(peer: &UnixStream, bytes: &[u8], fds: &[RawFd]) {
+        let fd_bytes = std::mem::size_of_val(fds);
+        let control_len = unsafe { libc::CMSG_SPACE(fd_bytes as u32) as usize };
+        let mut control = vec![0_usize; control_len.div_ceil(size_of::<usize>())];
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        };
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control_len;
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&message);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(fd_bytes as u32) as usize;
+            ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(cmsg).cast(), fds.len());
+            assert_eq!(
+                libc::sendmsg(peer.as_raw_fd(), &message, 0),
+                bytes.len() as isize
+            );
+        }
+    }
+
+    fn probe_buffers(input: bool) -> [AsioBufferInfo; 1] {
+        [AsioBufferInfo {
+            is_input_type: c_int::from(input),
+            channel_number: 0,
+            buffers: [ptr::null_mut(); 2],
+        }]
+    }
+
+    fn probe_callbacks() -> AsioCallbacks {
+        AsioCallbacks {
+            buffer_switch: Some(test_buffer_switch),
+            ..AsioCallbacks::default()
+        }
+    }
+
+    #[test]
+    fn changed_rate_rejects_create_and_recreate_without_reserving_pro() {
+        for after_dispose in [false, true] {
+            // Directional playback, directional capture, duplex and legacy fallback.
+            for mode in 0..4 {
+                let daemon = ProbeDaemon::new(if mode == 3 { 0 } else { FEATURE_PRO_DIRECTIONS });
+                let driver = AsioDriver::new();
+                driver.init(&daemon.socket).unwrap();
+                let mut infos = if mode == 2 {
+                    vec![probe_buffers(true)[0], probe_buffers(false)[0]]
+                } else {
+                    probe_buffers(mode == 1).to_vec()
+                };
+                if after_dispose {
+                    driver
+                        .create_buffers(&mut infos, 64, probe_callbacks())
+                        .unwrap();
+                    driver.dispose_buffers().unwrap();
+                    daemon.regions.recv_timeout(CONTROL_TIMEOUT).unwrap();
+                    for info in &mut infos {
+                        info.buffers = [ptr::null_mut(); 2];
+                    }
+                }
+                daemon.device.lock().unwrap().rate = 96000;
+                assert!(matches!(
+                    driver.create_buffers(&mut infos, 64, probe_callbacks()),
+                    Err(AsioError::DeviceChanged)
+                ));
+                assert!(
+                    infos
+                        .iter()
+                        .all(|info| info.buffers == [ptr::null_mut(); 2])
+                );
+                assert_eq!(driver.get_sample_rate().unwrap(), 48000.0);
+                let inner = driver.lock().unwrap();
+                assert_eq!(inner.state, DriverState::Initialized);
+                assert!(inner.stream.is_none());
+                assert!(inner.buffers.is_none());
+                drop(inner);
+                assert!(matches!(
+                    daemon.regions.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+
+                // A newly initialized driver can immediately claim both directions.
+                let fresh = AsioDriver::new();
+                fresh.init(&daemon.socket).unwrap();
+                assert_eq!(fresh.get_sample_rate().unwrap(), 96000.0);
+                fresh
+                    .create_buffers(
+                        &mut [probe_buffers(true)[0], probe_buffers(false)[0]],
+                        64,
+                        probe_callbacks(),
+                    )
+                    .unwrap();
+                fresh.dispose_buffers().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn paired_objects_reserve_at_create_release_and_recreate() {
+        let daemon = ProbeDaemon::new(FEATURE_PRO_DIRECTIONS);
+        let p = AsioDriver::new();
+        let c = AsioDriver::new();
+        p.init(&daemon.socket).unwrap();
+        c.init(&daemon.socket).unwrap();
+        assert!(p.lock().unwrap().stream.is_none());
+        let mut outputs = probe_buffers(false);
+        p.create_buffers(&mut outputs, 64, probe_callbacks())
+            .unwrap();
+        assert_eq!(
+            p.lock().unwrap().stream.as_ref().unwrap().pro_direction(),
+            Some(PortDirection::Playback)
+        );
+        let mut duplicate = probe_buffers(false);
+        assert!(matches!(
+            c.create_buffers(&mut duplicate, 64, probe_callbacks()),
+            Err(AsioError::Client(ClientError::Busy))
+        ));
+        assert!(duplicate[0].buffers[0].is_null());
+        let mut inputs = probe_buffers(true);
+        inputs[0].channel_number = 10;
+        assert!(matches!(
+            c.create_buffers(&mut inputs, 64, probe_callbacks()),
+            Err(AsioError::InvalidParameter)
+        ));
+        inputs[0].channel_number = 9;
+        c.create_buffers(&mut inputs, 64, probe_callbacks())
+            .unwrap();
+        assert_eq!(
+            c.lock().unwrap().stream.as_ref().unwrap().pro_direction(),
+            Some(PortDirection::Capture)
+        );
+        assert_eq!(c.get_channels().unwrap(), (10, 8));
+        assert_eq!(p.get_channels().unwrap(), (10, 8));
+        c.stop().unwrap();
+        c.dispose_buffers().unwrap();
+        assert!(p.lock().unwrap().stream.is_some());
+        c.create_buffers(&mut inputs, 64, probe_callbacks())
+            .unwrap();
+        // A reaped worker failure must not leave a permanently reserved endpoint.
+        c.lock().unwrap().worker_failure = Some(WorkerFailure::Stream);
+        assert!(c.dispose_buffers().is_err());
+        c.create_buffers(&mut inputs, 64, probe_callbacks())
+            .unwrap();
+        p.dispose_buffers().unwrap();
+        assert!(c.lock().unwrap().stream.is_some());
+        let mut duplex = [probe_buffers(true)[0], probe_buffers(false)[0]];
+        assert!(matches!(
+            p.create_buffers(&mut duplex, 64, probe_callbacks()),
+            Err(AsioError::Client(ClientError::Busy))
+        ));
+        c.dispose_buffers().unwrap();
+        p.create_buffers(&mut duplex, 64, probe_callbacks())
+            .unwrap();
+        assert_eq!(
+            p.lock().unwrap().stream.as_ref().unwrap().pro_direction(),
+            None
+        );
+        p.dispose_buffers().unwrap();
+    }
+
+    #[test]
+    fn legacy_server_uses_classic_exclusive_reservation() {
+        let daemon = ProbeDaemon::new(0);
+        let p = AsioDriver::new();
+        let c = AsioDriver::new();
+        p.init(&daemon.socket).unwrap();
+        c.init(&daemon.socket).unwrap();
+        p.create_buffers(&mut probe_buffers(false), 64, probe_callbacks())
+            .unwrap();
+        assert_eq!(
+            p.lock().unwrap().stream.as_ref().unwrap().pro_direction(),
+            None
+        );
+        assert!(matches!(
+            c.create_buffers(&mut probe_buffers(true), 64, probe_callbacks()),
+            Err(AsioError::Client(ClientError::Busy))
+        ));
+        p.dispose_buffers().unwrap();
+        c.create_buffers(&mut probe_buffers(true), 64, probe_callbacks())
+            .unwrap();
+        c.dispose_buffers().unwrap();
+    }
+
+    thread_local! {
+        static PROBE_CYCLE: std::cell::RefCell<Option<(Arc<WorkerGate>, Arc<sidealsa_client::SharedRegion>)>> = const { std::cell::RefCell::new(None) };
+    }
+
+    unsafe extern "win64" fn stop_probe_callback(_index: c_int, _direct: c_int) {
+        PROBE_CYCLE.with_borrow(|cycle| {
+            let (gate, region) = cycle.as_ref().unwrap();
+            gate.set_running(false);
+            // Let playback drain past the callback block without a hardware loop.
+            region.set_playback_sequence(2);
+            region.set_cycle_sequence(2);
+        });
+    }
+
+    #[test]
+    fn directional_workers_running_and_stopped_never_touch_the_other_endpoint() {
+        for input_only in [false, true] {
+            for running in [false, true] {
+                let daemon = ProbeDaemon::new(FEATURE_PRO_DIRECTIONS);
+                let driver = AsioDriver::new();
+                let other = AsioDriver::new();
+                driver.init(&daemon.socket).unwrap();
+                other.init(&daemon.socket).unwrap();
+                driver
+                    .create_buffers(&mut probe_buffers(input_only), 64, probe_callbacks())
+                    .unwrap();
+                other
+                    .create_buffers(&mut probe_buffers(!input_only), 64, probe_callbacks())
+                    .unwrap();
+                let region = daemon.regions.recv_timeout(CONTROL_TIMEOUT).unwrap();
+                let other_region = daemon.regions.recv_timeout(CONTROL_TIMEOUT).unwrap();
+                let mut stream = driver.lock().unwrap().stream.take().unwrap();
+                stream.start().unwrap();
+                region.set_cycle_sequence(1);
+                region.set_playback_sequence(if input_only { 100 } else { 1 });
+                if input_only {
+                    assert!(region.try_publish_capture(&mut 0, 1, &[i32::MAX; 640]));
+                    assert!(other_region.try_client_publish_playback(&mut 0, 77, &[123; 512]));
+                } else {
+                    assert!(other_region.try_publish_capture(&mut 0, 77, &[123; 640]));
+                }
+                let stop = Arc::new(StopSignal::new().unwrap());
+                let gate = Arc::new(WorkerGate::new(running).unwrap());
+                let position = Arc::new(PositionSnapshot::new());
+                let inner = driver.lock().unwrap();
+                let buffers = inner.buffers.clone().unwrap();
+                let active = inner.active.clone().unwrap();
+                drop(inner);
+                let worker = {
+                    let stop = Arc::clone(&stop);
+                    let gate = Arc::clone(&gate);
+                    let region = Arc::clone(&region);
+                    let position = Arc::clone(&position);
+                    thread::spawn(move || {
+                        PROBE_CYCLE
+                            .with_borrow_mut(|cycle| *cycle = Some((Arc::clone(&gate), region)));
+                        let audio =
+                            unsafe { OwnedFd::from_raw_fd(stream.notification_fd().unwrap()) };
+                        let control = unsafe { OwnedFd::from_raw_fd(stream.control_fd().unwrap()) };
+                        let result = worker_loop(
+                            &mut stream,
+                            audio.as_raw_fd(),
+                            control.as_raw_fd(),
+                            &stop,
+                            &gate,
+                            &buffers,
+                            &active,
+                            AsioCallbacks {
+                                buffer_switch: Some(stop_probe_callback),
+                                ..AsioCallbacks::default()
+                            },
+                            false,
+                            48000,
+                            64,
+                            &mut vec![0; if input_only { 640 } else { 0 }],
+                            &mut vec![0; if input_only { 0 } else { 512 }],
+                            SampleKernels::scalar(),
+                            &position,
+                            0,
+                        );
+                        PROBE_CYCLE.with_borrow_mut(|cycle| *cycle = None);
+                        (stream, result)
+                    })
+                };
+                let deadline = Instant::now() + CONTROL_TIMEOUT;
+                while gate.acknowledged(false) != u64::from(running)
+                    || if input_only {
+                        region.ready_capture_slots() != 0
+                    } else {
+                        !region.has_ready_playback(if running { 2 } else { 1 })
+                    }
+                {
+                    if Instant::now() >= deadline || worker.is_finished() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_micros(50));
+                }
+                stop.request();
+                let (mut stream, result) = worker.join().unwrap();
+                result.unwrap();
+                assert_eq!(gate.acknowledged(false), u64::from(running));
+                assert_eq!(position.load().1 != 0, running);
+                assert_eq!(position.load().0, 0);
+                assert_eq!(region.client_playback_submit_failures(), 0);
+                if input_only {
+                    assert_eq!(region.ready_capture_slots(), 0);
+                    assert_eq!(region.client_playback_sequence(), 0);
+                    let inner = driver.lock().unwrap();
+                    assert_eq!(
+                        inner.buffers.as_ref().unwrap().input[0].half(0),
+                        &[if running { 1.0 } else { 0.0 }; 64]
+                    );
+                } else {
+                    let mut silence = [1; 512];
+                    assert!(region.try_consume_playback(if running { 2 } else { 1 }, &mut silence));
+                    assert_eq!(silence, [0; 512]);
+                }
+                stream.stop().unwrap();
+                stream.close().unwrap();
+                if input_only {
+                    let mut sentinel = [0; 512];
+                    assert!(other_region.try_consume_playback(77, &mut sentinel));
+                    assert_eq!(sentinel, [123; 512]);
+                } else {
+                    assert_eq!(other_region.next_client_capture_sequence(0), Some(77));
+                }
+                other.dispose_buffers().unwrap();
+            }
+        }
+    }
+
     fn fake_running_driver(
         timeout: Duration,
     ) -> (Arc<AsioDriver>, Arc<WorkerGate>, Weak<HostBuffers>) {
@@ -3425,6 +4008,12 @@ mod tests {
         );
         assert!(buffers.upgrade().is_some());
         drop(inner);
+        assert!(matches!(
+            driver.dispose_buffers(),
+            Err(AsioError::WorkerTimeout)
+        ));
+        assert!(buffers.upgrade().is_some());
+        assert!(driver.lock().unwrap().worker.is_some());
         remove_fake_worker(&driver);
     }
 

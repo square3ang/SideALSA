@@ -166,9 +166,23 @@ Run the installer as the normal desktop user, not with `sudo`:
 ./scripts/install.sh
 ```
 
-It builds the Rust workspace and Qt control panel as that user, requests `sudo`
-only for protected paths and systemd operations, installs the reference profile,
-starts `sidealsad`, and installs the ALSA and PipeWire adapter configuration.
+With no arguments it always dispatches to the terminal device/profile setup,
+even with redirected input/output. Setup fails before Cargo when stdin or stdout
+is not a terminal; automation must use explicit installer flags.
+
+Supported USB selection matches E1x2 OTG `152a:8755` (verified locally) or E2x2
+OTG `152a:8756` (source-backed, provisional), binds the vendor profile to the
+actual card's DEV0 in both directions, and preserves routing/timing. It proposes
+a unique local draft without channel/path questions and defaults to install
+`--no-start`, still requiring explicit `SAVE` then `INSTALL`. Manual setup
+defaults to save only. USB identity is not evdev identity; non-OTG `152a:8752`
+is not auto-selected. Capability checks are future work, and there is no
+multi-device aggregation. See [setup and USB evidence](docs/onboard-setup.md).
+
+After confirmation, installation builds the selected components as that user and
+requests `sudo` only for protected paths and systemd operations. `--no-start`
+enables the service for future boots without starting/restarting it now, and does
+not stop an already-running daemon.
 
 Important defaults are:
 
@@ -196,6 +210,13 @@ a differently configured host.
 Common variants:
 
 ```sh
+# Terminal menus: supported USB, manual device pair, or existing profile
+./scripts/install.sh
+./scripts/install.sh --interactive
+# Wine/Steam prefix selection and ASIO installation menus
+./scripts/install-asio.sh
+./scripts/install-asio.sh --interactive
+
 # Rust daemon, tools, and ALSA/PipeWire integration without the Qt GUI
 ./scripts/install.sh --no-gui
 
@@ -215,6 +236,11 @@ Common variants:
 An existing installed profile is preserved by default, including during an
 upgrade or `--force` install. Review repository profile changes and use
 `--replace-profile` only when replacement is intended.
+
+No-argument ASIO setup also always dispatches to its wizard with redirected
+input/output; EOF cancels safely. It requires explicit `INSTALL` before building,
+installing or registering. Explicit installer flags retain noninteractive behavior.
+See [ASIO setup](docs/asio-setup.md).
 
 Each installer invocation describes the desired complete optional feature set.
 On a later upgrade, omitting `--with-asio` removes installer-managed system ASIO
@@ -326,10 +352,10 @@ sidealsa-shared-test --port line1 --periods 3000
 ```
 
 Only one PRO owner may exist. Close a native PRO client, `sidealsa_pro` user, or
-ASIO application before opening another. The current ALSA plugin opens each PCM
-direction as a separate SideALSA stream, so two-handle full-duplex PRO through
-`sidealsa_pro` is not supported; use the native client API or ASIO for a single
-duplex PRO session.
+ASIO application before opening an unrelated owner. Updated clients and daemon
+support one input and one output handle in the same process as one exclusive
+group, including two directional ASIO objects. See
+[separate PRO opens](docs/pro-directions.md) for lifecycle and compatibility limits.
 
 Each SHARED logical port also has one backend owner at a time. Different ports
 can operate concurrently, and PipeWire can mix multiple desktop applications
@@ -533,8 +559,9 @@ load.
   occurs in PipeWire rather than inside SideALSA.
 - The ALSA ioplug supports S32_LE, RW-interleaved access, and the profile sample
   rate. It does not provide mmap, resampling, or format conversion.
-- ALSA `sidealsa_pro` does not currently provide a conventional two-handle
-  full-duplex open because the second handle encounters exclusive PRO ownership.
+- Separate PRO input/output handles require the directional feature on both
+  client and daemon and belong to one process/client-library instance. Unrelated
+  processes remain exclusive; ioplug linked-start support is not implied.
 - PipeWire integration uses profile-generated ALSA adapters. There is no custom PipeWire
   client, runtime hotplug integration, or automatic reconnection after a daemon
   restart.
@@ -563,6 +590,9 @@ and test conditions.
 - [Direct ALSA engine](docs/milestone-1.md)
 - [Profiles and channel splitting](docs/milestone-2.md)
 - [Device profiles and generated integration](docs/device-profiles.md)
+- [Onboard terminal setup](docs/onboard-setup.md)
+- [ASIO terminal setup](docs/asio-setup.md)
+- [Separate PRO input/output opens](docs/pro-directions.md)
 - [Local PRO path](docs/milestone-3.md)
 - [Daemon and protocol](docs/milestone-4.md)
 - [SHARED path](docs/milestone-5.md)

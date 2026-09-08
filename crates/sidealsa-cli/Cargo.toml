@@ -22,6 +22,13 @@ name = "sidealsa-stats"
 path = "src/bin/sidealsa-stats.rs"
 
 [dependencies]
+alsa = "0.11"
+sidealsa-config = { path = "../sidealsa-config" }
+toml_edit = "0.23"
 libc = "0.2"
 sidealsa-client = { path = "../sidealsa-client" }
 sidealsa-protocol = { path = "../sidealsa-protocol" }
+
+[[bin]]
+name = "sidealsa-setup"
+path = "src/bin/sidealsa-setup.rs"

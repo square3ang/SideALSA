@@ -164,6 +164,19 @@ add_custom_command(
 add_custom_target(sidealsa-asio-lifecycle-probe DEPENDS "${LIFECYCLE_OUTPUT}")
 add_dependencies(sidealsa-asio-lifecycle-probe sidealsa-asio-runtime-layout)
 
+set(SPLIT_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/sidealsa-asio-split-probe.exe")
+add_custom_command(
+    OUTPUT "${SPLIT_OUTPUT}" "${SPLIT_OUTPUT}.so"
+    COMMAND "${WINEGCC_EXECUTABLE}" -m64 -std=gnu11 -O2 -Wall -Wextra
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/asio_split_probe.c"
+            -lole32 -luuid -lm -o "${SPLIT_OUTPUT}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/asio_split_probe.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/asio_probe.c"
+    VERBATIM
+)
+add_custom_target(sidealsa-asio-split-probe DEPENDS "${SPLIT_OUTPUT}")
+add_dependencies(sidealsa-asio-split-probe sidealsa-asio-runtime-layout)
+
 include(CTest)
 if(BUILD_TESTING)
     find_program(WINE_EXECUTABLE NAMES wine wine64)
