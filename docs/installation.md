@@ -172,6 +172,26 @@ Install without starting the daemon:
 scripts/install.sh --no-start
 ```
 
+## Updating
+
+Refresh binaries, GUI, ASIO, and integration while keeping the installed
+device profile:
+
+```text
+scripts/update.sh
+```
+
+`update.sh` never opens the setup menus, even with no arguments on a terminal,
+and refuses `--profile`, `--replace-profile`, and `--interactive`. Installed
+features are read back from the previous install manifest, so the Qt control
+panel, Wine ASIO binaries, and PipeWire integration are repeated rather than
+retired. Explicit `--with-asio`, `--no-gui`, `--no-pipewire`, and the other
+forwarded options still override detection with install.sh "complete feature
+set" semantics. Without a previous manifest (first install through this path),
+install.sh defaults apply: GUI on, ASIO off. The daemon restarts unless
+`--no-start` is given. Fixture coverage lives in
+`scripts/test-update.sh` (staged DESTDIR only, never touches services).
+
 Skip the Qt control panel and polkit helper:
 
 ```text

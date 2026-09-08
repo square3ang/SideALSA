@@ -205,6 +205,18 @@ Check SideALSA counters alongside PipeWire graph XRUNs, not just the latter.
 
 ## Updates and Removal
 
+To refresh an existing installation without touching the device profile:
+
+```bash
+bash scripts/update.sh
+```
+
+This rebuilds and reinstalls the daemon, GUI, and ASIO while preserving the
+installed profile. Previously installed features are detected from the install
+manifest and repeated, and the daemon restarts unless `--no-start` is given.
+`--profile`, `--replace-profile`, and `--interactive` are refused here; use
+`scripts/install.sh` for device changes.
+
 Existing installed profiles are preserved by default. Use `--profile PATH --replace-profile` to replace one explicitly.
 Terminal-menu installation uses this replacement option to apply your selected profile, so check the final path.
 

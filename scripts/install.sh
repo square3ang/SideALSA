@@ -9,7 +9,7 @@ if [[ ${1:-} == --interactive ]]; then
     (($# == 1)) || { printf 'Use --interactive alone; select options in the menu.\n' >&2; exit 2; }
     exec bash "$ROOT/scripts/setup.sh"
 fi
-if (($# == 0)); then
+if (($# == 0)) && [[ -z "${SIDEALSA_UPDATE:-}" ]]; then
     exec bash "$ROOT/scripts/setup.sh"
 fi
 PREFIX="${PREFIX:-/usr/local}"
