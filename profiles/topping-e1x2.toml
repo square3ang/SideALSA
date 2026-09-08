@@ -17,7 +17,7 @@ pro_handoff_us = 1000
 # Keep userspace audio below the PREEMPT_RT xHCI IRQ thread (FIFO 50 here).
 pro_realtime_priority = 46
 shared_latency_periods = 5
-shared_playback_repeat_on_underrun = true
+shared_playback_repeat_on_underrun = false
 realtime = true
 realtime_priority = 48
 
