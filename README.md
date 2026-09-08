@@ -98,19 +98,19 @@ The non-OTG `152a:8752` is not selected automatically. Manual setup is available
 hardware capabilities for channels, formats, and rates are not yet checked.
 SideALSA does not aggregate independent devices, so use playback and capture sharing the same physical clock.
 
-### 3. Save, Then Install
+### 3. Confirm, Then Install
 
 1. Select your device and profile, then review the summary.
-2. Type `SAVE` to confirm your choices and save a new draft.
-3. If you chose installation, review the components and final command, then type `INSTALL`.
+2. Answer `y` at each `[y/N]` prompt to proceed. Enter, EOF, and any other answer cancel; nothing runs without an explicit `y`.
+3. If you chose installation, review the components and final command, then answer `y` again.
 
 > [!NOTE]
-> **Supported USB devices default to installation with `--no-start`.** This does not start or restart the daemon now,
-> but **does enable automatic service startup on future boots**. It does not stop an already running daemon.
+> **Supported USB devices default to installation with hardware restart.** This opens the hardware and may interrupt current audio.
 > Manual setup and existing-profile selection default to **save only**; choose an installation action separately.
+> To install without starting or restarting now, pick the `--no-start` action instead: it skips the running daemon
+> but **still enables automatic service startup on future boots**.
 
-To apply changes immediately, choose install and restart in the menu, then confirm with **`RESTART`**. This opens the hardware and may interrupt current audio.
-After a first installation with `--no-start`, you can start the daemon later if it is not running:
+After a `--no-start` installation, start the daemon later if it is not running:
 
 ```bash
 sudo systemctl start sidealsad
@@ -132,7 +132,7 @@ bash scripts/install-asio.sh
 1. Review the installation location, build choice, and prefix registration choice.
 2. In **Steam game selection**, choose numbers using the displayed game names, AppIDs, and prefix paths.
 3. In **manual Wine prefix selection**, choose a regular Wine prefix or a path from an additional Steam library.
-4. Review the final summary and type exactly `INSTALL`.
+4. Review the final summary and answer `y`.
 
 For Steam games only, press Enter to skip the manual step. For regular Wine only, skip Steam selection.
 
@@ -140,17 +140,19 @@ For Steam games only, press Enter to skip the manual step. For regular Wine only
 > **Launch each Steam game with Proton once, then close it before setup.** Only existing prefixes can be selected.
 > Games whose names cannot be found appear as `Unknown Steam game`.
 
-Entering multiple numbers or `all` only selects prefixes; nothing is built, installed, or registered before the final `INSTALL` confirmation.
+Entering multiple numbers or `all` only selects prefixes; nothing is built, installed, or registered before the final `y` confirmation.
 Registration can start Wine processes and modify the selected prefixes.
 
 Use the launch environment printed by the installer. If you already have launch options, merge the required environment variables rather than discarding your existing settings.
 For the default installation location, Steam launch options are:
 
 ```text
-SIDEALSA_SOCKET=/tmp/sidealsad.sock WINEDLLPATH="$HOME/.local/lib/wine" %command%
+WINEDLLPATH="$HOME/.local/lib/wine" %command%
 ```
 
-For a custom socket or installation location, substitute the actual paths printed by the installer. Select the SideALSA ASIO driver in your game or DAW's audio settings.
+ASIO connects to `/tmp/sidealsad.sock` unless `SIDEALSA_SOCKET` is set, so the
+default setup needs no extra variable. For a custom socket or installation
+location, substitute the actual paths printed by the installer. Select the SideALSA ASIO driver in your game or DAW's audio settings.
 The main installer's `--with-asio` installs system files only; **prefix registration still requires this separate step**.
 [ASIO Setup Guide](docs/asio-setup.md) · [ASIO Implementation and Validation](docs/milestone-asio.md)
 

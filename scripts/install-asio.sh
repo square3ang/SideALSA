@@ -200,4 +200,5 @@ for prefix in "${UNIQUE_PREFIXES[@]}"; do
 done
 
 info "registered SideALSA ASIO in ${#UNIQUE_PREFIXES[@]} prefix(es)"
-info "Steam launch option: SIDEALSA_SOCKET=${SIDEALSA_SOCKET:-/tmp/sidealsad.sock} WINEDLLPATH=$WINE_ROOT %command%"
+info "Steam launch option: WINEDLLPATH=$WINE_ROOT %command%"
+info "ASIO uses /tmp/sidealsad.sock unless SIDEALSA_SOCKET is set"

@@ -98,7 +98,7 @@ cancelled() {
 run ''
 [[ ! -e "$tmp/calls" ]] || fail 'no-argument EOF invoked installer'
 grep -Fq 'Cancelled' "$tmp/output" || fail 'no-argument EOF did not reach wizard'
-run $'\n\n2\n1\nINSTALL\n'
+run $'\n\n2\n1\ny\n'
 [[ -e "$tmp/calls" ]] || fail 'no-argument redirected confirmation did not reach stub installer'
 
 # EOF at each prompt, 0/invalid menu input, skipped steps, and final default cancellation.
@@ -107,7 +107,7 @@ for input in '' $'\n' $'\n\n' $'\n\n2\n' $'\n\n2\n2\n' \
     $'\n\n2\n2\n1; touch bad\n' $'\n\n2\n2\n\n' \
     $'\n\n2\n2\n\n'"$tmp/missing"$'\n' $'\n\n2\n2\n\n\n0\n' \
     $'\n\n2\n2\n\n\n99\n' $'\n\n2\n2\n\n\n\n' \
-    $'\n\n2\n2\nall\n\n\nno\n' $'relative\n'; do
+    $'\n\n2\n2\nall\n\n\nno\n' $'\n\n2\n2\nall\n\nall\n\n' $'relative\n'; do
     cancelled "$input"
 done
 for selection in 0 999 -1 01 '1 999' '1; touch bad' 'a[$(touch bad)]' ''; do
@@ -117,7 +117,7 @@ for selection in 0 99 -1 '1 99' 'allx'; do
     cancelled $'\n\n2\n2\n\n\n'"$selection"$'\nINSTALL\n'
 done
 
-run "$tmp/install root"$'\nrelative build\n2\n1\nINSTALL\n' --interactive
+run "$tmp/install root"$'\nrelative build\n2\n1\ny\n' --interactive
 mapfile -d '' -t args < "$tmp/calls"
 expected_args=(--install-root "$tmp/install root" --build-dir "$tmp/repo/relative build" --wine wine --no-build --no-register)
 [[ ${#args[@]} == ${#expected_args[@]} ]] || fail 'file-only argument count'
@@ -127,7 +127,7 @@ done
 [[ ! -e "$tmp/install root" ]] || fail 'real installation occurred'
 
 # All Steam games plus all manual prefixes, with game names displayed.
-run $'\n\n1\n2\nall\n\nall\nINSTALL\n' --interactive
+run $'\n\n1\n2\nall\n\nall\ny\n' --interactive
 mapfile -d '' -t args < "$tmp/calls"
 expected_all=("${steam_paths[@]}" "${manual[@]}")
 [[ ${#args[@]} == $((6 + 2 * ${#expected_all[@]})) ]] || fail 'all prefix count or build flag'
@@ -142,7 +142,7 @@ grep -Fq 'Step 1 - Steam games' "$tmp/output" || fail 'steam step missing'
 grep -Fq 'Step 2 - Manual Wine prefixes' "$tmp/output" || fail 'manual step missing'
 
 # Split selection keeps game order; skipped manual step leaves no manual section.
-run $'\n\n2\n2\n2 1\n\n\nINSTALL\n' --interactive
+run $'\n\n2\n2\n2 1\n\n\nY\n' --interactive
 mapfile -d '' -t args < "$tmp/calls"
 [[ ${#args[@]} == 11 && "${args[6]}" == --no-build ]] || fail 'split selection flags'
 [[ "${args[7]}" == --steam-prefix && "${args[8]}" == "${steam_paths[1]}" ]] || fail 'split first game'
@@ -150,7 +150,7 @@ mapfile -d '' -t args < "$tmp/calls"
 if grep -Fq 'Manual prefixes:' "$tmp/output"; then fail 'skipped manual step listed'; fi
 
 # Manual-only: Steam skipped, alias and already-known compatdata deduplicated.
-run $'\n\n2\n2\n\n'"$home/external library/steamapps/compatdata"$'\n'"$home/prefix alias"$'\n\nall\nINSTALL\n' --interactive
+run $'\n\n2\n2\n\n'"$home/external library/steamapps/compatdata"$'\n'"$home/prefix alias"$'\n\nall\nYES\n' --interactive
 mapfile -d '' -t args < "$tmp/calls"
 [[ ${#args[@]} == 11 ]] || fail 'manual-only argument count'
 [[ "${args[8]}" == "${manual[0]}" && "${args[10]}" == "${manual[1]}" ]] || fail 'manual-only prefixes'

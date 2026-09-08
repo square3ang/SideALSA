@@ -221,9 +221,24 @@ fn ask(
     }
 }
 
-/// Choice prompt without a default: an empty line re-prompts instead of
-/// silently accepting item 0. EOF/`b`/`c` keep their navigation meaning.
+/// Yes-or-no confirmation defaulting to no. Only an explicit `y` proceeds;
+/// `b` steps back, while EOF, Enter, and any other answer cancel.
+fn confirm(input: &mut impl BufRead, out: &mut impl Write, label: &str) -> Result<()> {
+    write!(out, "{label} [y/N] (y: yes, Enter: no, b: back): ")?;
+    out.flush()?;
+    let mut line = String::new();
+    if input.read_line(&mut line)? == 0 {
+        return Err(Box::new(Navigation::Cancel));
+    }
+    match line.trim().to_lowercase().as_str() {
+        "y" | "yes" => Ok(()),
+        "b" => Err(Box::new(Navigation::Back)),
+        _ => Err(Box::new(Navigation::Cancel)),
+    }
+}
 fn ask_explicit(input: &mut impl BufRead, out: &mut impl Write) -> Result<String> {
+    // No default: an empty line re-prompts instead of silently accepting.
+    // EOF/`b`/`c` keep their navigation meaning.
     loop {
         let answer = ask(input, out, "Choice (number, no default)", "")?;
         if answer.is_empty() {
@@ -497,7 +512,7 @@ fn plan(
         "SAVE ONLY (existing profile: leave unchanged); no installation or service effects".into(),
         "Install/select with --no-start: ENABLE service for FUTURE BOOTS, no immediate start/restart".into(),
         "Install/select and RESTART hardware service now; enable future boots".into(),
-    ], if is_supported { 2 } else { 1 })?;
+    ], if is_supported { 3 } else { 1 })?;
     section(out, "Review")?;
     row(out, "Source", format_args!("{}", path.display()))?;
     row(
@@ -538,15 +553,7 @@ fn plan(
             ),
         )?;
     }
-    if ask(
-        input,
-        out,
-        "Type SAVE to commit this choice (anything else cancels)",
-        "cancel",
-    )? != "SAVE"
-    {
-        return Err(Box::new(Navigation::Cancel));
-    }
+    confirm(input, out, "Commit this choice")?;
     Ok(Draft {
         path,
         text,
@@ -751,20 +758,7 @@ fn install(
             }
         ),
     )?;
-    let token = if staged || draft.action == 2 {
-        "INSTALL"
-    } else {
-        "RESTART"
-    };
-    if ask(
-        input,
-        out,
-        &format!("Type {token} to invoke installer"),
-        "cancel",
-    )? != token
-    {
-        return Err(Box::new(Navigation::Cancel));
-    }
+    confirm(input, out, "Run the installer now")?;
     if !command.status()?.success() {
         return Err("installer failed; saved profile remains available".into());
     }
@@ -797,7 +791,7 @@ fn run() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "sidealsa-setup [--project-root PATH] [--list-devices]\nDefault: numbered interactive menus (TTY required). Supported USB devices use vendor profiles and default to install --no-start; manual setup defaults to SAVE ONLY. All actions require confirmation.\n--list-devices: control-only playback/capture and USB/profile listing, no writes or PCM opens.\n--help: offline, no enumeration. Run scripts/setup.sh as a normal user."
+            "sidealsa-setup [--project-root PATH] [--list-devices]\nDefault: numbered interactive menus (TTY required). Supported USB devices use vendor profiles and default to install and restart; manual setup defaults to SAVE ONLY. Every confirmation defaults to no.\n--list-devices: control-only playback/capture and USB/profile listing, no writes or PCM opens.\n--help: offline, no enumeration. Run scripts/setup.sh as a normal user."
         );
         return Ok(());
     }
@@ -889,7 +883,7 @@ fn run() -> Result<()> {
     println!(
         "{}",
         dim(
-            "Numbered menus: Enter = default · b = back · c/EOF = cancel. Nothing is saved or installed until SAVE / INSTALL / RESTART is typed."
+            "Numbered menus: Enter = default · b = back · c/EOF = cancel. Nothing is saved or installed without an explicit y."
         )
     );
     for dir in directories.drain(..) {
@@ -1051,22 +1045,25 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut entries = usb_entries(1, 0x8755);
         let mut out = Vec::new();
-        let draft = plan(
-            &mut Cursor::new("\n\nSAVE\n"),
-            &mut out,
-            &root,
-            &entries,
-            &[],
-        )
-        .unwrap();
-        assert_eq!(draft.action, 2);
+        let draft = plan(&mut Cursor::new("\n\ny\n"), &mut out, &root, &entries, &[]).unwrap();
+        assert_eq!(draft.action, 3);
         assert!(draft.create);
         assert!(!draft.path.exists());
         let output = String::from_utf8(out).unwrap();
         assert!(!output.contains("Confirm proposed"));
         assert!(!output.contains("New draft path"));
         assert!(!output.contains("Explicit hw:"));
-        for input in ["", "c\n", "b\n", "\n", "\n\n", "\n\nc\n", "\n\nwrong\n"] {
+        for input in [
+            "",
+            "c\n",
+            "b\n",
+            "\n",
+            "\n\n",
+            "\n\n\n",
+            "\n\nc\n",
+            "\n\nn\n",
+            "\n\nwrong\n",
+        ] {
             assert!(
                 plan(
                     &mut Cursor::new(input),
@@ -1090,7 +1087,7 @@ mod tests {
             .is_err()
         );
         let draft = plan(
-            &mut Cursor::new("2\n1\nSAVE\n"),
+            &mut Cursor::new("2\n1\ny\n"),
             &mut Vec::new(),
             &root,
             &entries,
@@ -1287,7 +1284,7 @@ mod tests {
         let mut out = Vec::new();
         assert!(plan(&mut Cursor::new("2\n\n"), &mut out, &root, &[], &existing).is_err());
         let draft = plan(
-            &mut Cursor::new("2\n1\n\nSAVE\n"),
+            &mut Cursor::new("2\n1\n\ny\n"),
             &mut out,
             &root,
             &[],
@@ -1315,7 +1312,7 @@ mod tests {
             "",
             "/nonexistent/sidealsa-draft.toml",
             "",
-            "SAVE",
+            "y",
         ];
         for end in 0..answers.len() {
             let input = format!("{}\n", answers[..end].join("\n"));
@@ -1379,7 +1376,7 @@ mod tests {
             action: 2,
         };
         let error = install(
-            &mut Cursor::new("1\n1\nINSTALL\n"),
+            &mut Cursor::new("1\n1\ny\n"),
             &mut Vec::new(),
             Path::new("/nonexistent"),
             &draft,

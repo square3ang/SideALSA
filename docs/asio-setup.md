@@ -60,9 +60,9 @@ discovery. Blank numbered choices skip that step.
 ## Confirmation
 
 The final summary separates file installation from prefix registration and lists
-the selected Steam games (with appids) and manual prefixes separately. Only the
-exact text `INSTALL` authorizes execution.
-Enter, EOF, or any other response defaults to cancellation, with no build,
+the selected Steam games (with appids) and manual prefixes separately. Only an
+explicit `y` at the `[y/N]` prompt authorizes execution.
+Enter, EOF, or any other response defaults to no, with no build,
 installation, or registration. Root execution is rejected before any prompts.
 
 File-only setup never runs Wine. Registration copies the DLL into each selected

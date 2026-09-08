@@ -240,7 +240,10 @@ if ((register)); then
 else
     row 'Registration' 'none'
 fi
-ask 'Type INSTALL to proceed; Enter or anything else cancels: '
-[[ "$answer" == INSTALL ]] || cancel
+ask 'Proceed with build/install/register? [y/N] (y: yes, Enter: no): '
+case "${answer,,}" in
+    y|yes) ;;
+    *) cancel ;;
+esac
 # Explicit options prevent the no-argument TTY entry point from recursing.
 exec bash "$ROOT/scripts/install-asio.sh" "${args[@]}"

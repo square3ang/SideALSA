@@ -89,14 +89,15 @@ It displays `selection::installed_selection()` or legacy service `ExecStart`
 text read-only, without evaluating it or migrating configuration just to inspect.
 
 Manual setup and existing-profile selection default to **SAVE ONLY**.
-Supported USB selection defaults to **install/select with `--no-start`**, but this
-is only a proposed action: `SAVE` and then `INSTALL` must both be typed explicitly.
-Supported drafts use a unique local filename automatically. For manual setup,
+Supported USB selection defaults to **install and restart**, but this
+is only a proposed action: each `[y/N]` confirmation defaults to no, so only an
+explicit `y` proceeds. Supported drafts use a unique local filename
+automatically. For manual setup,
 the default new path is
 `<project-root>/profiles/onboard-local.toml`. Parents must exist. Drafts are
 validated with `Profile` and written using `create_new`; existing files and
 symlinks are never overwritten. Choose another path instead. Existing profile
-selection leaves its source unchanged. Type `SAVE` to commit the choice.
+selection leaves its source unchanged. Answer `y` to commit the choice.
 Cancellation/EOF before this point writes nothing and invokes no installer.
 
 Optional install choices call the existing `scripts/install.sh` using Rust
@@ -116,11 +117,11 @@ destinations, not safe staging directories. A valid staging destination is shown
 as having no service effects. Known template placeholders cannot be installed.
 
 Install/select without immediate start passes `--no-start`. **This enables the
-service for future boots**; it does not stop an already-running daemon. Type
-`INSTALL` after the final summary to proceed. Install+restart instead requires
-typing `RESTART`, opens hardware, can interrupt audio and stop/restore user
-PipeWire, and enables future boots. Cancelling either leaves the saved draft.
-No installer is invoked without explicit final confirmation.
+service for future boots**; it does not stop an already-running daemon. Answer
+`y` after the final summary to proceed. Install+restart opens hardware, can
+interrupt audio and stop/restore user PipeWire, and enables future boots.
+Cancelling either leaves the saved draft.
+No installer is invoked without an explicit `y` confirmation.
 
 ## Offline Tests
 

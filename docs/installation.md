@@ -14,7 +14,8 @@ installer flags retain noninteractive behavior and should be used for automation
 `scripts/install.sh --interactive` or `scripts/setup.sh` to request the menus
 explicitly. Supported USB selection binds the matching vendor profile to the
 actual card's DEV0 in both directions, preserving routing and timing, and proposes
-install `--no-start`; explicit `SAVE` then `INSTALL` are still required. Manual
+install and restart; each `[y/N]` confirmation defaults to no, so only an
+explicit `y` proceeds. Manual
 setup defaults to save only. See
 [onboard setup](onboard-setup.md) and [ASIO setup](asio-setup.md).
 
@@ -208,7 +209,7 @@ Proton prefix with `scripts/install-asio.sh --no-build --wine-prefix PATH` (or
 the corresponding Steam-prefix options).
 `scripts/install-asio.sh` with no arguments always dispatches to its wizard,
 even with redirected input. EOF cancels safely without installation or Wine;
-only explicit `INSTALL` confirmation authorizes the wizard's final command.
+only an explicit `y` at the `[y/N]` prompt authorizes the wizard's final command.
 
 Remove files owned by the installer:
 
