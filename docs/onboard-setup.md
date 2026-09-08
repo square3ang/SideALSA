@@ -91,10 +91,12 @@ text read-only, without evaluating it or migrating configuration just to inspect
 Manual setup and existing-profile selection default to **SAVE ONLY**.
 Supported USB selection defaults to **install and restart**, but this
 is only a proposed action: each `[y/N]` confirmation defaults to no, so only an
-explicit `y` proceeds. Supported drafts use a unique local filename
-automatically. For manual setup,
-the default new path is
-`<project-root>/profiles/onboard-local.toml`. Parents must exist. Drafts are
+explicit `y` proceeds. Supported auto-selection reuses one stable staging file
+per card under `<project-root>/profiles/local/` (for example
+`topping-e1x2-card3-local.toml`), replacing it on every run instead of creating
+numbered copies. The installer then installs that same basename into
+`/etc/sidealsa/profiles/`, replacing it as well. Manual onboard drafts default
+to `<project-root>/profiles/local/onboard-local.toml`. Parents must exist. Drafts are
 validated with `Profile` and written using `create_new`; existing files and
 symlinks are never overwritten. Choose another path instead. Existing profile
 selection leaves its source unchanged. Answer `y` to commit the choice.

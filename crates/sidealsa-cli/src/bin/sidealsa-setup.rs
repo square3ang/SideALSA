@@ -12,6 +12,11 @@ use toml_edit::{Array, DocumentMut, value};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const TEMPLATE: &str = include_str!("../../../../profiles/generic-onboard-analog.toml");
+/// Staging area for generated drafts, relative to the checkout root. One
+/// constant so the generator, the replace guard, the profile scan, and the
+/// tests cannot drift apart. The installer derives the `/etc` filename from
+/// the staging basename, so this name is part of the deployed contract.
+const STAGING_DIR: &str = "profiles/local";
 const RULE: &str = "──────────────────────────────────────────────────────────────";
 
 /// ANSI styling is terminal-only: unit tests capture a pipe, and
@@ -127,19 +132,15 @@ fn bind_vendor(text: &str, selector: &str) -> Result<String> {
     Ok(text)
 }
 
-fn local_path(root: &Path, profile: &str, card: i32) -> Result<PathBuf> {
-    for n in 0..u32::MAX {
-        let path = root.join("profiles").join(format!(
-            "{}-card{card}-local-{n}.toml",
-            profile.trim_end_matches(".toml")
-        ));
-        match fs::symlink_metadata(&path) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(path),
-            Err(e) => return Err(e.into()),
-            Ok(_) => {}
-        }
-    }
-    Err("no unused local profile path".into())
+/// Stable staging name: one file per card, replaced on every run. Repeated
+/// installs therefore reuse the same `/etc` file instead of piling up
+/// numbered copies. The name keeps the card so two identical devices stay
+/// separate. Only files under `profiles/local/` may use replace semantics.
+fn local_path(root: &Path, profile: &str, card: i32) -> PathBuf {
+    root.join(STAGING_DIR).join(format!(
+        "{}-card{card}-local.toml",
+        profile.trim_end_matches(".toml")
+    ))
 }
 
 fn discover() -> Vec<Entry> {
@@ -378,6 +379,9 @@ struct Draft {
     text: String,
     create: bool,
     action: usize,
+    /// Only our `profiles/local/` staging files may be replaced. Anything the
+    /// user typed keeps never-overwrite protection.
+    replace: bool,
 }
 
 fn plan(
@@ -433,14 +437,14 @@ fn plan(
         if supported.len() > 1 { 0 } else { 1 },
     )?;
     let is_supported = choice <= supported.len();
-    let (path, text, create) = if is_supported {
+    let (path, text, create, replace) = if is_supported {
         let entry = supported[choice - 1];
         let (profile, _) = vendor_profile(entry.usb).unwrap();
         let text = bind_vendor(
             &fs::read_to_string(root.join("profiles").join(profile))?,
             &entry.selector,
         )?;
-        let path = local_path(root, profile, entry.card)?;
+        let path = local_path(root, profile, entry.card);
         writeln!(
             out,
             "\nAuto-selected {} for {}.",
@@ -452,17 +456,17 @@ fn plan(
             out,
             "{}",
             dim(
-                "Vendor routing, channel counts, and timing are preserved; only the card address is bound. No channel or path questions follow."
+                "Vendor routing, channel counts, and timing are preserved; only the card address is bound. No channel or path questions follow. The same staging file is reused on every run."
             )
         )?;
-        (path, text, true)
+        (path, text, true, true)
     } else if choice == supported.len() + 1 {
         let playback = selector(input, out, entries, Direction::Playback)?;
         let capture = selector(input, out, entries, Direction::Capture)?;
         let pc = channels(input, out, "playback")?;
         let cc = channels(input, out, "capture")?;
         let text = generate(&playback, &capture, pc, cc)?;
-        let default = root.join("profiles/onboard-local.toml");
+        let default = root.join(STAGING_DIR).join("onboard-local.toml");
         let path = loop {
             let s = ask(
                 input,
@@ -485,7 +489,7 @@ fn plan(
                 break path;
             }
         };
-        (path, text, true)
+        (path, text, true, false)
     } else {
         if existing.is_empty() {
             writeln!(out, "No readable valid profiles found.")?;
@@ -505,7 +509,7 @@ fn plan(
         )? - 1;
         let path = existing[i].0.clone();
         let text = fs::read_to_string(&path)?;
-        (path, text, false)
+        (path, text, false, false)
     };
     summary(out, &path, &text)?;
     let action = menu(input, out, "Step 2 — Final action", &[
@@ -559,6 +563,7 @@ fn plan(
         text,
         create,
         action,
+        replace,
     })
 }
 
@@ -648,6 +653,29 @@ fn summary(out: &mut impl Write, path: &Path, text: &str) -> Result<()> {
 fn save_new(path: &Path, text: &str) -> Result<()> {
     Profile::from_toml(text)?;
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Replace-write for our own `profiles/local/` staging files only. The path
+/// must stay inside the staging directory so user files and shipped profiles
+/// keep never-overwrite protection.
+fn save_replace(root: &Path, path: &Path, text: &str) -> Result<()> {
+    Profile::from_toml(text)?;
+    let staging = root.join(STAGING_DIR);
+    let canonical = path
+        .parent()
+        .ok_or("staging file needs a parent directory")?
+        .canonicalize()?;
+    if canonical != staging.canonicalize()? {
+        return Err("replace is only allowed inside profiles/local".into());
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
     file.write_all(text.as_bytes())?;
     file.sync_all()?;
     Ok(())
@@ -860,6 +888,7 @@ fn run() -> Result<()> {
     let mut existing = Vec::new();
     let mut directories = vec![
         root.join("profiles"),
+        root.join(STAGING_DIR),
         PathBuf::from("/etc/sidealsa/profiles"),
     ];
     println!("{}", bold("SideALSA setup"));
@@ -907,7 +936,11 @@ fn run() -> Result<()> {
         match plan(&mut input, &mut out, &root, &entries, &existing) {
             Ok(draft) => {
                 if draft.create {
-                    save_new(&draft.path, &draft.text)?;
+                    if draft.replace {
+                        save_replace(&root, &draft.path, &draft.text)?;
+                    } else {
+                        save_new(&draft.path, &draft.text)?;
+                    }
                     existing.push((
                         draft.path.clone(),
                         Profile::from_toml(&draft.text)?.device.name,
@@ -1048,7 +1081,11 @@ mod tests {
         let draft = plan(&mut Cursor::new("\n\ny\n"), &mut out, &root, &entries, &[]).unwrap();
         assert_eq!(draft.action, 3);
         assert!(draft.create);
-        assert!(!draft.path.exists());
+        assert!(draft.replace);
+        assert_eq!(
+            draft.path,
+            root.join("profiles/local/topping-e1x2-card1-local.toml")
+        );
         let output = String::from_utf8(out).unwrap();
         assert!(!output.contains("Confirm proposed"));
         assert!(!output.contains("New draft path"));
@@ -1106,18 +1143,30 @@ mod tests {
     }
 
     #[test]
-    fn automatic_path_skips_files_and_dangling_symlinks() {
+    fn staging_path_is_stable_per_card_and_replace_stays_inside_staging() {
         let root = std::env::temp_dir().join(format!("sidealsa-path-{}", std::process::id()));
         fs::create_dir(&root).unwrap();
         fs::create_dir(root.join("profiles")).unwrap();
-        let first = local_path(&root, "topping-e1x2.toml", 2).unwrap();
-        fs::write(&first, "untouched").unwrap();
-        let second = local_path(&root, "topping-e1x2.toml", 2).unwrap();
-        std::os::unix::fs::symlink("missing", &second).unwrap();
-        let third = local_path(&root, "topping-e1x2.toml", 2).unwrap();
-        assert_ne!(first, third);
-        assert_ne!(second, third);
-        assert_eq!(fs::read_to_string(first).unwrap(), "untouched");
+        fs::create_dir(root.join("profiles/local")).unwrap();
+        // Same card always maps to the same file: no numbered pile-up.
+        let first = local_path(&root, "topping-e1x2.toml", 2);
+        let second = local_path(&root, "topping-e1x2.toml", 2);
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            root.join("profiles/local/topping-e1x2-card2-local.toml")
+        );
+        assert_ne!(first, local_path(&root, "topping-e1x2.toml", 3));
+        // Replace overwrites our own staging file, including over symlinks.
+        let text = generate("hw:A,0", "hw:B,0", 2, 2).unwrap();
+        std::os::unix::fs::symlink("missing", &first).unwrap();
+        save_replace(&root, &first, &text).unwrap();
+        assert_eq!(fs::read_to_string(&first).unwrap(), text);
+        // Replace refuses to touch anything outside profiles/local.
+        let outside = root.join("profiles/topping-e1x2.toml");
+        fs::write(&outside, &text).unwrap();
+        assert!(save_replace(&root, &outside, &text).is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), text);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1354,6 +1403,7 @@ mod tests {
             text: generate("hw:Playback,0", "hw:Capture,0", 2, 2).unwrap(),
             create: false,
             action: 2,
+            replace: false,
         };
         for input in ["", "c\n", "1\n", "1\n1\n", "1\n1\nwrong\n", "1\n2\nc\n"] {
             let error = install(
@@ -1374,6 +1424,7 @@ mod tests {
             text: TEMPLATE.into(),
             create: false,
             action: 2,
+            replace: false,
         };
         let error = install(
             &mut Cursor::new("1\n1\ny\n"),
