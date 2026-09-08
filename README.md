@@ -5,23 +5,44 @@
 SideALSA is an experimental professional-audio layer for Linux. One daemon owns the physical ALSA device and provides separate paths for DAWs and Wine ASIO, and for PipeWire desktop audio.
 Its core goal is to keep the hardware streaming even when a client runs late or exits.
 
+> [!WARNING]
 > **Experimental software.** The Topping E1x2 OTG is the tested reference device.
 > Small buffers and zero XRUNs do not guarantee fixed analog round-trip latency.
 > Validate your own device and setup before using it for important work.
 
 [Quick Start](#quick-start) · [Wine / Steam ASIO](#wine--steam-asio) · [Everyday Use](#everyday-use) · [Updates and Removal](#updates-and-removal) · [Technical Documentation](#technical-documentation)
 
-```text
-                   USB audio interface (ALSA hw:X,Y)
-                                  |
-                              sidealsad
-                             /         \
-                   PRO (exclusive)      SHARED (separate buffers)
-                   /       \                    |
-            Native / ALSA  Wine ASIO        ALSA ioplug
-                                                |
-                                            PipeWire
-                                        Browser / calls / music
+```mermaid
+flowchart TB
+    hardware["Audio interface<br/>Physical ALSA device"]
+    daemon["sidealsad<br/>Hardware clock and RT engine"]
+    hardware <--> daemon
+
+    subgraph proDomain["PRO · Exclusive access"]
+        pro["Full physical channel set"]
+        native["Native / ALSA clients"]
+        asio["Wine / Proton ASIO"]
+        pro <--> native
+        pro <--> asio
+    end
+
+    subgraph sharedDomain["SHARED · Independent buffering"]
+        shared["Logical ports<br/>ALSA ioplug"]
+        pipewire["PipeWire"]
+        desktop["Browser / calls / music"]
+        shared <--> pipewire
+        pipewire <--> desktop
+    end
+
+    daemon <--> pro
+    daemon <--> shared
+
+    classDef engine fill:#172554,stroke:#60a5fa,color:#eff6ff
+    classDef proPath fill:#134e4a,stroke:#2dd4bf,color:#f0fdfa
+    classDef sharedPath fill:#312e81,stroke:#a5b4fc,color:#eef2ff
+    class daemon engine
+    class pro,native,asio proPath
+    class shared,pipewire,desktop sharedPath
 ```
 
 PRO exposes all physical channels; SHARED exposes logical ports defined by the device profile.
@@ -47,8 +68,9 @@ The terminal menu includes both GUI and ASIO by default. You can deselect either
 
 ### 2. Run the Installer
 
-**Run as your normal desktop user, not with `sudo`.**
-Builds run as your user. The installer requests `sudo` only for protected paths and service operations.
+> [!IMPORTANT]
+> **Run as your normal desktop user, not with `sudo`.**
+> Builds run as your user. The installer requests `sudo` only for protected paths and service operations.
 
 ```bash
 git clone https://github.com/square3ang/SideALSA.git
@@ -78,9 +100,10 @@ SideALSA does not aggregate independent devices, so use playback and capture sha
 2. Type `SAVE` to confirm your choices and save a new draft.
 3. If you chose installation, review the components and final command, then type `INSTALL`.
 
-**Supported USB devices default to installation with `--no-start`.** This does not start or restart the daemon now,
-but **does enable automatic service startup on future boots**. It does not stop an already running daemon.
-Manual setup and existing-profile selection default to **save only**; choose an installation action separately.
+> [!NOTE]
+> **Supported USB devices default to installation with `--no-start`.** This does not start or restart the daemon now,
+> but **does enable automatic service startup on future boots**. It does not stop an already running daemon.
+> Manual setup and existing-profile selection default to **save only**; choose an installation action separately.
 
 To apply changes immediately, choose install and restart in the menu, then confirm with **`RESTART`**. This opens the hardware and may interrupt current audio.
 After a first installation with `--no-start`, you can start the daemon later if it is not running:
@@ -109,7 +132,10 @@ bash scripts/install-asio.sh
 
 For Steam games only, press Enter to skip the manual step. For regular Wine only, skip Steam selection.
 
-Only existing prefixes can be selected. **Launch each Steam game with Proton once** to create its prefix, then close it. Games whose names cannot be found appear as `Unknown Steam game`.
+> [!TIP]
+> **Launch each Steam game with Proton once, then close it before setup.** Only existing prefixes can be selected.
+> Games whose names cannot be found appear as `Unknown Steam game`.
+
 Entering multiple numbers or `all` only selects prefixes; nothing is built, installed, or registered before the final `INSTALL` confirmation.
 Registration can start Wine processes and modify the selected prefixes.
 
@@ -176,6 +202,7 @@ Check SideALSA counters alongside PipeWire graph XRUNs, not just the latter.
 Existing installed profiles are preserved by default. Use `--profile PATH --replace-profile` to replace one explicitly.
 Terminal-menu installation uses this replacement option to apply your selected profile, so check the final path.
 
+> [!CAUTION]
 > **Component selection is not additive.** Omitting `--with-asio` on a later main installation
 > removes installer-managed system ASIO files. `--no-gui` removes the GUI and helper;
 > `--no-pipewire` removes managed PipeWire configuration. Select the options you want to keep every time.
