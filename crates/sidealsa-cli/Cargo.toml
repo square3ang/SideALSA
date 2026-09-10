@@ -26,9 +26,14 @@ alsa = "0.11"
 sidealsa-config = { path = "../sidealsa-config" }
 toml_edit = "0.23"
 libc = "0.2"
+serde_json = "1"
 sidealsa-client = { path = "../sidealsa-client" }
 sidealsa-protocol = { path = "../sidealsa-protocol" }
 
 [[bin]]
 name = "sidealsa-setup"
 path = "src/bin/sidealsa-setup.rs"
+
+[[bin]]
+name = "sidealsa-reconnect"
+path = "src/bin/sidealsa-reconnect.rs"

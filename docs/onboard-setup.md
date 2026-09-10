@@ -121,7 +121,7 @@ as having no service effects. Known template placeholders cannot be installed.
 Install/select without immediate start passes `--no-start`. **This enables the
 service for future boots**; it does not stop an already-running daemon. Answer
 `y` after the final summary to proceed. Install+restart opens hardware, can
-interrupt audio and stop/restore user PipeWire, and enables future boots.
+interrupt SideALSA audio and enables future boots. PipeWire services remain running.
 Cancelling either leaves the saved draft.
 No installer is invoked without an explicit `y` confirmation.
 

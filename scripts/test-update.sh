@@ -18,7 +18,7 @@ cp "$ROOT/scripts/install.sh" "$ROOT/scripts/update.sh" "$CHECKOUT/scripts/"
 cp "$ROOT/assets/sidealsa-icon.png" "$CHECKOUT/assets/"
 cp -a "$ROOT/packaging" "$ROOT/configs" "$ROOT/profiles" "$ROOT/docs" "$ROOT/LICENSE" "$CHECKOUT/"
 cp "$GENERATOR" "$CHECKOUT/target/release/"
-for binary in sidealsa-setup sidealsad sidealsa-hw-test sidealsa-pro-test sidealsa-loopback-test \
+for binary in sidealsa-setup sidealsa-reconnect sidealsad sidealsa-hw-test sidealsa-pro-test sidealsa-loopback-test \
     sidealsa-stats sidealsa-pro-client-test sidealsa-shared-test sidealsa-admin; do
     printf '#!/usr/bin/env bash\n# MOCK artifact, never executed by these tests.\nexit 97\n' > "$CHECKOUT/target/release/$binary"
     chmod +x "$CHECKOUT/target/release/$binary"

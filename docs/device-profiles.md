@@ -192,3 +192,23 @@ spa-json-dump target/generated-example/pipewire.conf
 ```
 
 These parse configuration only and do not open audio devices.
+## Timing Policy
+
+Timing headroom is user-controlled. Profile validation no longer rejects a
+zero-lead configuration because it has fewer than three logical periods of
+hardware capacity, predicts insufficient handoff reserve, or selects a
+one-period playback startup queue. A zero handoff budget is also accepted.
+For example, Q128/P128 with B256 and zero PRO lead passes profile validation.
+ALSA still validates the actual requested hardware parameters at open time;
+acceptance by the parser is not a hardware stability measurement.
+
+The startup queue preference is capped to physical buffer capacity. Q192/P192/B192
+and Q256/P256/B256 are accepted even if `playback_queue_periods = 2` remains
+selected; the actual startup queue fits one period. Shared-ring alignment still
+uses the selected logical period (for example, 384 shared frames for Q192).
+
+Structural checks remain: nonzero rate/period/buffer, a full transfer fitting
+in the buffer, supported period alignment, fixed shared-ring
+limits, valid channel mappings, supported mode combinations, and OS priority
+ranges. The engine's availability-based deadline limiting still runs; removing
+the conservative preflight policy does not make the RT thread wait indefinitely.

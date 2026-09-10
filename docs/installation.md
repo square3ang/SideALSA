@@ -205,18 +205,39 @@ authenticates with polkit, validates and atomically replaces the root-owned
 profile, restarts the fixed system service, and verifies the new root-owned
 socket peer against systemd's `MainPID` and the complete loaded profile
 fingerprint. On failure it restores the original profile, verifies the rollback
-restart, and keeps pending GUI values available for correction. After a
-successful restart or a reported failure that may have restarted the daemon,
-including rollback, the control panel restarts active user PipeWire services so
-static adapters reopen against the current daemon. Direct PRO and SHARED clients
-still need to reconnect. A warning with the manual `systemctl --user restart`
-command is shown if the user-service restart fails or times out; an otherwise
-verified daemon change remains applied.
+restart, and keeps pending GUI values available for correction. Neither successful
+Apply nor rollback restarts PipeWire, pipewire-pulse, or WirePlumber. A verified
+daemon change is reported separately from client reconnection.
 
-Unless `--preserve-pipewire` is used, the installer also stops active user audio
-before restarting `sidealsad` and waits for the new socket before restoring
-those services. This prevents static PipeWire adapters from opening before the
-daemon is ready. Preserve mode leaves those user services running.
+The installer (including update.sh) leaves PipeWire, Pulse and WirePlumber running.
+It installs the `sidealsa-reconnect` user service with PipeWire integration and
+enables it for the invoking desktop user unless `--no-start` is selected. This
+worker automatically refreshes SHARED links after daemon restarts without
+restarting apps. See [automatic recovery](pipewire-reconnect.md) for details.
+New integration files still require a manual reload or a later PipeWire restart.
+
+### Daemon-only restart observation without the recovery worker (2026-09-11)
+
+On the reference desktop, a live test kept a low-level Line 1 tone and Input
+5/6 digital-return recording open while running only
+`sudo systemctl restart sidealsad.service`. Daemon PID changed from 792 to
+180832; PipeWire (1053), pipewire-pulse (1303) and WirePlumber (1055) kept their
+PIDs throughout. No PipeWire service operation was performed.
+
+The already-open recorder stopped receiving data at 145,408 frames (about
+3.03 seconds), even after waiting 15 seconds after restart. Both test processes
+remained alive and the graph still reported the nodes as running: those states
+alone do not demonstrate audio recovery. After closing the old clients and
+opening fresh playback **and** capture streams, a five-second check recorded
+238,592 frames with the expected 0.005-peak returned tone. Thus reopening the
+affected streams recovered this setup without restarting PipeWire, but existing
+active streams did not reconnect automatically in this test.
+
+Logs, graph snapshots, PID snapshots and recordings are in
+`/tmp/opencode/daemon-reconnect-egq0lms6/`; the host-specific runner is
+`/tmp/opencode/daemon_reconnect_probe.py`. This tested the daemon-only restart
+operation against the installed binaries, not a deployed build of the changed
+GUI. It did not test changing PCM geometry, sample rate, or protocol version.
 
 Install Wine ASIO binaries when CMake, `winegcc`, and `winebuild` are available:
 

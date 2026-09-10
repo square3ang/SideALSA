@@ -27,8 +27,6 @@ NO_START=0
 INSTALL_PIPEWIRE=1
 PRESERVE_PIPEWIRE=0
 INSTALL_GUI=1
-USER_AUDIO_WAS_STOPPED=0
-USER_AUDIO_UNITS=()
 DAEMON_RESTART_PENDING=0
 DAEMON_WAS_ENABLED=0
 TMP_DIR=
@@ -78,41 +76,6 @@ wait_for_socket() {
     die "sidealsad socket did not appear: $SOCKET_PATH"
 }
 
-stop_user_audio() {
-    if [[ -n "$DESTDIR" || "$EUID" -eq 0 || "$NO_START" -eq 1 \
-        || "$INSTALL_PIPEWIRE" -eq 0 || "$PRESERVE_PIPEWIRE" -eq 1 ]]; then
-        return
-    fi
-    command -v systemctl >/dev/null 2>&1 || return
-    local unit
-    local units=(
-        pipewire-pulse.socket pipewire.socket pipewire-pulse.service
-        wireplumber.service pipewire.service
-    )
-    USER_AUDIO_UNITS=()
-    for unit in "${units[@]}"; do
-        if systemctl --user is-active --quiet "$unit"; then
-            USER_AUDIO_UNITS+=("$unit")
-        fi
-    done
-    if ((${#USER_AUDIO_UNITS[@]} == 0)); then
-        return
-    fi
-    info "stopping user PipeWire session before replacing SideALSA daemon"
-    USER_AUDIO_WAS_STOPPED=1
-    systemctl --user stop "${USER_AUDIO_UNITS[@]}"
-}
-
-restore_user_audio() {
-    if ((USER_AUDIO_WAS_STOPPED == 0)); then
-        return
-    fi
-    systemctl --user reset-failed "${USER_AUDIO_UNITS[@]}" || true
-    systemctl --user start "${USER_AUDIO_UNITS[@]}"
-    USER_AUDIO_WAS_STOPPED=0
-    USER_AUDIO_UNITS=()
-}
-
 cleanup() {
     local status=$?
     trap - EXIT
@@ -125,7 +88,6 @@ cleanup() {
             run_privileged systemctl disable sidealsad.service || true
         fi
     fi
-    restore_user_audio || true
     exit "$status"
 }
 
@@ -332,6 +294,7 @@ fi
 
 BINARIES=(
     sidealsa-setup
+    sidealsa-reconnect
     sidealsa-config-gen
     sidealsad
     sidealsa-hw-test
@@ -466,6 +429,7 @@ GUI_PATH="$PREFIX/bin/sidealsa-control"
 ADMIN_PATH=/usr/libexec/sidealsa-admin
 DESKTOP_PATH="$PREFIX/share/applications/org.sidealsa.Control.desktop"
 ICON_PATH="$PREFIX/share/icons/hicolor/512x512/apps/org.sidealsa.Control.png"
+RECONNECT_UNIT="$PREFIX/lib/systemd/user/sidealsa-reconnect.service"
 POLKIT_PATH=/usr/share/polkit-1/actions/org.sidealsa.configure.policy
 RETIRED_MANAGED_PATHS=()
 if ((INSTALL_PIPEWIRE == 0)); then
@@ -474,6 +438,7 @@ if ((INSTALL_PIPEWIRE == 0)); then
         "$PIPEWIRE_PULSE_CONFIG_PATH"
         "$WIREPLUMBER_CONFIG_PATH"
         "$INTEGRATION_PROFILE_PATH"
+        "$RECONNECT_UNIT"
     )
 fi
 if ((WITH_ASIO == 0)); then
@@ -508,6 +473,7 @@ MANAGED_PATHS+=(
 )
 if ((INSTALL_PIPEWIRE == 1)); then
     MANAGED_PATHS+=(
+        "$RECONNECT_UNIT"
         "$INTEGRATION_PROFILE_PATH"
         "$PIPEWIRE_CONFIG_PATH"
         "$PIPEWIRE_PULSE_CONFIG_PATH"
@@ -643,6 +609,11 @@ if ((INSTALL_PIPEWIRE == 1 && PRESERVE_PIPEWIRE == 0)); then
 fi
 
 # No installed files are changed until selection, validation and rendering succeed.
+if ((INSTALL_PIPEWIRE == 1)); then
+    sed -e "s|@PREFIX@|$(sed_escape "$PREFIX")|g" \
+        -e "s|@SOCKET@|$(sed_escape "$SOCKET_PATH")|g" \
+        "$ROOT/packaging/sidealsa-reconnect.service.in" > "$TMP_DIR/reconnect.service"
+fi
 for path in "${RETIRED_MANAGED_PATHS[@]}"; do
     actual="$(destination "$path")"
     [[ -e "$actual" && -n "${OLD_HASHES[$path]+owned}" ]] || continue
@@ -672,6 +643,9 @@ fi
 run_privileged install -D -m 0644 "$TMP_DIR/alsa.managed" "$(destination "$ALSA_CONFIG_PATH")"
 run_privileged install -D -m 0644 "$TMP_DIR/active.managed" "$(destination "$SELECTION_PATH")"
 run_privileged install -D -m 0644 "$service_temp" "$(destination "$SERVICE_PATH")"
+if ((INSTALL_PIPEWIRE == 1)); then
+    run_privileged install -D -m 0644 "$TMP_DIR/reconnect.service" "$(destination "$RECONNECT_UNIT")"
+fi
 
 if ((INSTALL_PIPEWIRE == 1 && PRESERVE_PIPEWIRE == 0)); then
     run_privileged install -D -m 0644 "$TMP_DIR/profile.toml" "$(destination "$INTEGRATION_PROFILE_PATH")"
@@ -707,7 +681,6 @@ run_privileged install -D -m 0644 "$manifest_temp" "$(destination "$MANIFEST_PAT
 
 if [[ -z "$DESTDIR" ]]; then
     if command -v systemctl >/dev/null 2>&1; then
-        stop_user_audio
         run_privileged systemctl daemon-reload
         if ((NO_START == 1)); then
             run_privileged systemctl enable sidealsad.service
@@ -720,15 +693,28 @@ if [[ -z "$DESTDIR" ]]; then
             wait_for_socket
             run_privileged systemctl enable sidealsad.service
             DAEMON_RESTART_PENDING=0
-            restore_user_audio
         fi
     else
         warn "systemctl not found; start sidealsad.service manually"
     fi
     if ((INSTALL_PIPEWIRE == 1 && PRESERVE_PIPEWIRE == 0)); then
-        info "start/restart user PipeWire session and PulseAudio compatibility:"
+        info "PipeWire services were left running. To load new integration files, run manually if needed:"
         info "  systemctl --user enable --now pipewire.socket pipewire-pulse.socket"
         info "  systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service"
+    fi
+    # Manage only our recovery worker, never restart desktop audio services.
+    if ((EUID != 0 && NO_START == 0)) && command -v systemctl >/dev/null 2>&1 \
+        && systemctl --user show-environment >/dev/null 2>&1; then
+        systemctl --user daemon-reload
+        if ((INSTALL_PIPEWIRE == 1)); then
+            systemctl --user enable "$RECONNECT_UNIT"
+            systemctl --user restart sidealsa-reconnect.service
+        else
+            systemctl --user disable --now sidealsa-reconnect.service 2>/dev/null || true
+        fi
+    elif ((INSTALL_PIPEWIRE == 1)); then
+        info "Enable automatic link recovery in your desktop session:"
+        info "  systemctl --user enable --now $RECONNECT_UNIT"
     fi
 fi
 

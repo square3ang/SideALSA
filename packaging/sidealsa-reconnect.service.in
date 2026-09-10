@@ -1,0 +1,13 @@
+# Managed by SideALSA installer.
+[Unit]
+Description=Reconnect SideALSA PipeWire links after daemon restarts
+After=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=@PREFIX@/bin/sidealsa-reconnect --socket @SOCKET@ --initial-refresh
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

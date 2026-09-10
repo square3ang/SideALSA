@@ -528,25 +528,12 @@ impl HardwareConfig {
                 )));
             }
         }
-        if let Some(periods) = self.playback_queue_periods {
-            if periods == 0 {
-                return Err(ProfileError::Invalid(
-                    "playback_queue_periods must be non-zero".into(),
-                ));
-            }
-            if self.uses_event_driven_linked_pro() && periods < DIRECT_MIN_PLAYBACK_QUEUE_PERIODS {
-                return Err(ProfileError::Invalid(format!(
-                    "direct whole-period PRO requires playback_queue_periods >= {DIRECT_MIN_PLAYBACK_QUEUE_PERIODS}"
-                )));
-            }
-            let queue_frames = self.period_size.checked_mul(periods).ok_or_else(|| {
-                ProfileError::Invalid("playback_queue_periods is too large".into())
-            })?;
-            if queue_frames > self.buffer_size {
-                return Err(ProfileError::Invalid(
-                    "playback_queue_periods must fit within buffer_size".into(),
-                ));
-            }
+        // The requested queue is capped to physical capacity by the engine.
+        // Reducing B must not require a separate edit of this tuning hint.
+        if self.playback_queue_periods == Some(0) {
+            return Err(ProfileError::Invalid(
+                "playback_queue_periods must be non-zero".into(),
+            ));
         }
         if let Some(guard_frames) = self.linked_playback_guard_frames {
             if self.uses_event_driven_linked_pro() {
@@ -602,68 +589,13 @@ impl HardwareConfig {
                 "pro_latency_periods must be <= {MAX_PRO_LATENCY_PERIODS}"
             )));
         }
-        if self.pro_handoff_us == 0 {
+        // Buffer headroom and handoff budgets are tuning choices, not profile
+        // validity. ALSA checks the actual device geometry at open, while the
+        // direct engine bounds its wait using observed playback availability.
+        if self.pro_latency_periods == 0 && !self.effective_duplex_link() {
             return Err(ProfileError::Invalid(
-                "pro_handoff_us must be non-zero".into(),
+                "pro_latency_periods = 0 requires duplex_link = true".into(),
             ));
-        }
-        let handoff_frames = self
-            .pro_handoff_nanos()
-            .saturating_mul(u64::from(self.rate))
-            .div_ceil(1_000_000_000);
-        if self.effective_duplex_link() && self.pro_latency_periods <= 1 {
-            let available_handoff_nanos = if self.uses_event_driven_linked_pro() {
-                let queue_periods = self
-                    .playback_queue_periods
-                    .unwrap_or(DIRECT_MIN_PLAYBACK_QUEUE_PERIODS);
-                let queued_after_wake = u64::from(self.period_size)
-                    .saturating_mul(u64::from(queue_periods.saturating_sub(1)));
-                let reserve_frames =
-                    u64::from(self.period_size).div_ceil(u64::from(DIRECT_WRITE_RESERVE_DIVISOR));
-                queued_after_wake
-                    .saturating_sub(reserve_frames)
-                    .saturating_mul(1_000_000_000)
-                    / u64::from(self.rate)
-            } else {
-                let hardware_period_nanos = u64::from(hardware_period_size)
-                    .saturating_mul(1_000_000_000)
-                    / u64::from(self.rate);
-                hardware_period_nanos.saturating_sub(
-                    hardware_period_nanos / u64::from(LINKED_PHASE_OVERHEAD_DIVISOR),
-                )
-            };
-            if self.pro_handoff_nanos() > available_handoff_nanos {
-                return Err(ProfileError::Invalid(
-                    "pro_handoff_us leaves no physical-period write reserve".into(),
-                ));
-            }
-        }
-        if self.pro_latency_periods == 0 {
-            if !self.effective_duplex_link() {
-                return Err(ProfileError::Invalid(
-                    "pro_latency_periods = 0 requires duplex_link = true".into(),
-                ));
-            }
-            if self.buffer_size < self.period_size.saturating_mul(2) {
-                return Err(ProfileError::Invalid(
-                    "pro_latency_periods = 0 requires at least two logical periods".into(),
-                ));
-            }
-            let required_buffer = if self.uses_event_driven_linked_pro() {
-                u64::from(self.period_size).saturating_mul(3)
-            } else {
-                let safety_frames = handoff_frames
-                    .div_ceil(u64::from(hardware_period_size))
-                    .saturating_mul(u64::from(hardware_period_size));
-                u64::from(self.period_size)
-                    .saturating_add(u64::from(hardware_period_size))
-                    .saturating_add(safety_frames)
-            };
-            if u64::from(self.buffer_size) < required_buffer {
-                return Err(ProfileError::Invalid(format!(
-                    "pro_latency_periods = 0 requires buffer_size >= {required_buffer}"
-                )));
-            }
         }
         if self.linked_phase_max_attempts > MAX_LINKED_PHASE_ATTEMPTS {
             return Err(ProfileError::Invalid(format!(
@@ -992,7 +924,7 @@ mod tests {
         assert_eq!(profile.device.linked_phase_max_attempts, 0);
         assert_eq!(profile.device.effective_shared_buffer_size(), 512);
         assert_eq!(profile.device.shared_latency_periods, 5);
-        assert!(profile.device.shared_playback_repeat_on_underrun);
+        assert!(!profile.device.shared_playback_repeat_on_underrun);
         assert_eq!(profile.device.startup_loopback, None);
     }
 
@@ -1107,17 +1039,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_pro_handoff() {
+    fn accepts_zero_pro_handoff() {
         let text = PROFILE.replace(
             "pro_latency_periods = 1",
             "pro_latency_periods = 1\n        pro_handoff_us = 0",
         );
 
-        let error = Profile::from_toml(&text).expect_err("profile should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("pro_handoff_us must be non-zero")
+        assert_eq!(
+            Profile::from_toml(&text)
+                .unwrap()
+                .device
+                .pro_handoff_nanos(),
+            0
         );
     }
 
@@ -1263,37 +1196,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_shallow_playback_queue_in_direct_whole_period_mode() {
+    fn accepts_shallow_playback_queue_in_direct_whole_period_mode() {
         let text = E1X2_PROFILE.replace("playback_queue_periods = 2", "playback_queue_periods = 1");
 
-        let error = Profile::from_toml(&text).expect_err("profile should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("requires playback_queue_periods >= 2")
-        );
+        let profile = Profile::from_toml(&text).unwrap();
+        assert_eq!(profile.device.playback_queue_periods, Some(1));
     }
 
     #[test]
-    fn direct_whole_period_mode_requires_three_periods_of_capacity() {
+    fn direct_whole_period_mode_allows_two_periods_of_capacity() {
         let text = E1X2_PROFILE.replace(
             "buffer_size = 256\nplayback_queue_periods = 2",
             "buffer_size = 128",
         );
 
-        let error = Profile::from_toml(&text).expect_err("profile should fail");
-        assert!(error.to_string().contains("requires buffer_size >= 192"));
+        let profile = Profile::from_toml(&text).unwrap();
+        assert_eq!(profile.device.buffer_size, 128);
     }
 
     #[test]
-    fn direct_whole_period_handoff_keeps_write_reserve() {
+    fn direct_whole_period_handoff_is_a_user_selected_budget() {
         let text = E1X2_PROFILE.replace("pro_handoff_us = 1000", "pro_handoff_us = 1100");
 
-        let error = Profile::from_toml(&text).expect_err("profile should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("leaves no physical-period write reserve")
+        assert_eq!(
+            Profile::from_toml(&text).unwrap().device.pro_handoff_us,
+            1100
         );
     }
 
@@ -1367,15 +1294,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_pro_latency_without_handoff_buffer() {
+    fn accepts_zero_pro_latency_without_extra_handoff_capacity() {
         let text = PROFILE.replace("pro_latency_periods = 1", "pro_latency_periods = 0");
 
-        let error = Profile::from_toml(&text).expect_err("profile should fail");
-        assert!(error.to_string().contains("requires buffer_size >= 96"));
+        assert_eq!(Profile::from_toml(&text).unwrap().device.buffer_size, 64);
     }
 
     #[test]
-    fn linked_handoff_rounds_up_to_one_hardware_period() {
+    fn linked_handoff_does_not_impose_rounded_capacity() {
         let text = PROFILE
             .replace("buffer_size = 64", "buffer_size = 87")
             .replace(
@@ -1383,12 +1309,11 @@ mod tests {
                 "pro_latency_periods = 0\n        pro_handoff_us = 500",
             );
 
-        let error = Profile::from_toml(&text).expect_err("profile should fail");
-        assert!(error.to_string().contains("requires buffer_size >= 96"));
+        assert_eq!(Profile::from_toml(&text).unwrap().device.buffer_size, 87);
     }
 
     #[test]
-    fn rejects_pro_handoff_without_physical_write_reserve() {
+    fn accepts_pro_handoff_without_predicted_write_reserve() {
         let text = PROFILE
             .replace("buffer_size = 64", "buffer_size = 96")
             .replace(
@@ -1396,11 +1321,9 @@ mod tests {
                 "pro_latency_periods = 0\n        pro_handoff_us = 600",
             );
 
-        let error = Profile::from_toml(&text).expect_err("profile should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("leaves no physical-period write reserve")
+        assert_eq!(
+            Profile::from_toml(&text).unwrap().device.pro_handoff_us,
+            600
         );
     }
 
@@ -1426,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_transport_period_does_not_reduce_handoff_reserve() {
+    fn direct_transport_allows_user_budgets_but_requires_aligned_ring() {
         let text = E1X2_PROFILE.replace("hardware_period_size = 64", "hardware_period_size = 32");
         let profile =
             Profile::from_toml(&text).expect("Q64 client with P32 transport should parse");
@@ -1439,7 +1362,7 @@ mod tests {
         assert!(!profile.device.uses_staged_pro_packets());
         assert!(
             Profile::from_toml(&text.replace("pro_handoff_us = 1000", "pro_handoff_us = 1100"))
-                .is_err()
+                .is_ok()
         );
         let error = Profile::from_toml(&text.replace("buffer_size = 256", "buffer_size = 224"))
             .expect_err("ring wraps must remain aligned to full client blocks");
@@ -1448,7 +1371,7 @@ mod tests {
             Profile::from_toml(
                 &text.replace("playback_queue_periods = 2", "playback_queue_periods = 1")
             )
-            .is_err()
+            .is_ok()
         );
     }
 
@@ -1478,17 +1401,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_pro_latency_with_one_hardware_period() {
+    fn accepts_zero_pro_latency_with_one_hardware_period() {
         let text = PROFILE
             .replace("buffer_size = 64", "buffer_size = 32")
             .replace("pro_latency_periods = 1", "pro_latency_periods = 0");
 
-        let error = Profile::from_toml(&text).expect_err("profile should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("requires at least two logical periods")
-        );
+        assert_eq!(Profile::from_toml(&text).unwrap().device.buffer_size, 32);
+    }
+
+    #[test]
+    fn q128_b256_zero_lead_is_not_rejected_by_predicted_headroom() {
+        let mut profile = Profile::from_toml(E1X2_PROFILE).unwrap();
+        profile.device.period_size = 128;
+        profile.device.hardware_period_size = Some(128);
+        profile.device.buffer_size = 256;
+        profile.device.validate().unwrap();
+        assert_eq!(profile.device.pro_latency_periods, 0);
     }
 
     #[test]
@@ -1562,16 +1490,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_playback_queue_larger_than_hardware_buffer() {
+    fn accepts_playback_queue_larger_than_hardware_buffer() {
         let text = PROFILE.replace("playback_queue_periods = 1", "playback_queue_periods = 3");
 
-        let error = Profile::from_toml(&text).expect_err("profile should fail");
-
-        assert!(
-            error
-                .to_string()
-                .contains("playback_queue_periods must fit within buffer_size")
+        assert_eq!(
+            Profile::from_toml(&text)
+                .unwrap()
+                .device
+                .playback_queue_periods,
+            Some(3)
         );
+    }
+
+    #[test]
+    fn single_period_hardware_accepts_previous_queue_preferences() {
+        for period in [64, 128, 192, 256] {
+            for queue in [None, Some(1), Some(2), Some(u32::MAX)] {
+                let mut profile = Profile::from_toml(E1X2_PROFILE).unwrap();
+                profile.device.period_size = period;
+                profile.device.hardware_period_size = Some(period);
+                profile.device.buffer_size = period;
+                profile.device.shared_buffer_size = Some(period * 2);
+                profile.device.playback_queue_periods = queue;
+                profile.device.validate().unwrap();
+            }
+        }
     }
 
     #[test]

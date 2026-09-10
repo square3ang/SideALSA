@@ -105,6 +105,9 @@ MANIFEST_ACTUAL="$(destination "$MANIFEST_PATH")"
 [[ -f "$MANIFEST_ACTUAL" ]] || die "SideALSA install manifest not found: $MANIFEST_ACTUAL"
 
 if [[ -z "$DESTDIR" ]] && command -v systemctl >/dev/null 2>&1; then
+    if ((EUID != 0)); then
+        systemctl --user disable --now sidealsa-reconnect.service 2>/dev/null || true
+    fi
     run_privileged systemctl disable --now sidealsad.service 2>/dev/null || true
     run_privileged systemctl daemon-reload
 fi
@@ -147,6 +150,9 @@ fi
 
 if [[ -z "$DESTDIR" ]] && command -v systemctl >/dev/null 2>&1; then
     run_privileged systemctl daemon-reload
+    if ((EUID != 0)); then
+        systemctl --user daemon-reload 2>/dev/null || true
+    fi
 fi
 
 for directory in \

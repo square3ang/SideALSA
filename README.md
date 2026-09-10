@@ -117,7 +117,7 @@ sudo systemctl start sidealsad
 ```
 
 If it is already running, `start` does not apply a new binary or profile. When changing an existing installation, close clients and use the menu's restart flow.
-If you manually run `sudo systemctl restart sidealsad`, also restart PipeWire and reconnect clients.
+The installer and control panel leave PipeWire running. The `sidealsa-reconnect` user service automatically refreshes affected SHARED links after daemon restarts; PRO/ASIO clients still need to reconnect.
 See [Installation and Service Lifecycle](docs/installation.md) and [Terminal Setup](docs/onboard-setup.md).
 
 ## Wine / Steam ASIO
@@ -175,8 +175,10 @@ wpctl status
 sidealsa-control
 ```
 
-`sidealsa-control` is the Qt control panel. Applying settings authenticates, validates the profile, and restarts the service,
-along with active PipeWire services. Native and ASIO clients must reconnect.
+`sidealsa-control` is the Qt control panel. Applying settings authenticates, validates the profile, and restarts only the SideALSA service.
+PipeWire services remain running. With `sidealsa-reconnect.service` enabled, SHARED links recover automatically without restarting apps. A brief audio gap remains; native PRO and ASIO clients must reconnect.
+
+See [automatic SHARED recovery](docs/pipewire-reconnect.md) for activation, diagnostics and limitations.
 
 ### Select Audio in Apps
 

@@ -142,7 +142,8 @@ impl DuplexEngine {
                 .map_or(config.buffer_size, |periods| {
                     config.period_size.saturating_mul(periods)
                 }),
-        );
+        )
+        .min(buffer);
         let playback_avail_min =
             if config.uses_event_driven_linked_pro() || config.playback_timer_scheduling {
                 period
@@ -4816,6 +4817,11 @@ mod tests {
         assert_eq!(direct_linked_start_frames(64, 256, Some(3)), 192);
         assert_eq!(direct_linked_start_frames(64, 256, Some(4)), 256);
         assert_eq!(direct_linked_start_frames(64, 128, Some(2)), 128);
+        for period in [64, 128, 192, 256] {
+            for queue in [None, Some(1), Some(2), Some(u32::MAX)] {
+                assert_eq!(direct_linked_start_frames(period, period, queue), period);
+            }
+        }
     }
 
     #[test]

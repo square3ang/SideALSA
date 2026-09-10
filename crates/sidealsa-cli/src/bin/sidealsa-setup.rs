@@ -552,7 +552,7 @@ fn plan(
                 if action == 2 {
                     "--no-start enables future boots; an already-running service is not stopped or restarted"
                 } else {
-                    "RESTART opens hardware and may interrupt audio; installer may stop/restore user PipeWire"
+                    "RESTART opens hardware and may interrupt audio; PipeWire services remain running"
                 }
             ),
         )?;
