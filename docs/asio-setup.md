@@ -57,6 +57,34 @@ Invalid selections, `0` at a numbered menu, and EOF cancel without invoking the
 installer. Blank path prompts retain defaults; blank additional-path input ends
 discovery. Blank numbered choices skip that step.
 
+## Prefix Ownership (Proton / Bottles)
+
+A host Wine process started inside a prefix owned by another Wine build
+migrates that prefix to the host build and can damage it. Following
+`pipeasio-register`, the wizard and the installer detect ownership from
+filesystem metadata only:
+
+- `tracked_files` in the prefix or its parent directory marks a
+  Proton-managed prefix.
+- `bottle.yml` in the prefix marks a Bottles bottle.
+
+With a default wine lookup, Proton prefixes register through `umu-run`
+(`GAMEID=umu-<appid>`) instead of system wine, so the prefix is never migrated
+to the host build. Installing `umu` is required for this path. In Bottles
+bottles the DLL is staged automatically and `bottles-cli` persists
+`WINEDLLPATH` in the bottle environment (Bottles limits the system environment,
+so an exported variable would never reach its wine) before running
+`regsvr32 /s sidealsa-asio64.dll`. Give the TUI the bottle name for this path;
+without a name only the DLL is staged and the printed manual steps apply.
+Every registration command is status-checked: a failed `regsvr32` aborts the
+install instead of reporting success.
+
+Passing `--wine` or setting `WINE` explicitly counts as accepting
+responsibility and bypasses both rules, so only do that with a binary that
+owns the prefix. Automatic per-game Proton-build selection is deliberately not
+attempted: runners live outside the prefix and cannot be derived reliably from
+prefix files alone; `umu-run` manages that choice.
+
 ## Confirmation
 
 The final summary separates file installation from prefix registration and lists
@@ -80,11 +108,15 @@ retain their existing behavior and do not ask for confirmation.
 
 ## Fixture Tests
 
-Run `bash -n scripts/install-asio.sh scripts/setup-asio.sh scripts/test-setup-asio.sh`
-and `bash scripts/test-setup-asio.sh`. Tests use an isolated temporary HOME,
-prefix fixtures and a stub installer; they never invoke real Wine, build ASIO,
-install files into the desktop environment, or use live prefixes.
+Run `bash -n scripts/install-asio.sh scripts/setup-asio.sh scripts/test-setup-asio.sh scripts/test-install-asio-prefix-guard.sh`,
+`bash scripts/test-setup-asio.sh`, and
+`bash scripts/test-install-asio-prefix-guard.sh`. Tests use an isolated
+temporary HOME, prefix fixtures and a stub installer (plus mock build artifacts
+and logging wine stubs for the guard test); they never invoke real Wine, build
+ASIO, install files into the desktop environment, or use live prefixes.
 Coverage includes no-argument dispatch with redirected input/output, safe EOF
 cancellation, split Steam-game/manual selection with ordering, game-name and
 unknown-manifest display, `libraryfolders.vdf` external libraries, alias
-deduplication, and explicit confirmation reaching only the stub installer.
+deduplication, explicit confirmation reaching only the stub installer,
+Proton/Bottles skip-and-report in the wizard, explicit-`WINE` inclusion, and
+installer refusal before any Wine process or file copy in foreign prefixes.

@@ -143,6 +143,14 @@ For Steam games only, press Enter to skip the manual step. For regular Wine only
 Entering multiple numbers or `all` only selects prefixes; nothing is built, installed, or registered before the final `y` confirmation.
 Registration can start Wine processes and modify the selected prefixes.
 
+> [!CAUTION]
+> **Prefixes owned by another Wine build never see system wine.** Proton
+> prefixes register through `umu-run` (install `umu` first); in Bottles bottles
+> the DLL is staged and `regsvr32` runs through `bottles-cli` when the wizard
+> is given the bottle name, otherwise run it inside Bottles yourself
+> (see [ASIO Setup Guide](docs/asio-setup.md)). `--wine`/`WINE` explicitly set
+> counts as accepting responsibility.
+
 Use the launch environment printed by the installer. If you already have launch options, merge the required environment variables rather than discarding your existing settings.
 For the default installation location, Steam launch options are:
 

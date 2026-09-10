@@ -56,9 +56,11 @@ manifest 42 "External Game" "$home/external library/steamapps/appmanifest_42.acf
     printf '"libraryfolders"\n{\n\t"0"\n\t{\n\t\t"path"\t\t"%s"\n\t}\n}\n' \
         "$home/external library"
 } > "$home/.local/share/Steam/steamapps/libraryfolders.vdf"
-steam_ids=(10 11 12 13 42 14 15 16 17 18)
+steam_ids=(10 11 12 13 42 14 15 16 17 18 19)
 steam_names=("Test Game 10" "Test Game 11" "Unknown Steam game" "Test Game 13" \
-    "External Game" "Test Game 14" "Test Game 15" "Test Game 16" "Test Game 17" "Test Game 18")
+    "External Game" "Test Game 14" "Test Game 15" "Test Game 16" "Test Game 17" "Test Game 18" \
+    "Proton Game 19")
+# Discovery order: roots in order, external library right after its parent root.
 steam_paths=(
     "${roots[0]}/steamapps/compatdata/10/pfx"
     "${roots[1]}/steamapps/compatdata/11/pfx"
@@ -75,6 +77,16 @@ manual=("$home/.wine" "$home/custom prefix")
 for prefix in "${manual[@]}"; do mkdir -p "$prefix/drive_c/windows/system32"; done
 ln -s "$home/.wine" "$home/prefix alias"
 mkdir -p "$home/.local/share/Steam/steamapps/compatdata/invalid/pfx"
+# Proton-owned prefix (tracked_files): included, registers through umu-run.
+proton="${roots[8]}/steamapps/compatdata/19/pfx"
+mkdir -p "$proton/drive_c/windows/system32"
+touch "$proton/tracked_files"
+manifest 19 "Proton Game 19" "${roots[8]}/steamapps/appmanifest_19.acf"
+# Bottles bottle entered manually below: excluded unless WINE is set explicitly.
+bottle="$home/bottles/game"
+mkdir -p "$bottle/drive_c/windows/system32"
+touch "$bottle/bottle.yml"
+steam_paths+=("$proton")
 cp -a -- "$home" "$tmp/before"
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -119,7 +131,7 @@ done
 
 run "$tmp/install root"$'\nrelative build\n2\n1\ny\n' --interactive
 mapfile -d '' -t args < "$tmp/calls"
-expected_args=(--install-root "$tmp/install root" --build-dir "$tmp/repo/relative build" --wine wine --no-build --no-register)
+expected_args=(--install-root "$tmp/install root" --build-dir "$tmp/repo/relative build" --no-build --no-register)
 [[ ${#args[@]} == ${#expected_args[@]} ]] || fail 'file-only argument count'
 for i in "${!expected_args[@]}"; do
     [[ "${args[i]}" == "${expected_args[i]}" ]] || fail "file-only argument $i"
@@ -127,33 +139,69 @@ done
 [[ ! -e "$tmp/install root" ]] || fail 'real installation occurred'
 
 # All Steam games plus all manual prefixes, with game names displayed.
+# The Proton-owned game is included: it registers through umu-run.
 run $'\n\n1\n2\nall\n\nall\ny\n' --interactive
 mapfile -d '' -t args < "$tmp/calls"
 expected_all=("${steam_paths[@]}" "${manual[@]}")
-[[ ${#args[@]} == $((6 + 2 * ${#expected_all[@]})) ]] || fail 'all prefix count or build flag'
+[[ ${#args[@]} == $((4 + 2 * ${#expected_all[@]})) ]] || fail 'all prefix count or build flag'
 for i in "${!expected_all[@]}"; do
-    [[ "${args[6 + 2*i]}" == --steam-prefix && "${args[7 + 2*i]}" == "${expected_all[i]}" ]] \
+    [[ "${args[4 + 2*i]}" == --steam-prefix && "${args[5 + 2*i]}" == "${expected_all[i]}" ]] \
         || fail "prefix $i missing or duplicated"
 done
-for name in "Test Game 10" "Unknown Steam game" "External Game"; do
+for name in "Test Game 10" "Unknown Steam game" "External Game" "Proton Game 19"; do
     grep -Fq "$name" "$tmp/output" || fail "game name not displayed: $name"
 done
+grep -Fq 'umu-run' "$tmp/output" || fail 'proton registration note missing'
 grep -Fq 'Step 1 - Steam games' "$tmp/output" || fail 'steam step missing'
 grep -Fq 'Step 2 - Manual Wine prefixes' "$tmp/output" || fail 'manual step missing'
+
+# Explicit WINE is forwarded and still covers the Proton-owned game.
+rm -f -- "$tmp/calls" "$tmp/forbidden"
+printf '%s' $'\n\n1\n2\nall\n\n\ny\n' | env -i PATH="$tmp/bin:$PATH" HOME="$home" \
+    XDG_DATA_HOME="$home/xdg data" WINEPREFIX="$home/custom prefix" WINE=custom-wine \
+    CALL_LOG="$tmp/calls" FORBIDDEN_LOG="$tmp/forbidden" \
+    bash "$tmp/repo/scripts/entry.sh" --interactive > "$tmp/output"
+[[ ! -e "$tmp/forbidden" ]] || fail 'build/install/Wine command executed'
+mapfile -d '' -t args < "$tmp/calls"
+wine_forwarded=0
+proton_selected=0
+for arg in "${args[@]}"; do
+    [[ "$arg" == --wine ]] && wine_forwarded=1
+    [[ "$arg" == "$proton" ]] && proton_selected=1
+done
+# --wine custom-wine must immediately precede its value; check adjacency too.
+for ((i = 0; i + 1 < ${#args[@]}; i++)); do
+    if [[ "${args[i]}" == --wine && "${args[i+1]}" == custom-wine ]]; then
+        wine_forwarded=2
+    fi
+done
+((wine_forwarded == 2)) || fail 'explicit wine not forwarded'
+((proton_selected)) || fail 'proton prefix missing with explicit WINE'
 
 # Split selection keeps game order; skipped manual step leaves no manual section.
 run $'\n\n2\n2\n2 1\n\n\nY\n' --interactive
 mapfile -d '' -t args < "$tmp/calls"
-[[ ${#args[@]} == 11 && "${args[6]}" == --no-build ]] || fail 'split selection flags'
-[[ "${args[7]}" == --steam-prefix && "${args[8]}" == "${steam_paths[1]}" ]] || fail 'split first game'
-[[ "${args[9]}" == --steam-prefix && "${args[10]}" == "${steam_paths[0]}" ]] || fail 'split second game'
+[[ ${#args[@]} == 9 && "${args[4]}" == --no-build ]] || fail 'split selection flags'
+[[ "${args[5]}" == --steam-prefix && "${args[6]}" == "${steam_paths[1]}" ]] || fail 'split first game'
+[[ "${args[7]}" == --steam-prefix && "${args[8]}" == "${steam_paths[0]}" ]] || fail 'split second game'
 if grep -Fq 'Manual prefixes:' "$tmp/output"; then fail 'skipped manual step listed'; fi
 
 # Manual-only: Steam skipped, alias and already-known compatdata deduplicated.
-run $'\n\n2\n2\n\n'"$home/external library/steamapps/compatdata"$'\n'"$home/prefix alias"$'\n\nall\nYES\n' --interactive
+# The Bottles bottle is included with its bottle name for bottles-cli.
+run $'\n\n2\n2\n\n'"$home/external library/steamapps/compatdata"$'\n'"$home/prefix alias"$'\n'"$bottle"$'\n\nall\nMyBottle\nYES\n' --interactive
 mapfile -d '' -t args < "$tmp/calls"
-[[ ${#args[@]} == 11 ]] || fail 'manual-only argument count'
-[[ "${args[8]}" == "${manual[0]}" && "${args[10]}" == "${manual[1]}" ]] || fail 'manual-only prefixes'
+[[ ${#args[@]} == 13 ]] || fail 'manual-only argument count'
+[[ "${args[6]}" == "${manual[0]}" && "${args[8]}" == "${manual[1]}" && "${args[10]}" == "$bottle" ]] || fail 'manual-only prefixes'
+[[ "${args[11]}" == --bottle-name && "${args[12]}" == MyBottle ]] || fail 'bottle name not forwarded'
+grep -Fq 'MyBottle' "$tmp/output" || fail 'bottle name not summarized'
+grep -Fq 'bottles-cli' "$tmp/output" || fail 'bottles auto-registration not summarized'
+
+# Bottles bottle without a name: DLL staged, manual regsvr32 summarized.
+run $'\n\n2\n2\n\n'"$bottle"$'\n\nall\n\nYES\n' --interactive
+mapfile -d '' -t args < "$tmp/calls"
+[[ ${#args[@]} == 11 ]] || fail 'nameless bottle argument count'
+for arg in "${args[@]}"; do [[ "$arg" == --bottle-name ]] && fail 'unexpected bottle name forwarded'; done
+grep -Fq 'run regsvr32 yourself' "$tmp/output" || fail 'manual regsvr32 note missing'
 
 # Empty discovery cancels even if confirmation text follows.
 mkdir -p "$tmp/empty"
