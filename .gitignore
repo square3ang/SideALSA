@@ -133,3 +133,6 @@ Cargo.lock
 /build-asio/
 /build-asio-*/
 /build-gui/
+
+# Generated setup drafts; shipped profiles stay clean.
+profiles/local/*.toml

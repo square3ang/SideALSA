@@ -3164,6 +3164,66 @@ mod tests {
     }
 
     #[test]
+    fn shared_lifecycle_can_cut_a_waveform_without_an_underrun() {
+        // Reproduce a sample discontinuity, not an acoustic hardware result.
+        // Use the reference Q64 / five-period lookahead with a synthetic PCM.
+        let profile = Profile::from_toml(
+            &PROFILE
+                .replace("period_size = 4", "period_size = 64")
+                .replace("buffer_size = 8", "buffer_size = 256")
+                .replace("shared_latency_periods = 0", "shared_latency_periods = 5"),
+        )
+        .unwrap();
+        let timeline = Arc::new(HardwareTimeline::default());
+        let state = DaemonState::new(&profile, Arc::clone(&timeline)).unwrap();
+        let shared = state.open_shared("line1").unwrap().unwrap();
+        let mut bridge = state.bridge();
+        let mut output = [0; 128];
+        bridge.process(0, &[0; 128], &mut output);
+        assert_eq!(output, [0; 128]);
+        assert!(state.start(shared.session_id));
+        activate_session(&state, shared.session_id, 1);
+
+        // Continuous 1 kHz cosine at -12 dBFS, both channels identical.
+        let block = |offset: usize| -> [i32; 128] {
+            std::array::from_fn(|sample| {
+                let phase = (offset + sample / 2) as f64 * std::f64::consts::TAU / 48.0;
+                (phase.cos() * (i32::MAX as f64 / 4.0)) as i32
+            })
+        };
+        let first = block(0);
+        let second = block(64);
+        let mut index = 0;
+        for (sequence, samples) in [(1, &first), (2, &second)] {
+            assert!(
+                state.shared[0]
+                    .session
+                    .current()
+                    .region
+                    .try_client_publish_playback(&mut index, sequence, samples,)
+            );
+        }
+        for sequence in 1..6 {
+            bridge.process(sequence, &[0; 128], &mut output);
+            assert_eq!(output, [0; 128]);
+        }
+        bridge.process(6, &[0; 128], &mut output);
+        assert_eq!(output, first); // No fade-in at the silence-to-signal boundary.
+        let last_sample = output[126];
+        let natural_step = (i64::from(second[0]) - i64::from(last_sample)).abs();
+
+        assert!(state.stop(shared.session_id));
+        bridge.process(7, &[0; 128], &mut output);
+        assert_eq!(output, [0; 128]); // Queued continuation was discarded.
+        assert!(i64::from(last_sample).abs() > 2 * natural_step);
+        let stats = timeline.snapshot();
+        assert_eq!(stats.shared_underruns, 0);
+        assert_eq!(stats.hw_playback_xruns, 0);
+        assert_eq!(stats.hw_capture_xruns, 0);
+        assert_eq!(stats.timeline_resets, 0);
+    }
+
+    #[test]
     fn shared_playback_consumes_configured_lookahead() {
         let profile_text =
             PROFILE.replace("shared_latency_periods = 0", "shared_latency_periods = 2");
