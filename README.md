@@ -166,6 +166,11 @@ The main installer's `--with-asio` installs system files only; **prefix registra
 
 ## Everyday Use
 
+For heavy multithreaded DSP, enable **Scheduling → Automatic PRO handoff** in the
+control panel. This scales the processing budget with the period instead of
+keeping a fixed 1 ms ceiling; hardware availability still bounds the deadline.
+Existing profiles retain manual mode until changed. See [DSP deadline measurements](docs/pro-dsp-deadlines.md).
+
 ### Status and Control Panel
 
 ```bash

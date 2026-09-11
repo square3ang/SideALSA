@@ -284,6 +284,9 @@ private:
 
         proLatencyPeriods_ = numberBox(0, 7, QStringLiteral(" periods"));
         proHandoffUs_ = numberBox(0, maximumInteger, QStringLiteral(" us"));
+        proHandoffUs_->setToolTip(QStringLiteral("Fixed handoff ceiling. Ignored in direct zero-lead mode when Automatic PRO handoff is enabled."));
+        proHandoffAuto_ = new QCheckBox(QStringLiteral("Automatic PRO handoff (scales with buffer period)"));
+        proHandoffAuto_->setToolTip(QStringLiteral("Direct zero-lead mode: allow up to one logical period, bounded by actual hardware queue and write reserve. No extra buffering. Other modes use the manual budget."));
         proRealtimePriority_ = optionalNumberBox(99);
         sharedLatencyPeriods_ = numberBox(0, 7, QStringLiteral(" periods"));
         sharedPlaybackRepeatOnUnderrun_ =
@@ -298,7 +301,8 @@ private:
         schedulingForm->setHorizontalSpacing(24);
         schedulingForm->setVerticalSpacing(11);
         schedulingForm->addRow(QStringLiteral("PRO lead"), proLatencyPeriods_);
-        schedulingForm->addRow(QStringLiteral("PRO handoff"), proHandoffUs_);
+        schedulingForm->addRow(QStringLiteral("Manual PRO handoff"), proHandoffUs_);
+        schedulingForm->addRow(QString(), proHandoffAuto_);
         schedulingForm->addRow(QStringLiteral("PRO RT priority"), proRealtimePriority_);
         schedulingForm->addRow(QStringLiteral("SHARED lead"), sharedLatencyPeriods_);
         schedulingForm->addRow(QString(), sharedPlaybackRepeatOnUnderrun_);
@@ -364,6 +368,7 @@ private:
         connect(sharedPlaybackRepeatOnUnderrun_, &QCheckBox::toggled, this,
                 [this] { markEdited(); });
         connect(realtime_, &QCheckBox::toggled, this, [this] { markEdited(); });
+        connect(proHandoffAuto_, &QCheckBox::toggled, this, [this] { markEdited(); });
 
         setCentralWidget(central);
         setStyleSheet(QStringLiteral(R"(
@@ -654,6 +659,7 @@ private:
                            values.value(QStringLiteral("linked_phase_max_attempts")));
         valid &= setNumber(proLatencyPeriods_, values.value(QStringLiteral("pro_latency_periods")));
         valid &= setNumber(proHandoffUs_, values.value(QStringLiteral("pro_handoff_us")));
+        proHandoffAuto_->setChecked(textBool(values.value(QStringLiteral("pro_handoff_auto"))));
         valid &= setOptional(proRealtimePriority_,
                              values.value(QStringLiteral("pro_realtime_priority")));
         valid &= setNumber(sharedLatencyPeriods_,
@@ -702,6 +708,7 @@ private:
             QStringLiteral("linked_phase_max_attempts=%1").arg(linkedPhaseAttempts_->value()),
             QStringLiteral("pro_latency_periods=%1").arg(proLatencyPeriods_->value()),
             QStringLiteral("pro_handoff_us=%1").arg(proHandoffUs_->value()),
+            QStringLiteral("pro_handoff_auto=%1").arg(proHandoffAuto_->isChecked() ? QStringLiteral("true") : QStringLiteral("false")),
             QStringLiteral("pro_realtime_priority=%1").arg(optionalNumber(proRealtimePriority_)),
             QStringLiteral("shared_latency_periods=%1").arg(sharedLatencyPeriods_->value()),
             QStringLiteral("shared_playback_repeat_on_underrun=%1")
@@ -828,6 +835,7 @@ private:
     QSpinBox *linkedPhaseAttempts_ = nullptr;
     QSpinBox *proLatencyPeriods_ = nullptr;
     QSpinBox *proHandoffUs_ = nullptr;
+    QCheckBox *proHandoffAuto_ = nullptr;
     QSpinBox *proRealtimePriority_ = nullptr;
     QSpinBox *sharedLatencyPeriods_ = nullptr;
     QCheckBox *sharedPlaybackRepeatOnUnderrun_ = nullptr;

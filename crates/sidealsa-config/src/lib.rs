@@ -53,6 +53,10 @@ pub struct HardwareConfig {
     pub pro_latency_periods: u32,
     #[serde(default = "default_pro_handoff_us")]
     pub pro_handoff_us: u32,
+    /// Use the logical period as the handoff ceiling in direct PRO mode.
+    /// False preserves explicitly configured legacy microsecond budgets.
+    #[serde(default)]
+    pub pro_handoff_auto: bool,
     #[serde(default)]
     pub pro_realtime_priority: Option<u32>,
     #[serde(default = "default_shared_latency_periods")]
@@ -91,6 +95,7 @@ pub struct TimingSettings {
     pub linked_phase_max_attempts: u32,
     pub pro_latency_periods: u32,
     pub pro_handoff_us: u32,
+    pub pro_handoff_auto: bool,
     pub pro_realtime_priority: Option<u32>,
     pub shared_latency_periods: u32,
     pub shared_playback_repeat_on_underrun: bool,
@@ -276,6 +281,7 @@ impl From<&HardwareConfig> for TimingSettings {
             linked_phase_max_attempts: config.linked_phase_max_attempts,
             pro_latency_periods: config.pro_latency_periods,
             pro_handoff_us: config.pro_handoff_us,
+            pro_handoff_auto: config.pro_handoff_auto,
             pro_realtime_priority: config.pro_realtime_priority,
             shared_latency_periods: config.shared_latency_periods,
             shared_playback_repeat_on_underrun: config.shared_playback_repeat_on_underrun,
@@ -299,6 +305,7 @@ impl TimingSettings {
         config.linked_phase_max_attempts = self.linked_phase_max_attempts;
         config.pro_latency_periods = self.pro_latency_periods;
         config.pro_handoff_us = self.pro_handoff_us;
+        config.pro_handoff_auto = self.pro_handoff_auto;
         config.pro_realtime_priority = self.pro_realtime_priority;
         config.shared_latency_periods = self.shared_latency_periods;
         config.shared_playback_repeat_on_underrun = self.shared_playback_repeat_on_underrun;
@@ -325,6 +332,10 @@ impl TimingSettings {
         hash_bool(&mut hash, self.shared_playback_repeat_on_underrun);
         hash_bool(&mut hash, self.realtime);
         hash_u32(&mut hash, self.realtime_priority);
+        // Preserve fingerprints of legacy manual-budget profiles.
+        if self.pro_handoff_auto {
+            hash_string(&mut hash, "pro_handoff_auto");
+        }
         hash
     }
 }
@@ -358,6 +369,7 @@ fn write_timing(device: &mut Table, timing: &TimingSettings) {
     );
     set_u32(device, "pro_latency_periods", timing.pro_latency_periods);
     set_u32(device, "pro_handoff_us", timing.pro_handoff_us);
+    set_bool(device, "pro_handoff_auto", timing.pro_handoff_auto);
     set_optional_u32(
         device,
         "pro_realtime_priority",
@@ -670,6 +682,9 @@ impl HardwareConfig {
     }
 
     pub fn pro_handoff_nanos(&self) -> u64 {
+        if self.pro_handoff_auto && self.uses_event_driven_linked_pro() {
+            return u64::from(self.period_size) * 1_000_000_000 / u64::from(self.rate.max(1));
+        }
         u64::from(self.pro_handoff_us).saturating_mul(1_000)
     }
 
@@ -1036,6 +1051,38 @@ mod tests {
 
         assert_eq!(profile.device.pro_handoff_us, 500);
         assert_eq!(profile.device.pro_handoff_nanos(), 500_000);
+    }
+
+    #[test]
+    fn automatic_handoff_scales_with_period_and_manual_mode_is_preserved() {
+        let mut profile = Profile::from_toml(E1X2_PROFILE).unwrap();
+        profile.device.pro_handoff_auto = true;
+        for frames in [64, 128, 256, 1024] {
+            profile.device.period_size = frames;
+            assert_eq!(
+                profile.device.pro_handoff_nanos(),
+                u64::from(frames) * 1_000_000_000 / 48000
+            );
+        }
+        let auto = TimingSettings::from(&profile.device);
+        profile.device.pro_handoff_auto = false;
+        assert_eq!(profile.device.pro_handoff_nanos(), 1_000_000);
+        assert_ne!(
+            auto.fingerprint(),
+            TimingSettings::from(&profile.device).fingerprint()
+        );
+        auto.apply_to(&mut profile.device);
+        assert!(profile.device.pro_handoff_auto);
+        let mut document = ProfileDocument::from_toml(E1X2_PROFILE).unwrap();
+        let mut timing = document.timing();
+        timing.pro_handoff_auto = false;
+        document.apply_timing(&timing).unwrap();
+        assert!(!document.profile().device.pro_handoff_auto);
+        timing.pro_handoff_auto = true;
+        document.apply_timing(&timing).unwrap();
+        assert!(document.profile().device.pro_handoff_auto);
+        profile.device.playback_timer_scheduling = true;
+        assert_eq!(profile.device.pro_handoff_nanos(), 1_000_000);
     }
 
     #[test]

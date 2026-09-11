@@ -136,6 +136,18 @@ add_custom_command(
 add_custom_target(sidealsa-asio-probe DEPENDS "${PROBE_OUTPUT}")
 add_dependencies(sidealsa-asio-probe sidealsa-asio-runtime-layout)
 
+set(DSP_PROBE_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/sidealsa-asio-dsp-probe.exe")
+add_custom_command(
+    OUTPUT "${DSP_PROBE_OUTPUT}" "${DSP_PROBE_OUTPUT}.so"
+    COMMAND "${WINEGCC_EXECUTABLE}" -m64 -std=gnu11 -O2 -Wall -Wextra
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/asio_dsp_probe.c"
+            -lole32 -luuid -lm -o "${DSP_PROBE_OUTPUT}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/asio_dsp_probe.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/asio_probe.c"
+    VERBATIM)
+add_custom_target(sidealsa-asio-dsp-probe DEPENDS "${DSP_PROBE_OUTPUT}")
+add_dependencies(sidealsa-asio-dsp-probe sidealsa-asio-runtime-layout)
+
 add_custom_command(
     OUTPUT "${LOOPBACK_OUTPUT}" "${LOOPBACK_OUTPUT}.so"
     COMMAND "${WINEGCC_EXECUTABLE}" -m64 -std=gnu11 -O2 -Wall -Wextra

@@ -3802,7 +3802,11 @@ fn direct_pro_cutoff_nanos(
     handoff_nanos: u64,
 ) -> u64 {
     let reserve_divisor = i64::from(DIRECT_WRITE_RESERVE_DIVISOR);
-    let reserve_frames = period.saturating_add(reserve_divisor - 1) / reserve_divisor;
+    // Keep the Q64/48k write margin (~333 us), but do not reserve a quarter
+    // of a large DAW block: Q256 would otherwise lose 1.33 ms of DSP time.
+    // Small periods retain their existing proportional reserve.
+    let reserve_frames = (period.saturating_add(reserve_divisor - 1) / reserve_divisor)
+        .min(i64::from(rate.div_ceil(3_000)));
     let wait_frames = readiness
         .playback_queued_frames
         .saturating_sub(reserve_frames)
@@ -4822,6 +4826,26 @@ mod tests {
                 assert_eq!(direct_linked_start_frames(period, period, queue), period);
             }
         }
+    }
+
+    #[test]
+    fn automatic_dsp_budget_uses_available_period_without_extending_queue() {
+        let readiness = DirectDuplexReadiness {
+            observed_nanos: 1_000_000_000,
+            playback_queued_frames: 256,
+        };
+        let manual = direct_pro_cutoff_nanos(readiness, 256, 48000, 1_000_000);
+        let automatic = direct_pro_cutoff_nanos(readiness, 256, 48000, 256 * 1_000_000_000 / 48000);
+        assert_eq!(manual, 1_001_000_000);
+        assert_eq!(automatic, 1_005_000_000); // 16-frame / 333 us write reserve.
+        let late = DirectDuplexReadiness {
+            playback_queued_frames: 16,
+            ..readiness
+        };
+        assert_eq!(
+            direct_pro_cutoff_nanos(late, 256, 48000, 5_333_333),
+            readiness.observed_nanos
+        );
     }
 
     #[test]
