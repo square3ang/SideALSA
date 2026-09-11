@@ -54,8 +54,8 @@ pub struct HardwareConfig {
     #[serde(default = "default_pro_handoff_us")]
     pub pro_handoff_us: u32,
     /// Use the logical period as the handoff ceiling in direct PRO mode.
-    /// False preserves explicitly configured legacy microsecond budgets.
-    #[serde(default)]
+    /// Enabled when omitted; false explicitly selects the microsecond budget.
+    #[serde(default = "default_pro_handoff_auto")]
     pub pro_handoff_auto: bool,
     #[serde(default)]
     pub pro_realtime_priority: Option<u32>,
@@ -754,6 +754,10 @@ fn default_realtime() -> bool {
     true
 }
 
+fn default_pro_handoff_auto() -> bool {
+    true
+}
+
 fn default_realtime_priority() -> u32 {
     50
 }
@@ -1051,6 +1055,19 @@ mod tests {
 
         assert_eq!(profile.device.pro_handoff_us, 500);
         assert_eq!(profile.device.pro_handoff_nanos(), 500_000);
+    }
+
+    #[test]
+    fn automatic_handoff_defaults_on_and_respects_explicit_opt_out() {
+        let legacy = E1X2_PROFILE.replace("pro_handoff_auto = true\n", "");
+        let mut profile = Profile::from_toml(&legacy).unwrap();
+        assert!(profile.device.pro_handoff_auto);
+        profile.device.period_size = 256;
+        assert_eq!(profile.device.pro_handoff_nanos(), 5_333_333);
+        let manual = legacy.replace("[device]", "[device]\npro_handoff_auto = false");
+        let profile = Profile::from_toml(&manual).unwrap();
+        assert!(!profile.device.pro_handoff_auto);
+        assert_eq!(profile.device.pro_handoff_nanos(), 1_000_000);
     }
 
     #[test]

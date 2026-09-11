@@ -195,8 +195,8 @@ These parse configuration only and do not open audio devices.
 ## Timing Policy
 
 Direct zero-lead PRO supports `pro_handoff_auto = true` to scale its handoff
-ceiling with the logical period. Existing profiles default to manual mode;
-new reference profiles enable automatic mode. Manual `pro_handoff_us` is retained
+ceiling with the logical period. This defaults to true even in existing profiles
+that omit the key; explicit false selects manual mode. Manual `pro_handoff_us` is retained
 for opt-out and other scheduling modes. See [DSP deadline behavior and benchmarks](pro-dsp-deadlines.md).
 
 Timing headroom is user-controlled. Profile validation no longer rejects a

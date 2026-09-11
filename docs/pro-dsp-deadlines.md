@@ -26,8 +26,9 @@ ceiling. The engine never waits indefinitely for a DSP worker.
 
 ## Enable for an existing installation
 
-Update the daemon, admin helper and GUI, then use **Scheduling → Automatic PRO
-handoff (scales with buffer period)** and Apply. The retained manual value is
+Update the daemon, admin helper and GUI. Automatic handoff defaults to enabled,
+including existing profiles that omit `pro_handoff_auto`. The checkbox is under
+**Scheduling → Automatic PRO handoff (scales with buffer period)**. The retained manual value is
 used when automatic mode is off; manual zero remains a zero budget. Modes other
 than direct linked zero-lead continue to use the manual value.
 
@@ -37,9 +38,10 @@ pro_handoff_auto = true
 pro_handoff_us = 1000 # retained manual ceiling, ignored in automatic direct mode
 ```
 
-New reference E1x2/E2x2 profiles enable automatic handoff. Existing profiles
-without the new key retain manual semantics and need the checkbox enabled;
-`update.sh` deliberately does not overwrite user profiles. The GUI's **Manual
+New reference E1x2/E2x2 profiles explicitly enable automatic handoff. Existing profiles
+without the key use the same default without requiring a file rewrite. Explicit
+`pro_handoff_auto = false` is preserved; enable the checkbox and Apply to opt back
+in. `update.sh` does not overwrite user profiles. The GUI's **Manual
 PRO handoff** field is labelled accordingly.
 
 Automatic handoff does not make unsupported ALSA geometry valid. It also cannot
