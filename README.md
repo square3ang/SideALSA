@@ -171,6 +171,11 @@ control panel. This scales the processing budget with the period instead of
 keeping a fixed 1 ms ceiling; hardware availability still bounds the deadline.
 Automatic mode is enabled by default, including existing profiles that omit the setting. Explicit `pro_handoff_auto = false` keeps manual mode. See [DSP deadline measurements](docs/pro-dsp-deadlines.md).
 
+The direct engine also automatically recovers a sustained queue-depth increase
+after a hardware-worker stall, even if ALSA reports no XRUN. This is built-in
+recovery, with no config switch. See [latency recovery](docs/direct-latency-recovery.md)
+for the conditions, brief rebase interruption and measured results.
+
 ### Status and Control Panel
 
 ```bash

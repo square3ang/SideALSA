@@ -1,4 +1,5 @@
 mod engine;
+mod latency;
 mod pro;
 mod routing;
 mod timeline;

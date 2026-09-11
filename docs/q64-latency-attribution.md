@@ -1,5 +1,9 @@
 # Q64 large-latency-change investigation
 
+The later controlled reproduction and correction are documented in
+[Direct-stream latency recovery](direct-latency-recovery.md). The observations
+below describe the earlier investigation before that reproduction was available.
+
 The target is the user's approximately **6.8 to 9.0 ms** change, about 106
 frames at 48 kHz. The smaller 25-frame / 0.52 ms change is not an explanation
 for that larger event.
@@ -53,3 +57,49 @@ Its observations must be correlated with the actual loopback measurement when
 the high-latency state returns. It cannot measure end-to-end latency by itself.
 
 No latency-reduction workaround or fixed-latency claim follows from these tests.
+
+## High-state report during the same recording
+
+The user subsequently reported 8.854 ms after continued gameplay. The collector
+still observed PID 132842, generation 0 and no ALSA XRUNs. The saved series now
+shows a persistent increase in the playback-side delay estimates, not merely
+one unusual status sample:
+
+| Median over 300 samples | Early window | Settled higher-delay window |
+| --- | ---: | ---: |
+| Playback total delay | 195.5 frames | 255 frames |
+| Playback ring occupancy | 5 frames | 31 frames |
+| Playback driver delay estimate | 192 frames | 222 frames |
+| Capture total delay after read | 12 frames | 12 frames |
+| Paired playback + capture total | 209 frames | 274 frames |
+
+Medians of individual components need not sum to the median of the total. The
+paired total increased by 65 frames (about 1.354 ms), roughly one Q64 period.
+The later windows retained the higher level for tens of minutes. This localizes
+a substantial part of the increase to playback buffering/transfer timing; it
+does not account exactly for the entire roughly 2.2 ms user-reported change.
+
+At 21:56:45 KST (collector sample 466), the cumulative maximum
+capture-to-playback-write interval rose from 1,083,691 to 2,635,853 ns in the
+same one-second sample where the queue estimates began their sustained rise.
+Playback driver-delay maximum then rose from 222 to 258 frames over samples
+466–469. PRO misses stayed at 7,906 throughout that transition; additional PRO
+misses occurred later. Capture delay did not show a sustained corresponding
+increase.
+
+This is temporal association, not a captured scheduler/USB trace. In particular,
+the capture-to-write timestamp is taken after successful write bookkeeping and
+may include a preemption after the actual ALSA commit. It cannot identify which
+instruction stalled or prove a USB scheduling hole by itself. ALSA USB driver
+delay also includes an estimate based on USB frame counters, so these values
+are not a direct measurement of internal device latency.
+
+The next fault to isolate is a delayed hardware-worker iteration followed by a
+persistent playback-queue/phase shift that ALSA does not report as XRUN. Current
+direct scheduling checks readiness and client publication deadlines but has no
+bounded-depth recovery policy for such a non-XRUN shift. That missing handling
+is a concrete investigation target, not yet a validated fix. No forced reset or
+sample-dropping correction was applied to the reported high state.
+
+Analysis script: `/tmp/opencode/analyze_latency_observer.py`; it reads the same
+collector JSONL without changing the audio configuration.

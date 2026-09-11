@@ -16,6 +16,7 @@ use alsa::{
 use sidealsa_config::{StartupLoopbackConfig, direct_pro_write_reserve_frames};
 use thiserror::Error;
 
+use crate::latency::LatencyGuard;
 use crate::pro::{ProCaptureSink, ProPlaybackSource};
 use crate::{
     DIRECT_MIN_PLAYBACK_QUEUE_PERIODS, HardwareConfig, HardwareStats, HardwareTimeline,
@@ -1945,6 +1946,7 @@ fn linked_pro_cycle_loop(
     let mut sequence = 0_u64;
     let mut periods_processed = 0_u64;
 
+    let mut latency_guard = LatencyGuard::new(config.period, config.rate);
     'cycles: loop {
         if control.stop.load(Ordering::Relaxed)
             || max_periods.is_some_and(|limit| periods_processed >= limit)
@@ -1983,6 +1985,9 @@ fn linked_pro_cycle_loop(
         } else {
             None
         };
+        if let Some(readiness) = direct_readiness {
+            latency_guard.ready(control.timeline.generation(), readiness.observed_nanos);
+        }
         let read = match read_capture_samples(
             capture_pcm,
             capture_scratch,
@@ -2025,9 +2030,9 @@ fn linked_pro_cycle_loop(
         let capture_read_nanos = monotonic_nanos();
         // Observe both directions at the same phase, after capture and before
         // client publication. alsa::Status uses fixed stack storage. Sampling
-        // only every 256 cycles keeps ioctl overhead out of most Q64 cycles;
+        // at roughly 12 Hz keeps ioctl overhead out of most audio cycles;
         // any elapsed work still consumes the existing absolute deadline.
-        let sample_status = !config.event_driven || sequence.is_multiple_of(256);
+        let sample_status = !config.event_driven || latency_guard.sample_due(sequence);
         let (capture_status, playback_status_at_capture) = if sample_status {
             (
                 pcm_status_with_audio_timestamp(capture_pcm).ok(),
@@ -2079,6 +2084,20 @@ fn linked_pro_cycle_loop(
                     playback_status,
                     capture_status,
                 ));
+            if config.event_driven
+                && latency_guard.sample(
+                    monotonic_nanos(),
+                    playback_status.get_delay(),
+                    capture_status.get_delay(),
+                )
+            {
+                // This is a real duplex rebase after an observed hardware-cycle
+                // stall AND sustained added buffering, not a client miss/XRUN.
+                // Do it before publishing this capture block to any clients.
+                rebase_linked_streams(playback_pcm, capture_pcm, control, config, 0)?;
+                normalize_startup_loopback(playback_pcm, capture_pcm, config, control)?;
+                continue 'cycles;
+            }
         }
         capture_position = capture_position.wrapping_add(config.period as u64);
         control.timeline.update_capture_position(capture_position);
@@ -2324,6 +2343,9 @@ fn linked_pro_cycle_loop(
                     playback_position = playback_position.wrapping_add(write_frames as u64);
                     control.timeline.update_playback_position(playback_position);
                     if chunk == 0 {
+                        if let Some(readiness) = direct_readiness {
+                            latency_guard.completed(readiness.observed_nanos, monotonic_nanos());
+                        }
                         control
                             .timeline
                             .record_pro_playback_write(sequence, monotonic_nanos());
@@ -3902,16 +3924,29 @@ fn rebase_linked_streams(
         "stop playback stream for phase rebase",
         StreamDirection::Playback,
     )?;
-    alsa_call(
-        capture_pcm.prepare(),
-        "prepare capture stream for phase rebase",
-        StreamDirection::Capture,
-    )?;
-    alsa_call(
-        playback_pcm.prepare(),
-        "prepare playback stream for phase rebase",
-        StreamDirection::Playback,
-    )?;
+    if config.event_driven {
+        alsa_call(
+            playback_pcm.link(capture_pcm),
+            "relink direct streams for phase rebase",
+            StreamDirection::Playback,
+        )?;
+        alsa_call(
+            playback_pcm.prepare(),
+            "prepare direct streams for phase rebase",
+            StreamDirection::Playback,
+        )?;
+    } else {
+        alsa_call(
+            capture_pcm.prepare(),
+            "prepare capture stream for phase rebase",
+            StreamDirection::Capture,
+        )?;
+        alsa_call(
+            playback_pcm.prepare(),
+            "prepare playback stream for phase rebase",
+            StreamDirection::Playback,
+        )?;
+    }
 
     control.ensure_running()?;
     let written = write_playback_samples(
@@ -3929,11 +3964,13 @@ fn rebase_linked_streams(
         });
     }
     control.ensure_running()?;
-    alsa_call(
-        playback_pcm.link(capture_pcm),
-        "relink duplex streams for phase rebase",
-        StreamDirection::Playback,
-    )?;
+    if !config.event_driven {
+        alsa_call(
+            playback_pcm.link(capture_pcm),
+            "relink duplex streams for phase rebase",
+            StreamDirection::Playback,
+        )?;
+    }
     sleep_for_frames(dither_frames, config.rate);
     control.ensure_running()?;
     alsa_call(
