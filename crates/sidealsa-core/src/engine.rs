@@ -2023,13 +2023,18 @@ fn linked_pro_cycle_loop(
         }
 
         let capture_read_nanos = monotonic_nanos();
-        let (capture_status, playback_status_at_capture) = if config.event_driven {
-            (None, None)
-        } else {
+        // Observe both directions at the same phase, after capture and before
+        // client publication. alsa::Status uses fixed stack storage. Sampling
+        // only every 256 cycles keeps ioctl overhead out of most Q64 cycles;
+        // any elapsed work still consumes the existing absolute deadline.
+        let sample_status = !config.event_driven || sequence.is_multiple_of(256);
+        let (capture_status, playback_status_at_capture) = if sample_status {
             (
                 pcm_status_with_audio_timestamp(capture_pcm).ok(),
                 pcm_status_with_audio_timestamp(playback_pcm).ok(),
             )
+        } else {
+            (None, None)
         };
         let playback_delay_at_capture = if config.event_driven {
             None
@@ -2039,7 +2044,7 @@ fn linked_pro_cycle_loop(
                 .map(Status::get_delay)
                 .or_else(|| playback_pcm.delay().ok())
         };
-        if !config.event_driven
+        if sample_status
             && let Some(delay) = capture_status
                 .as_ref()
                 .map(Status::get_delay)
@@ -2049,6 +2054,20 @@ fn linked_pro_cycle_loop(
                 StreamDirection::Capture,
                 delay,
                 config.period as u64,
+            );
+        }
+        if config.event_driven
+            && let Some(status) = playback_status_at_capture.as_ref()
+        {
+            control.timeline.update_pcm_delay(
+                StreamDirection::Playback,
+                status.get_delay(),
+                config.period as u64,
+            );
+            control.timeline.update_playback_delay_breakdown(
+                status.get_delay(),
+                status.get_avail(),
+                config.buffer,
             );
         }
         if let (Some(playback_status), Some(capture_status)) =
