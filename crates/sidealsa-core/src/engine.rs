@@ -13,14 +13,13 @@ use alsa::{
     pcm::{Access, AudioTstampType, Format, HwParams, PCM, State, Status, StatusBuilder},
     poll::{self, Descriptors, pollfd},
 };
-use sidealsa_config::StartupLoopbackConfig;
+use sidealsa_config::{StartupLoopbackConfig, direct_pro_write_reserve_frames};
 use thiserror::Error;
 
 use crate::pro::{ProCaptureSink, ProPlaybackSource};
 use crate::{
-    DIRECT_MIN_PLAYBACK_QUEUE_PERIODS, DIRECT_WRITE_RESERVE_DIVISOR, HardwareConfig, HardwareStats,
-    HardwareTimeline, LINKED_PHASE_OVERHEAD_DIVISOR, Profile, RoutingError, RoutingTable,
-    SampleFormat,
+    DIRECT_MIN_PLAYBACK_QUEUE_PERIODS, HardwareConfig, HardwareStats, HardwareTimeline,
+    LINKED_PHASE_OVERHEAD_DIVISOR, Profile, RoutingError, RoutingTable, SampleFormat,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3801,12 +3800,13 @@ fn direct_pro_cutoff_nanos(
     rate: u32,
     handoff_nanos: u64,
 ) -> u64 {
-    let reserve_divisor = i64::from(DIRECT_WRITE_RESERVE_DIVISOR);
     // Keep the Q64/48k write margin (~333 us), but do not reserve a quarter
     // of a large DAW block: Q256 would otherwise lose 1.33 ms of DSP time.
     // Small periods retain their existing proportional reserve.
-    let reserve_frames = (period.saturating_add(reserve_divisor - 1) / reserve_divisor)
-        .min(i64::from(rate.div_ceil(3_000)));
+    let reserve_frames = i64::from(direct_pro_write_reserve_frames(
+        u32::try_from(period).unwrap_or(u32::MAX),
+        rate,
+    ));
     let wait_frames = readiness
         .playback_queued_frames
         .saturating_sub(reserve_frames)
@@ -4826,6 +4826,27 @@ mod tests {
                 assert_eq!(direct_linked_start_frames(period, period, queue), period);
             }
         }
+    }
+
+    #[test]
+    fn q64_automatic_handoff_does_not_expand_when_the_queue_is_fuller() {
+        let mut profile =
+            crate::Profile::from_toml(include_str!("../../../profiles/topping-e1x2.toml")).unwrap();
+        profile.device.pro_handoff_auto = true;
+        assert_eq!(profile.device.pro_handoff_nanos(), 1_000_000);
+        for queued in [64, 96, 128, 192] {
+            let ready = DirectDuplexReadiness {
+                observed_nanos: 1_000_000_000,
+                playback_queued_frames: queued,
+            };
+            assert_eq!(
+                direct_pro_cutoff_nanos(ready, 64, 48000, profile.device.pro_handoff_nanos()),
+                1_001_000_000
+            );
+        }
+        profile.device.period_size = 256;
+        profile.device.hardware_period_size = Some(256);
+        assert_eq!(profile.device.pro_handoff_nanos(), 5_000_000);
     }
 
     #[test]

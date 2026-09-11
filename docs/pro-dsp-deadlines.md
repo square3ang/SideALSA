@@ -10,7 +10,7 @@ at Q64. Both cut into the host's usable DSP time.
 
 The correction has two parts:
 
-- `pro_handoff_auto = true` uses one logical period as the handoff ceiling in
+- `pro_handoff_auto = true` uses one logical period **minus write reserve** as the handoff ceiling in
   direct, linked zero-lead mode. The real deadline remains bounded by observed
   ALSA queued frames and time already spent since that observation.
 - The write reserve is `min(ceil(Q/4), ceil(rate/3000))` frames. Q64 at 48 kHz
@@ -130,3 +130,40 @@ Host-local evidence:
 Each result directory contains per-case stats, probe callback timing, exact test
 profiles and restoration evidence. Unit tests cover automatic/manual semantics,
 fingerprints and the actual queue-bounded deadline formula.
+
+## Q64 ceiling regression and latency investigation
+
+The initial automatic implementation used a whole-period configured ceiling.
+When ALSA reported more than one period queued, Q64/48k could therefore wait
+up to 1.333 ms instead of the previous 1 ms. The corrected implementation
+subtracts the write reserve from the configured ceiling too, using the same
+reserve function as the engine's occupancy bound. This keeps Q64 at 1 ms even
+with extra queued frames; Q256 retains its nominal 5 ms DSP window.
+
+A user's approximately 13 ms report was reproduced as 671 frames / 13.979 ms
+using native PRO before restarting the hardware. With identical Q64/P64/B256
+and 128-frame startup settings:
+
+- Direct ALSA reference runs measured 323 and 329 frames (6.729 / 6.854 ms).
+- Fresh daemon runs measured 323 and 317 frames (6.729 / 6.604 ms).
+- Five deliberate 20 ms process stops each produced a genuine hardware rebase,
+  but did not reproduce the 14 ms state. Their subsequent loopback observations
+  were 323–353 frames. Some probes failed strict acceptance due to phase variation,
+  one or two native-client misses, or a lost pulse; those are not clean passes.
+- After deployment of the ceiling correction, a FIFO-46 native Q64 probe
+  measured 353 frames / 7.354 ms for 118 pulses with no misses, lost pulses or
+  hardware resets.
+- A subsequent private-Wine ASIO loopback passed both legs at 378 frames /
+  7.875 ms, 36/36 pulses per leg. A following native PRO probe measured exactly
+  the same 378 frames with no misses. The installed daemon's observed handoff
+  budget maximum was 999,521 ns, below the corrected 1 ms ceiling.
+
+The higher-latency runtime state cleared on full close/reopen **before** the
+code change. Thus the ceiling regression is confirmed and corrected, but it
+does not by itself explain the entire original 14 ms measurement. Residual
+device/transport phase variation remains: these measurements do not establish
+a permanently fixed 6–8 ms latency or prove that XRUN count caused the old state.
+The installed profile values were preserved, and PipeWire was not restarted.
+
+Evidence: `/tmp/opencode/q64-latency-szwplgeu/`,
+`/tmp/opencode/q64-xrun-k7s1oan1/`, and `/tmp/opencode/q64-asio-cpljkmo9/`.

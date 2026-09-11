@@ -484,6 +484,13 @@ fn hash_ports(hash: &mut u64, ports: &[PortConfig]) {
     }
 }
 
+/// Shared deadline arithmetic for configuration and the hardware worker.
+pub fn direct_pro_write_reserve_frames(period: u32, rate: u32) -> u32 {
+    period
+        .div_ceil(DIRECT_WRITE_RESERVE_DIVISOR)
+        .min(rate.div_ceil(3_000))
+}
+
 impl HardwareConfig {
     pub fn validate(&self) -> Result<(), ProfileError> {
         if self.name.trim().is_empty() {
@@ -683,7 +690,12 @@ impl HardwareConfig {
 
     pub fn pro_handoff_nanos(&self) -> u64 {
         if self.pro_handoff_auto && self.uses_event_driven_linked_pro() {
-            return u64::from(self.period_size) * 1_000_000_000 / u64::from(self.rate.max(1));
+            let reserve = direct_pro_write_reserve_frames(self.period_size, self.rate);
+            // Bound the configured ceiling as well as actual queue occupancy.
+            // A temporarily fuller queue must not extend Q64 beyond its
+            // established 1 ms window (or spend the next cycle's write time).
+            return u64::from(self.period_size.saturating_sub(reserve)) * 1_000_000_000
+                / u64::from(self.rate.max(1));
         }
         u64::from(self.pro_handoff_us).saturating_mul(1_000)
     }
@@ -1063,7 +1075,7 @@ mod tests {
         let mut profile = Profile::from_toml(&legacy).unwrap();
         assert!(profile.device.pro_handoff_auto);
         profile.device.period_size = 256;
-        assert_eq!(profile.device.pro_handoff_nanos(), 5_333_333);
+        assert_eq!(profile.device.pro_handoff_nanos(), 5_000_000);
         let manual = legacy.replace("[device]", "[device]\npro_handoff_auto = false");
         let profile = Profile::from_toml(&manual).unwrap();
         assert!(!profile.device.pro_handoff_auto);
@@ -1074,12 +1086,14 @@ mod tests {
     fn automatic_handoff_scales_with_period_and_manual_mode_is_preserved() {
         let mut profile = Profile::from_toml(E1X2_PROFILE).unwrap();
         profile.device.pro_handoff_auto = true;
-        for frames in [64, 128, 256, 1024] {
+        for (frames, budget) in [
+            (64, 1_000_000),
+            (128, 2_333_333),
+            (256, 5_000_000),
+            (1024, 21_000_000),
+        ] {
             profile.device.period_size = frames;
-            assert_eq!(
-                profile.device.pro_handoff_nanos(),
-                u64::from(frames) * 1_000_000_000 / 48000
-            );
+            assert_eq!(profile.device.pro_handoff_nanos(), budget);
         }
         let auto = TimingSettings::from(&profile.device);
         profile.device.pro_handoff_auto = false;

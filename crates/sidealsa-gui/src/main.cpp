@@ -286,7 +286,7 @@ private:
         proHandoffUs_ = numberBox(0, maximumInteger, QStringLiteral(" us"));
         proHandoffUs_->setToolTip(QStringLiteral("Fixed handoff ceiling. Ignored in direct zero-lead mode when Automatic PRO handoff is enabled."));
         proHandoffAuto_ = new QCheckBox(QStringLiteral("Automatic PRO handoff (scales with buffer period)"));
-        proHandoffAuto_->setToolTip(QStringLiteral("Direct zero-lead mode: allow up to one logical period, bounded by actual hardware queue and write reserve. No extra buffering. Other modes use the manual budget."));
+        proHandoffAuto_->setToolTip(QStringLiteral("Direct zero-lead mode: one logical period minus write reserve, also bounded by the actual hardware queue. Q64/48k keeps its 1 ms ceiling. No extra buffering. Other modes use the manual budget."));
         proRealtimePriority_ = optionalNumberBox(99);
         sharedLatencyPeriods_ = numberBox(0, 7, QStringLiteral(" periods"));
         sharedPlaybackRepeatOnUnderrun_ =
