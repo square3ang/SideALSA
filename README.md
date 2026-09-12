@@ -190,6 +190,9 @@ PipeWire services remain running. With `sidealsa-reconnect.service` enabled, SHA
 
 See [automatic SHARED recovery](docs/pipewire-reconnect.md) for activation, diagnostics and limitations.
 
+For Vesktop's **Entire System** capture with SideALSA Line outputs, see the
+[Vesktop screen-sharing settings](docs/vesktop-audio.md).
+
 ### Select Audio in Apps
 
 ALSA PRO applications can negotiate a one-period client buffer: with Q64,
