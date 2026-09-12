@@ -217,3 +217,44 @@ in the buffer, supported period alignment, fixed shared-ring
 limits, valid channel mappings, supported mode combinations, and OS priority
 ranges. The engine's availability-based deadline limiting still runs; removing
 the conservative preflight policy does not make the RT thread wait indefinitely.
+
+### Physical buffer alignment
+
+In direct PRO mode, hardware buffer capacity is a multiple of the **physical**
+period. It may wrap within a logical client block. For example, these timing
+fields are valid in an existing linked zero-lead profile:
+
+```toml
+[device]
+rate = 48000
+period_size = 64
+hardware_period_size = 32
+buffer_size = 160
+shared_buffer_size = 256
+playback_queue_periods = 2
+```
+
+B160 contains five P32 periods, while startup queues two Q64 blocks (128 frames).
+The existing mmap capture/playback helpers immediately continue at the start of
+the ring after a partial mapping; both pieces retain their order within one Q64
+client cycle. Ring wrap does not add a client notification or a hardware restart.
+Physical period must still divide client period, and a complete client block must
+fit in the hardware buffer. SHARED capacity is independently aligned to logical
+Q64, so B256 is valid for SHARED but B160 is not. Actual hardware geometry is
+verified against the request during ALSA open.
+
+E1x2 verification at 48 kHz, Q64/P32/B160, SHARED B256 and startup queue 2:
+
+- Native PRO ran 15,000 logical periods (20 seconds), receiving all 235 internal
+  digital-return pulses at 353 frames (7.354 ms). SHARED Line 2 concurrently
+  submitted 12,000 silent blocks with no publication failures.
+- ALSA PRO app B64 with zero prefill passed capture-first and playback-first
+  starts, each returning all 45 pulses. Capture-first delay moved from 353 to
+  378 frames; playback-first then measured 378 frames (7.875 ms).
+- PRO miss, playback/capture hardware XRUN, SHARED underrun/overrun and timeline
+  reset/generation deltas were zero throughout. These results establish streaming
+  across the physical ring boundary, not a fixed or reduced latency: the measured
+  25-frame phase change was below one logical period and was not attributed here.
+
+Evidence: `/tmp/opencode/q64-p32-b160-validation/`. The temporary daemon override
+was removed after verification and the previously selected profile restored.

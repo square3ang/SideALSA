@@ -12,7 +12,8 @@
 #include <time.h>
 
 /* Private definition: never resolve sidealsa_pro to a physical/default PCM.
- * The daemon must already be configured for Q64, 48k, 8ch and PRO buffer 256.
+ * The daemon must use Q64, 48k and 8 playback channels; this probe requests
+ * application B256 independently of the physical buffer.
  * Startup/recovery prefill is not measured as submitted benchmark periods.
  * Installed plugins may differ in prepare/start activation and poll semantics.
  * Counts describe ALSA acceptance, not delivery, latency or daemon HW XRUNs.

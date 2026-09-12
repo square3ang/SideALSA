@@ -546,6 +546,8 @@ enum ProOwnership {
 }
 
 pub struct DaemonState {
+    // Aligned-start requests awaiting RT activation: bit 0 playback, bit 1 capture.
+    pro_pair_start: Arc<AtomicU64>,
     pro_diagnostics: Arc<ProDiagnostics>,
     info: DeviceInfo,
     timeline: Arc<HardwareTimeline>,
@@ -629,6 +631,7 @@ impl DaemonState {
             )?);
         }
         Ok(Self {
+            pro_pair_start: Arc::new(AtomicU64::new(0)),
             info: device_info(profile),
             pro_diagnostics: Arc::new(ProDiagnostics::default()),
             timeline,
@@ -866,6 +869,37 @@ impl DaemonState {
             .any(|port| port.session.start(session_id, hardware_generation))
     }
 
+    pub fn start_pro_aligned(&self, session: u64) -> bool {
+        let ownership = self
+            .pro_ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ProOwnership::Split {
+            playback: p,
+            capture: c,
+            ..
+        } = *ownership
+        else {
+            return false;
+        };
+        let (bit, state) = if p == Some(session) {
+            (1, &self.pro)
+        } else if c == Some(session) {
+            (2, &self.pro_capture)
+        } else {
+            return false;
+        };
+        if state.active.load(Ordering::SeqCst) != 0 {
+            return false;
+        }
+        self.pro_pair_start.fetch_or(bit, Ordering::Release);
+        if !state.start(session, self.timeline.generation()) {
+            self.pro_pair_start.fetch_and(!bit, Ordering::Release);
+            return false;
+        }
+        true
+    }
+
     pub fn stop(&self, session_id: u64) -> bool {
         if session_id == 0 || session_id == SESSION_CLOSING {
             return false;
@@ -875,9 +909,11 @@ impl DaemonState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.pro_capture.stop(session_id) {
+            self.pro_pair_start.fetch_and(!2, Ordering::Release);
             return true;
         }
         if self.pro.stop(session_id) {
+            self.pro_pair_start.fetch_and(!1, Ordering::Release);
             return true;
         }
         self.shared.iter().any(|port| port.session.stop(session_id))
@@ -898,9 +934,11 @@ impl DaemonState {
                     playback, capture, ..
                 } => {
                     if *playback == Some(session_id) {
+                        self.pro_pair_start.fetch_and(!1, Ordering::Release);
                         *playback = None;
                     }
                     if *capture == Some(session_id) {
+                        self.pro_pair_start.fetch_and(!2, Ordering::Release);
                         *capture = None;
                     }
                     if playback.is_none() && capture.is_none() {
@@ -970,6 +1008,12 @@ impl DaemonState {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let capture = DaemonCaptureBridge {
+            pair_start: Arc::clone(&self.pro_pair_start),
+            pair_owners: [
+                Arc::clone(&self.pro.owner),
+                Arc::clone(&self.pro_capture.owner),
+            ],
+            pair_wait: [None, None],
             directional_endpoint: Arc::clone(&self.pro_capture.endpoint),
             directional_active: Arc::clone(&self.pro_capture.active),
             directional_hardware_generation: Arc::clone(
@@ -1023,6 +1067,9 @@ impl DaemonState {
 }
 
 pub struct DaemonCaptureBridge {
+    pair_start: Arc<AtomicU64>,
+    pair_owners: [Arc<AtomicU64>; 2],
+    pair_wait: [Option<(u64, u64, u64)>; 2],
     directional_endpoint: Arc<EndpointSlot>,
     directional_active: Arc<AtomicU64>,
     directional_hardware_generation: Arc<AtomicU64>,
@@ -1384,6 +1431,90 @@ impl SharedAudioPortBridge {
 }
 
 impl DaemonCaptureBridge {
+    fn activate_pair(&mut self, capture_sequence: u64, playback_sequence: u64) -> u64 {
+        if self.pair_start.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
+        // Keep both endpoint guards through clearing the pending bits. Stop/close
+        // drain these guards before resetting or reopening a lifecycle, so this
+        // activation cannot clear a request belonging to a replacement session.
+        let p = self.pro_endpoint.load();
+        let c = self.directional_endpoint.load();
+        let generation = self.timeline.generation();
+        let active = [
+            self.pro_active.load(Ordering::SeqCst),
+            self.directional_active.load(Ordering::SeqCst),
+        ];
+        let lifecycle_hardware = [
+            self.pro_hardware_generation.load(Ordering::Acquire),
+            self.directional_hardware_generation.load(Ordering::Acquire),
+        ];
+        let mask = self.pair_start.load(Ordering::Acquire);
+        let endpoints = [&*p, &*c];
+        let eligible = std::array::from_fn::<_, 2, _>(|i| {
+            mask & (1 << i) != 0
+                && active[i] != 0
+                && active[i] == endpoints[i].session_id
+                && lifecycle_hardware[i] == generation
+        });
+        let mut activated = 0;
+        for i in 0..2 {
+            let bit = 1 << i;
+            if mask & bit == 0 {
+                self.pair_wait[i] = None;
+                continue;
+            }
+            let endpoint = endpoints[i];
+            endpoint.region.set_hardware_generation(generation);
+            if !eligible[i] {
+                if i == 0 {
+                    endpoint.events.notify_playback();
+                } else {
+                    endpoint.events.notify_capture();
+                }
+                continue;
+            }
+            let peer_owner = self.pair_owners[i ^ 1].load(Ordering::Acquire);
+            if !eligible[i ^ 1]
+                && active[i ^ 1] == 0
+                && peer_owner != 0
+                && peer_owner != SESSION_CLOSING
+            {
+                let life = endpoint.region.lifecycle_generation();
+                match self.pair_wait[i] {
+                    Some((id, previous_life, first))
+                        if id == active[i]
+                            && previous_life == life
+                            && first != capture_sequence => {}
+                    _ => {
+                        self.pair_wait[i] = Some((active[i], life, capture_sequence));
+                        continue;
+                    }
+                }
+            }
+            let sequence = if i == 0 {
+                playback_sequence
+            } else {
+                capture_sequence
+            };
+            endpoint.region.set_cycle_sequence(sequence);
+            endpoint.region.establish_activation(sequence);
+            if i == 1 {
+                endpoint.region.set_client_state(SHARED_CLIENT_RUNNING);
+            }
+            self.pair_wait[i] = None;
+            activated |= bit;
+        }
+        self.pair_start.fetch_and(!activated, Ordering::Release);
+        if activated & 1 != 0 {
+            p.events.notify_playback();
+        }
+        if activated & 2 != 0 {
+            c.events.notify_capture();
+        }
+        activated
+    }
+
     fn publish_pro_capture(&mut self, playback_sequence: u64, capture: &[i32]) {
         let endpoint = self.pro_endpoint.load();
         endpoint
@@ -1391,6 +1522,11 @@ impl DaemonCaptureBridge {
             .set_hardware_generation(self.timeline.generation());
         endpoint.region.set_cycle_sequence(playback_sequence);
         let session_id = self.pro_active.load(Ordering::SeqCst);
+        // Check after active: seeing a newly started session must also observe
+        // the preceding pair-start barrier, even if this cycle entered earlier.
+        if self.pair_start.load(Ordering::Acquire) & 1 != 0 {
+            return;
+        }
         if endpoint.info().capture_channels == 0 {
             if session_id != 0 && endpoint.session_id == session_id {
                 if self.pro_hardware_generation.load(Ordering::Acquire)
@@ -1433,6 +1569,9 @@ impl DaemonCaptureBridge {
         endpoint.region.set_hardware_generation(hardware_generation);
         endpoint.region.set_cycle_sequence(sequence);
         let session_id = self.directional_active.load(Ordering::SeqCst);
+        if self.pair_start.load(Ordering::Acquire) & 2 != 0 {
+            return;
+        }
         if session_id == 0
             || endpoint.session_id != session_id
             || endpoint.region.client_state() == SHARED_CLIENT_IDLE
@@ -1459,8 +1598,13 @@ impl DaemonCaptureBridge {
 
 impl ProCaptureSink for DaemonCaptureBridge {
     fn process_capture(&mut self, sequence: u64, capture: &[i32]) {
-        self.publish_pro_capture(sequence, capture);
-        self.publish_directional_capture(sequence, capture);
+        let activated = self.activate_pair(sequence, sequence);
+        if activated & 1 == 0 {
+            self.publish_pro_capture(sequence, capture);
+        }
+        if activated & 2 == 0 {
+            self.publish_directional_capture(sequence, capture);
+        }
         self.publish_shared_capture(sequence, capture);
     }
 
@@ -1470,8 +1614,13 @@ impl ProCaptureSink for DaemonCaptureBridge {
         playback_sequence: u64,
         capture: &[i32],
     ) {
-        self.publish_directional_capture(hardware_sequence, capture);
-        self.publish_pro_capture(playback_sequence, capture);
+        let activated = self.activate_pair(hardware_sequence, playback_sequence);
+        if activated & 2 == 0 {
+            self.publish_directional_capture(hardware_sequence, capture);
+        }
+        if activated & 1 == 0 {
+            self.publish_pro_capture(playback_sequence, capture);
+        }
     }
 
     fn process_deferred_capture(&mut self, hardware_sequence: u64, capture: &[i32]) {
@@ -1926,6 +2075,166 @@ mod tests {
         if endpoint.region.info().playback_channels == 0 {
             endpoint.region.set_client_state(SHARED_CLIENT_RUNNING);
         }
+    }
+
+    #[test]
+    fn aligned_pro_start_coalesces_both_orders_without_losing_capture() {
+        for first_capture in [false, true] {
+            let state = DaemonState::new(
+                &Profile::from_toml(PROFILE).unwrap(),
+                Arc::new(HardwareTimeline::default()),
+            )
+            .unwrap();
+            let p = state
+                .open_pro_direction(10, 20, [1, 2], PortDirection::Playback)
+                .unwrap()
+                .unwrap()
+                .0;
+            let c = state
+                .open_pro_direction(10, 20, [1, 2], PortDirection::Capture)
+                .unwrap()
+                .unwrap()
+                .0;
+            let mut bridge = state.bridge();
+            assert!(state.start_pro_aligned(if first_capture { c } else { p }));
+            bridge.process(100, &[1; 8], &mut [0; 8]);
+            assert!(!state.pro.current().region.activation_ready());
+            assert!(!state.pro_capture.current().region.activation_ready());
+            assert!(state.start_pro_aligned(if first_capture { p } else { c }));
+            bridge.process(101, &[2; 8], &mut [0; 8]);
+            assert_eq!(state.pro.current().region.start_sequence(), 101);
+            assert_eq!(state.pro_capture.current().region.start_sequence(), 101);
+            assert_eq!(state.pro_capture.current().region.ready_capture_slots(), 0);
+            bridge.process(102, &[3; 8], &mut [0; 8]);
+            let mut samples = [0; 8];
+            assert_eq!(
+                state
+                    .pro_capture
+                    .current()
+                    .region
+                    .try_client_read_capture(&mut 0, &mut samples),
+                Some(102)
+            );
+            assert_eq!(samples, [3; 8]);
+            assert!(!state.start_pro_aligned(p));
+            assert!(state.stop(p));
+            bridge.process(103, &[4; 8], &mut [0; 8]);
+            assert_eq!(state.pro_capture.current().region.ready_capture_slots(), 1);
+        }
+    }
+
+    #[test]
+    fn aligned_capture_starts_alone_after_one_cycle_and_peer_cannot_reset_it() {
+        let state = DaemonState::new(
+            &Profile::from_toml(PROFILE).unwrap(),
+            Arc::new(HardwareTimeline::default()),
+        )
+        .unwrap();
+        let p = state
+            .open_pro_direction(10, 20, [1, 2], PortDirection::Playback)
+            .unwrap()
+            .unwrap()
+            .0;
+        let c = state
+            .open_pro_direction(10, 20, [1, 2], PortDirection::Capture)
+            .unwrap()
+            .unwrap()
+            .0;
+        assert!(!state.start_pro_aligned(999));
+        let mut bridge = state.bridge();
+        assert!(state.start_pro_aligned(c));
+        bridge.process(10, &[1; 8], &mut [0; 8]);
+        bridge.process(11, &[2; 8], &mut [0; 8]);
+        assert_eq!(state.pro_capture.current().region.start_sequence(), 11);
+        bridge.process(12, &[3; 8], &mut [0; 8]);
+        assert!(state.start_pro_aligned(p));
+        bridge.process(13, &[4; 8], &mut [0; 8]);
+        assert_eq!(state.pro_capture.current().region.start_sequence(), 11);
+        assert_eq!(state.pro.current().region.start_sequence(), 13);
+        assert_eq!(state.pro_capture.current().region.ready_capture_slots(), 2);
+        assert!(state.stop(c));
+        assert!(state.stop(p));
+        assert!(state.start_pro_aligned(c));
+        bridge.process(20, &[0; 8], &mut [0; 8]);
+        assert!(!state.pro_capture.current().region.activation_ready());
+        bridge.process(21, &[0; 8], &mut [0; 8]);
+        assert_eq!(state.pro_capture.current().region.start_sequence(), 21);
+    }
+
+    #[test]
+    fn pending_aligned_start_cancels_on_stop_close_and_requires_current_hardware() {
+        let state = DaemonState::new(
+            &Profile::from_toml(PROFILE).unwrap(),
+            Arc::new(HardwareTimeline::default()),
+        )
+        .unwrap();
+        let p = state
+            .open_pro_direction(10, 20, [1, 2], PortDirection::Playback)
+            .unwrap()
+            .unwrap()
+            .0;
+        let c = state
+            .open_pro_direction(10, 20, [1, 2], PortDirection::Capture)
+            .unwrap()
+            .unwrap()
+            .0;
+        let mut bridge = state.bridge();
+        assert!(state.start_pro_aligned(p));
+        bridge.process(100, &[0; 8], &mut [0; 8]);
+        assert!(!state.pro.current().region.activation_ready());
+        assert!(state.stop(p));
+        bridge.process(101, &[0; 8], &mut [0; 8]);
+        assert!(!state.pro.current().region.activation_ready());
+        // A normal start after cancellation must not inherit the pairing wait.
+        assert!(state.start(p));
+        bridge.process(102, &[0; 8], &mut [0; 8]);
+        assert_eq!(state.pro.current().region.start_sequence(), 102);
+        assert!(state.stop(p));
+
+        assert!(state.start_pro_aligned(c));
+        bridge.process(103, &[0; 8], &mut [0; 8]);
+        assert!(!state.pro_capture.current().region.activation_ready());
+        assert!(state.close(c));
+        let new_c = state
+            .open_pro_direction(10, 20, [1, 2], PortDirection::Capture)
+            .unwrap()
+            .unwrap()
+            .0;
+        bridge.process(104, &[0; 8], &mut [0; 8]);
+        assert!(!state.pro_capture.current().region.activation_ready());
+        assert!(!state.start_pro_aligned(c));
+        assert!(state.start_pro_aligned(new_c));
+        state
+            .pro_capture
+            .lifecycle_hardware_generation
+            .store(u64::MAX, Ordering::Release);
+        for sequence in [105, 106] {
+            bridge.process(sequence, &[0; 8], &mut [0; 8]);
+            assert!(!state.pro_capture.current().region.activation_ready());
+            assert_eq!(state.pro_capture.current().region.ready_capture_slots(), 0);
+        }
+        assert!(state.stop(new_c));
+        assert!(state.start_pro_aligned(new_c));
+        bridge.process(107, &[0; 8], &mut [0; 8]);
+        assert!(!state.pro_capture.current().region.activation_ready());
+        bridge.process(108, &[0; 8], &mut [0; 8]);
+        assert_eq!(state.pro_capture.current().region.start_sequence(), 108);
+        bridge.process(109, &[42; 8], &mut [0; 8]);
+        let mut samples = [0; 8];
+        assert_eq!(
+            state
+                .pro_capture
+                .current()
+                .region
+                .try_client_read_capture(&mut 0, &mut samples),
+            Some(109)
+        );
+        assert_eq!(samples, [42; 8]);
+        let stats = state.timeline.snapshot();
+        assert_eq!(stats.generation, 0);
+        assert_eq!(stats.pro_deadline_misses, 0);
+        assert_eq!(stats.hw_playback_xruns, 0);
+        assert_eq!(stats.hw_capture_xruns, 0);
     }
 
     #[test]

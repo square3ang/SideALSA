@@ -615,10 +615,11 @@ The engine now permits a smaller physical ALSA period under the whole-Q64
 poll-driven algorithm, independently of timer-scheduled packet staging. Both
 directions wait for a full logical block (`avail_min=64`); playback still writes
 Q64, primes Q128, reserves Q16 for writing, and caps the client handoff at 1 ms.
-Direct-mode buffer capacity must be a multiple of the logical period, avoiding
-partial-ring-wrap waits at the logical notification threshold. This is an
-optional transport configuration; reference adoption was deferred during these
-experiments.
+At the time of these experiments, direct-mode buffer capacity was restricted to
+multiples of the logical period. That restriction has since been narrowed to
+physical-period alignment: the mmap helpers immediately continue partial ring
+wraps within one logical transfer. See [physical buffer alignment](device-profiles.md#physical-buffer-alignment).
+Reference adoption of P32 was deferred during these experiments.
 
 | Experiment, all B256/Q128-start | P64 results (frames) | P32 results (frames) |
 | --- | --- | --- |

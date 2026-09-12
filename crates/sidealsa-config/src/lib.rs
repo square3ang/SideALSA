@@ -523,10 +523,13 @@ impl HardwareConfig {
                 "buffer_size must not be smaller than period_size".into(),
             ));
         }
-        if self.uses_event_driven_linked_pro() && !self.buffer_size.is_multiple_of(self.period_size)
+        // Hardware rings align to physical periods. The mmap transfer helpers
+        // finish a logical block across a ring wrap before publishing a cycle.
+        if self.uses_event_driven_linked_pro()
+            && !self.buffer_size.is_multiple_of(hardware_period_size)
         {
             return Err(ProfileError::Invalid(
-                "direct whole-period PRO requires buffer_size to be a multiple of period_size"
+                "direct whole-period PRO requires buffer_size to be a multiple of hardware_period_size"
                     .into(),
             ));
         }
@@ -1427,7 +1430,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_transport_allows_user_budgets_but_requires_aligned_ring() {
+    fn direct_transport_allows_user_budgets_and_physically_aligned_ring() {
         let text = E1X2_PROFILE.replace("hardware_period_size = 64", "hardware_period_size = 32");
         let profile =
             Profile::from_toml(&text).expect("Q64 client with P32 transport should parse");
@@ -1442,14 +1445,74 @@ mod tests {
             Profile::from_toml(&text.replace("pro_handoff_us = 1000", "pro_handoff_us = 1100"))
                 .is_ok()
         );
-        let error = Profile::from_toml(&text.replace("buffer_size = 256", "buffer_size = 224"))
-            .expect_err("ring wraps must remain aligned to full client blocks");
-        assert!(error.to_string().contains("multiple of period_size"));
+        for buffer in [96, 160, 224] {
+            let wrapped = text.replace("\nbuffer_size = 256", &format!("\nbuffer_size = {buffer}"));
+            let profile = Profile::from_toml(&wrapped)
+                .expect("a hardware ring may wrap inside a logical client block");
+            assert_eq!(profile.device.buffer_size, buffer);
+            assert_eq!(profile.device.period_size, 64);
+        }
+        let error = Profile::from_toml(&text.replace("\nbuffer_size = 256", "\nbuffer_size = 144"))
+            .expect_err("direct hardware rings still require physical-period alignment");
+        assert!(
+            error
+                .to_string()
+                .contains("multiple of hardware_period_size")
+        );
         assert!(
             Profile::from_toml(
                 &text.replace("playback_queue_periods = 2", "playback_queue_periods = 1")
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn timing_edit_round_trips_q64_p32_b160_without_rounding_client_or_shared_geometry() {
+        let mut document = ProfileDocument::from_toml(E1X2_PROFILE).unwrap();
+        let mut timing = document.timing();
+        timing.rate = 48_000;
+        timing.period_size = 64;
+        timing.hardware_period_size = Some(32);
+        timing.buffer_size = 160;
+        timing.shared_buffer_size = Some(256);
+        timing.playback_queue_periods = Some(2);
+        document.apply_timing(&timing).unwrap();
+        let mut reparsed = ProfileDocument::from_toml(&document.to_toml()).unwrap();
+        assert_eq!(reparsed.timing(), timing);
+        assert_eq!(
+            reparsed
+                .profile()
+                .device
+                .effective_pro_output_latency_frames(),
+            64
+        );
+        assert_eq!(reparsed.profile().device.pro_handoff_nanos(), 1_000_000);
+        assert_eq!(
+            reparsed.profile().device.effective_shared_buffer_size(),
+            256
+        );
+
+        // Automatic SHARED capacity still rounds to full logical periods.
+        timing.shared_buffer_size = None;
+        reparsed.apply_timing(&timing).unwrap();
+        assert_eq!(
+            reparsed.profile().device.effective_shared_buffer_size(),
+            192
+        );
+
+        // A smaller hardware period does not relax logical SHARED alignment.
+        timing.shared_buffer_size = Some(160);
+        assert!(
+            reparsed
+                .apply_timing(&timing)
+                .unwrap_err()
+                .to_string()
+                .contains("shared_buffer_size must be a multiple of period_size")
+        );
+        assert_eq!(
+            reparsed.profile().device.effective_shared_buffer_size(),
+            192
         );
     }
 

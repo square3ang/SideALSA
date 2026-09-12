@@ -93,7 +93,7 @@ fn real_libasound_separate_pro_handles_both_orders() {
     assert!(!symbol.is_null());
     let probe: Probe = unsafe { std::mem::transmute(symbol) };
 
-    for capture_first in [0, 1] {
+    for capture_first in [0, 1, 2, 3] {
         let path = std::env::temp_dir().join(format!(
             "sidealsa-split-{}-{capture_first}.sock",
             std::process::id()

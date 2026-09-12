@@ -56,7 +56,16 @@ playback retains its existing FIFO sequence and expiry rules.
 With an older daemon the plugin falls back to the existing classic single-open
 behavior. Separate opens therefore require an updated daemon and plugin. Do not
 assume unrelated processes can split the same PRO reservation, or that
-`snd_pcm_link()` is implemented for the two ioplug handles; starts are independent.
+`snd_pcm_link()` is implemented for the two ioplug handles.
+
+### Start alignment
+
+The daemon advertises `FEATURE_PRO_ALIGNED_START` (bit 3). `StartProAligned`
+(request opcode 10) starts only the caller's directional PRO session, allowing
+starts within one logical cycle to share an activation boundary. An unstarted
+peer never blocks hardware or an independent direction indefinitely. Playback
+and capture sequence domains remain distinct when PRO lead is nonzero.
+See [ALSA PRO buffers](alsa-pro-buffers.md) for negotiation and startup semantics.
 
 ## ASIO and RTL-Style Hosts
 

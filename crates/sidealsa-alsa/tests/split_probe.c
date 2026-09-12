@@ -16,7 +16,7 @@ typedef void (*owner_check_t)(const char *, int);
 #define CHECK(expr) do { if (!(expr)) { fprintf(stderr, "probe line %d: %s\n", \
     __LINE__, #expr); return __LINE__; } } while (0)
 
-static int configure(snd_pcm_t *pcm)
+static int configure(snd_pcm_t *pcm, snd_pcm_uframes_t buffer)
 {
     snd_pcm_hw_params_t *hw;
     snd_pcm_hw_params_alloca(&hw);
@@ -26,7 +26,10 @@ static int configure(snd_pcm_t *pcm)
     CHECK(snd_pcm_hw_params_set_channels(pcm, hw, 1) == 0);
     CHECK(snd_pcm_hw_params_set_rate(pcm, hw, 48000, 0) == 0);
     CHECK(snd_pcm_hw_params_set_period_size(pcm, hw, 64, 0) == 0);
-    CHECK(snd_pcm_hw_params_set_buffer_size(pcm, hw, 128) == 0);
+    snd_pcm_uframes_t minimum, maximum;
+    CHECK(snd_pcm_hw_params_get_buffer_size_min(hw, &minimum) == 0 && minimum == 64);
+    CHECK(snd_pcm_hw_params_get_buffer_size_max(hw, &maximum) == 0 && maximum == 512);
+    CHECK(snd_pcm_hw_params_set_buffer_size(pcm, hw, buffer) == 0);
     CHECK(snd_pcm_hw_params(pcm, hw) == 0);
     snd_pcm_sw_params_t *sw;
     snd_pcm_sw_params_alloca(&sw);
@@ -54,7 +57,8 @@ int sidealsa_split_probe(plugin_open_t open_plugin, const char *socket,
     CHECK(snd_config_top(&conf) == 0);
     CHECK(snd_config_imake_string(&node, "socket", socket) == 0);
     CHECK(snd_config_add(conf, node) == 0);
-    int first = capture_first ? 1 : 0;
+    int first = capture_first & 1;
+    snd_pcm_uframes_t buffer = capture_first & 2 ? 64 : 128;
     CHECK(open_plugin(&pcm[first], "sidealsa_pro", conf, conf,
                       first, SND_PCM_NONBLOCK) == 0);
     if (other_owner)
@@ -64,7 +68,7 @@ int sidealsa_split_probe(plugin_open_t open_plugin, const char *socket,
     for (int i = 0; i < 2; ++i) {
         CHECK(open_plugin(&duplicate, "sidealsa_pro", conf, conf,
                           i, SND_PCM_NONBLOCK) == -EBUSY);
-        CHECK(configure(pcm[i]) == 0);
+        CHECK(configure(pcm[i], buffer) == 0);
     }
     struct pollfd p[2], c[2];
     CHECK(snd_pcm_poll_descriptors(pcm[0], p, 2) == 2);
@@ -93,7 +97,9 @@ int sidealsa_split_probe(plugin_open_t open_plugin, const char *socket,
     if (first == 0)
         CHECK(read_prefix(pcm[1], 116) == 0);
     else
-        CHECK(snd_pcm_writei(pcm[0], output, 64) == 64);
+        /* This mock does not consume the current playback block until Stop.
+         * A one-period client ring must therefore report backpressure. */
+        CHECK(snd_pcm_writei(pcm[0], output, 64) == (buffer == 64 ? -EAGAIN : 64));
     CHECK(snd_pcm_close(pcm[1 - first]) == 0);
     snd_config_delete(conf);
     return 0;

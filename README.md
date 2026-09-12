@@ -192,6 +192,12 @@ See [automatic SHARED recovery](docs/pipewire-reconnect.md) for activation, diag
 
 ### Select Audio in Apps
 
+ALSA PRO applications can negotiate a one-period client buffer: with Q64,
+**app B64 is supported while hardware remains B256**. Directional starts within
+one logical cycle are aligned, and a capture-driven zero-prefill startup can submit in
+the same cycle. Applications that prefill audio retain that buffering latency.
+See [ALSA PRO buffer setup](docs/alsa-pro-buffers.md).
+
 Choose the appropriate SideALSA port in your desktop sound settings or your app's input/output selector.
 The E1x2 ports are listed below; other profiles generate ports from their own definitions.
 

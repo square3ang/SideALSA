@@ -1,5 +1,13 @@
 # ALSA PRO Playback Optimization
 
+Current behavior supports independent PRO application buffers and aligned starts:
+see [ALSA PRO buffers](alsa-pro-buffers.md). The original B256-only behavior below
+is retained as measurement history.
+
+For the later measured buffering/startup latency comparison, see
+[ALSA PRO ioplug latency investigation](alsa-pro-latency.md). The historical
+silent deadline tests below did not measure end-to-end latency.
+
 This change targets playback-only ALSA handles opened on `sidealsa_pro`. It does
 not add the ASIO spin strategy to ALSA, change an application's scheduling policy,
 increase its FIFO, or change Q64/P32, zero lead, the daemon queue or write reserve.

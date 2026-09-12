@@ -20,6 +20,8 @@ extern int sidealsa_stream_start(sidealsa_stream_t *stream);
 extern int sidealsa_stream_stop(sidealsa_stream_t *stream);
 extern int sidealsa_stream_prepare(sidealsa_stream_t *stream);
 extern int sidealsa_stream_set_nonblock(sidealsa_stream_t *stream, int nonblock);
+extern int sidealsa_stream_set_buffer_size(sidealsa_stream_t *stream, size_t frames);
+extern int sidealsa_stream_pump_pro_playback(sidealsa_stream_t *stream);
 extern int sidealsa_stream_drain(sidealsa_stream_t *stream);
 extern ssize_t sidealsa_stream_transfer(sidealsa_stream_t *stream,
 					 const snd_pcm_channel_area_t *areas,
@@ -150,7 +152,9 @@ static snd_pcm_sframes_t sidealsa_transfer(snd_pcm_ioplug_t *io,
 static snd_pcm_sframes_t sidealsa_pointer(snd_pcm_ioplug_t *io)
 {
 	sidealsa_pcm_t *pcm = io->private_data;
-	int result = sidealsa_capture_sync(io);
+	int result = sidealsa_stream_pump_pro_playback(pcm->stream);
+	if (result >= 0)
+		result = sidealsa_capture_sync(io);
 	if (result < 0)
 		return result;
 	uint64_t position = sidealsa_stream_position(pcm->stream);
@@ -228,18 +232,17 @@ static int sidealsa_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params)
 	int valid_buffer;
 
 	(void)params;
-	valid_buffer = pcm->shared ?
+	valid_buffer =
 		io->buffer_size >= pcm->minimum_buffer_size &&
 		io->buffer_size <= pcm->buffer_size &&
-		io->buffer_size % pcm->period_size == 0 :
-		io->buffer_size == pcm->buffer_size;
+		io->buffer_size % pcm->period_size == 0;
 	if (io->format != SND_PCM_FORMAT_S32_LE ||
 	    io->channels != pcm->channels ||
 	    io->rate != pcm->rate ||
 	    io->period_size != pcm->period_size ||
 	    !valid_buffer)
 		return -EINVAL;
-	return 0;
+	return sidealsa_stream_set_buffer_size(pcm->stream, io->buffer_size);
 }
 
 static int sidealsa_set_constraints(sidealsa_pcm_t *pcm)
@@ -277,13 +280,13 @@ static int sidealsa_set_constraints(sidealsa_pcm_t *pcm)
 		return result;
 	result = snd_pcm_ioplug_set_param_minmax(
 		io, SND_PCM_IOPLUG_HW_BUFFER_BYTES,
-		pcm->shared ? pcm->minimum_buffer_size * pcm->channels * 4 : buffer_bytes,
+		pcm->minimum_buffer_size * pcm->channels * 4,
 		buffer_bytes);
 	if (result < 0)
 		return result;
 	return snd_pcm_ioplug_set_param_minmax(
 		io, SND_PCM_IOPLUG_HW_PERIODS,
-		pcm->shared ? pcm->minimum_buffer_size / pcm->period_size : periods,
+		pcm->minimum_buffer_size / pcm->period_size,
 		periods);
 }
 

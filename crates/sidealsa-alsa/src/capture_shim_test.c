@@ -37,6 +37,8 @@ ssize_t sidealsa_stream_transfer(sidealsa_stream_t *s,
 uint64_t sidealsa_stream_position(const sidealsa_stream_t *s) { return s->position; }
 int sidealsa_stream_prepare(sidealsa_stream_t *s) { s->sync_result = 0; return 0; }
 int sidealsa_stream_set_nonblock(sidealsa_stream_t *s, int n) { (void)s; (void)n; return 0; }
+int sidealsa_stream_set_buffer_size(sidealsa_stream_t *s, size_t n) { (void)s; (void)n; return 0; }
+int sidealsa_stream_pump_pro_playback(sidealsa_stream_t *s) { (void)s; return 0; }
 int sidealsa_stream_start(sidealsa_stream_t *s) { (void)s; return 0; }
 int sidealsa_stream_stop(sidealsa_stream_t *s) { (void)s; return 0; }
 int sidealsa_stream_drain(sidealsa_stream_t *s) { (void)s; return 0; }

@@ -101,6 +101,55 @@ fn unrelated_process_cannot_join() {
 }
 
 #[test]
+fn aligned_start_uses_one_hardware_boundary_and_keeps_sequence_domains() {
+    for capture_first in [false, true] {
+        let server = Server::new();
+        let mut input = server
+            .connect()
+            .open_pro_direction(PortDirection::Capture)
+            .unwrap();
+        let mut output = server
+            .connect()
+            .open_pro_direction(PortDirection::Playback)
+            .unwrap();
+        assert!(input.supports_aligned_pro_start());
+        assert!(output.supports_aligned_pro_start());
+        let (mut capture, mut playback) = server.state.bridges();
+        if capture_first {
+            input.start_aligned_pro().unwrap();
+        } else {
+            output.start_aligned_pro().unwrap();
+        }
+        playback.prepare_playback(10);
+        capture.process_capture_for_playback(9, 10, &[0; 8]);
+        assert_eq!(input.activation_sequence(), None);
+        assert_eq!(output.activation_sequence(), None);
+        if capture_first {
+            output.start_aligned_pro().unwrap();
+        } else {
+            input.start_aligned_pro().unwrap();
+        }
+        playback.prepare_playback(11);
+        capture.process_capture_for_playback(10, 11, &[0; 8]);
+        assert_eq!(input.activation_sequence(), Some(10));
+        assert_eq!(output.activation_sequence(), Some(11));
+        playback.prepare_playback(12);
+        capture.process_capture_for_playback(11, 12, &[23; 8]);
+        assert_eq!(input.wait_period(Duration::ZERO).unwrap(), 11);
+        assert_eq!(output.wait_pro_playback_period(Duration::ZERO).unwrap(), 12);
+        let mut samples = [0; 8];
+        assert_eq!(input.capture_buffer(&mut samples).unwrap(), Some(11));
+        assert_eq!(samples, [23; 8]);
+        assert!(output.submit_playback(12, &[29; 8]).unwrap());
+        let mut rendered = [0; 8];
+        playback.process_playback_before(12, u64::MAX, &mut rendered);
+        assert_eq!(rendered, [29; 8]);
+        input.close().unwrap();
+        output.close().unwrap();
+    }
+}
+
+#[test]
 fn capture_and_playback_keep_their_distinct_sequence_domains() {
     let server = Server::new();
     let mut input = server

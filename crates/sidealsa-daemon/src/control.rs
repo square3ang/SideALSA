@@ -184,7 +184,10 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
                     (
                         Response::Hello {
                             version: PROTOCOL_VERSION,
-                            features: FEATURE_PRO | FEATURE_SHARED | FEATURE_PRO_DIRECTIONS,
+                            features: FEATURE_PRO
+                                | FEATURE_SHARED
+                                | FEATURE_PRO_DIRECTIONS
+                                | sidealsa_protocol::FEATURE_PRO_ALIGNED_START,
                         },
                         Vec::new(),
                     )
@@ -300,6 +303,13 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
             }
             Request::Start { session_id } => {
                 if session == Some(session_id) && state.start(session_id) {
+                    (Response::Ack, Vec::new())
+                } else {
+                    (not_owner(), Vec::new())
+                }
+            }
+            Request::StartProAligned { session_id } => {
+                if session == Some(session_id) && state.start_pro_aligned(session_id) {
                     (Response::Ack, Vec::new())
                 } else {
                     (not_owner(), Vec::new())
@@ -612,6 +622,7 @@ mod tests {
         }
         for forbidden in [
             Request::Start { session_id: c_id },
+            Request::StartProAligned { session_id: c_id },
             Request::Stop { session_id: c_id },
             Request::Close { session_id: c_id },
         ] {

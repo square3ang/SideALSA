@@ -12,6 +12,7 @@ pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 pub const FEATURE_PRO: u32 = 1 << 0;
 pub const FEATURE_SHARED: u32 = 1 << 1;
 pub const FEATURE_PRO_DIRECTIONS: u32 = 1 << 2;
+pub const FEATURE_PRO_ALIGNED_START: u32 = 1 << 3;
 
 pub const SHARED_MAGIC: u32 = u32::from_le_bytes(*b"SASH");
 pub const SHARED_VERSION: u16 = 9;
@@ -43,6 +44,9 @@ pub enum Request {
         port_id: String,
     },
     Start {
+        session_id: u64,
+    },
+    StartProAligned {
         session_id: u64,
     },
     Stop {
@@ -223,6 +227,7 @@ enum RequestCode {
     Close = 7,
     GetStats = 8,
     OpenProDirection = 9,
+    StartProAligned = 10,
 }
 
 impl TryFrom<u16> for RequestCode {
@@ -239,6 +244,7 @@ impl TryFrom<u16> for RequestCode {
             7 => Ok(Self::Close),
             8 => Ok(Self::GetStats),
             9 => Ok(Self::OpenProDirection),
+            10 => Ok(Self::StartProAligned),
             _ => Err(ProtocolError::UnknownRequest(value)),
         }
     }
@@ -450,6 +456,10 @@ fn encode_request_payload(request: &Request) -> Result<(RequestCode, Vec<u8>), P
             put_u64(&mut payload, *session_id);
             RequestCode::Start
         }
+        Request::StartProAligned { session_id } => {
+            put_u64(&mut payload, *session_id);
+            RequestCode::StartProAligned
+        }
         Request::Stop { session_id } => {
             put_u64(&mut payload, *session_id);
             RequestCode::Stop
@@ -479,6 +489,9 @@ fn decode_request_payload(code: RequestCode, payload: &[u8]) -> Result<Request, 
             port_id: decoder.string()?,
         },
         RequestCode::Start => Request::Start {
+            session_id: decoder.u64()?,
+        },
+        RequestCode::StartProAligned => Request::StartProAligned {
             session_id: decoder.u64()?,
         },
         RequestCode::Stop => Request::Stop {
@@ -1130,6 +1143,16 @@ pub fn shared_slot_header_alignment() -> usize {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn aligned_start_is_additive_and_rejects_truncated_payloads() {
+        let request = Request::StartProAligned { session_id: 17 };
+        let bytes = encode_request(&request).unwrap();
+        assert_eq!(&bytes[6..8], &10_u16.to_le_bytes());
+        assert_eq!(decode_request(&bytes).unwrap(), request);
+        assert!(decode_request(&bytes[..bytes.len() - 1]).is_err());
+        assert_eq!(FEATURE_PRO_ALIGNED_START, 8);
+    }
 
     #[test]
     fn directional_pro_round_trips_without_changing_classic_wire() {

@@ -283,6 +283,8 @@ impl SideAlsaClient {
             AudioStream::from_parts(control, session_id, StreamMode::Pro, shared, fds)?;
         stream.pro_direction = Some(direction);
         stream.creator_pid = creator_pid;
+        stream.aligned_start_supported =
+            self.features & sidealsa_protocol::FEATURE_PRO_ALIGNED_START != 0;
         Ok(stream)
     }
 
@@ -318,6 +320,7 @@ pub struct AudioStream {
     session_id: u64,
     mode: StreamMode,
     pro_direction: Option<PortDirection>,
+    aligned_start_supported: bool,
     creator_pid: u32,
     info: SharedRegionInfo,
     region: SharedRegion,
@@ -359,6 +362,7 @@ impl AudioStream {
             session_id,
             mode,
             pro_direction: None,
+            aligned_start_supported: false,
             creator_pid: std::process::id(),
             info,
             region,
@@ -416,6 +420,23 @@ impl AudioStream {
             .then(|| self.region.start_sequence())
     }
 
+    pub fn supports_aligned_pro_start(&self) -> bool {
+        self.aligned_start_supported
+    }
+
+    /// Start this directional endpoint with a one-logical-cycle pairing window.
+    /// A sibling started in that window shares its activation boundary; otherwise
+    /// this endpoint starts independently. Never waits for an unstarted peer.
+    pub fn start_aligned_pro(&mut self) -> Result<(), ClientError> {
+        self.ensure_open()?;
+        if !self.aligned_start_supported {
+            return Err(ClientError::Unsupported);
+        }
+        self.start_with_request(Request::StartProAligned {
+            session_id: self.session_id,
+        })
+    }
+
     pub fn record_realtime_failure(&self) {
         if self.inherited_direction() {
             return;
@@ -446,6 +467,12 @@ impl AudioStream {
     }
 
     pub fn start(&mut self) -> Result<(), ClientError> {
+        self.start_with_request(Request::Start {
+            session_id: self.session_id,
+        })
+    }
+
+    fn start_with_request(&mut self, request: Request) -> Result<(), ClientError> {
         self.ensure_open()?;
         if self.started {
             return Ok(());
@@ -460,9 +487,7 @@ impl AudioStream {
         self.capture_event.drain();
         self.playback_event.drain();
         self.playback_ready_event.drain();
-        match self.control_request(Request::Start {
-            session_id: self.session_id,
-        })? {
+        match self.control_request(request)? {
             Response::Ack => {
                 // START establishes a new lifecycle before its ACK. Adopt that
                 // rebase only here, without hiding capture loss during START.
@@ -1421,6 +1446,42 @@ mod tests {
         assert_eq!(stream.mode(), StreamMode::Pro);
         assert_eq!(stream.pro_direction(), Some(direction));
         (stream, region, peer)
+    }
+
+    #[test]
+    fn aligned_start_checks_capability_and_preserves_preack_capture() {
+        let (mut stream, region, mut peer) = directional_stream(PortDirection::Capture);
+        assert!(matches!(
+            stream.start_aligned_pro(),
+            Err(ClientError::Unsupported)
+        ));
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(
+            peer.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        peer.set_nonblocking(false).unwrap();
+        stream.aligned_start_supported = true;
+        let server = thread::spawn(move || {
+            assert!(matches!(
+                sidealsa_protocol::read_request(&mut peer).unwrap(),
+                Request::StartProAligned { .. }
+            ));
+            region.set_lifecycle_generation(1);
+            region.reset_activation();
+            assert!(region.establish_activation(41));
+            region.set_cycle_sequence(42);
+            assert!(region.try_publish_capture(&mut 0, 42, &[17, 18]));
+            sidealsa_protocol::write_response(&mut peer, &Response::Ack).unwrap();
+            peer
+        });
+        stream.start_aligned_pro().unwrap();
+        let _peer = server.join().unwrap();
+        assert_eq!(stream.activation_sequence(), Some(41));
+        assert_eq!(stream.wait_period(Duration::ZERO).unwrap(), 42);
+        let mut samples = [0; 2];
+        assert_eq!(stream.capture_buffer(&mut samples).unwrap(), Some(42));
+        assert_eq!(samples, [17, 18]);
     }
 
     #[test]

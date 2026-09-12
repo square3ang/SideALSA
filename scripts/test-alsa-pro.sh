@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 usage() {
     printf 'Usage: bash %s --compile-only | --run installed|local [periods [work_us [blocking|poll [0|46 [prefill_periods=4]]]]]\n' "$0"
-    printf 'Local: ALSA_PLUGIN_DIR (default target/release). Stats: SIDEALSA_STATS. PRO buffer must be 256.\n'
+    printf 'Local: ALSA_PLUGIN_DIR (default target/release). Stats: SIDEALSA_STATS. Probe requests Q64/app B256; hardware buffer is independent.\n'
 }
 [[ $# -ge 1 ]] || { usage; exit 2; }
 action=$1

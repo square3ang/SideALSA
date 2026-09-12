@@ -71,6 +71,7 @@ pub struct SideAlsaStream {
     last_observed_playback_sequence: Option<u64>,
     last_playback_sequence: Option<u64>,
     start_sequence: Option<u64>,
+    pro_playback_origin: Option<u64>,
     position: u64,
     running: bool,
 }
@@ -157,16 +158,11 @@ pub unsafe extern "C" fn sidealsa_stream_open(
         let period_frames = usize::try_from(info.period_frames).map_err(|_| libc::EINVAL)?;
         let channels = usize::try_from(channels).map_err(|_| libc::EINVAL)?;
         let scratch_len = period_frames.checked_mul(channels).ok_or(libc::EINVAL)?;
-        let requested_buffer_size = requested_buffer_size(
-            mode,
-            device_info.buffer_size,
-            device_info.shared_buffer_size,
-        );
         let (alsa_period_size, buffer_size) = plugin_stream_geometry(
             mode,
             direction,
             info.period_frames,
-            requested_buffer_size,
+            device_info.shared_buffer_size,
             info.slot_count,
         );
         let minimum_buffer_size = minimum_plugin_buffer_size(
@@ -211,6 +207,7 @@ pub unsafe extern "C" fn sidealsa_stream_open(
             last_observed_playback_sequence: None,
             last_playback_sequence: None,
             start_sequence: None,
+            pro_playback_origin: None,
             position: 0,
             running: false,
         });
@@ -280,6 +277,51 @@ pub unsafe extern "C" fn sidealsa_stream_set_nonblock(
         let stream = stream.as_mut().ok_or(libc::EINVAL)?;
         stream.nonblock = nonblock != 0;
         Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `stream` must be a live exclusively borrowed handle, before playback starts.
+pub unsafe extern "C" fn sidealsa_stream_set_buffer_size(
+    stream: *mut SideAlsaStream,
+    frames: usize,
+) -> c_int {
+    ffi_status(|| unsafe {
+        let stream = stream.as_mut().ok_or(libc::EINVAL)?;
+        if !stream.pro {
+            return Ok(());
+        }
+        if stream.running || stream.playback_fifo_frames != 0 || stream.capture_frames != 0 {
+            return Err(libc::EBUSY);
+        }
+        if frames < stream.period_frames
+            || !frames.is_multiple_of(stream.period_frames)
+            || frames > stream.playback_fifo.len() / stream.channels
+        {
+            return Err(libc::EINVAL);
+        }
+        stream.buffer_frames = frames;
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `stream` must be a live exclusively borrowed handle. This never waits for
+/// a cycle: status/poll callers may need to publish prepared PRO data before
+/// ALSA can observe that data's consumption and expose writable space.
+pub unsafe extern "C" fn sidealsa_stream_pump_pro_playback(stream: *mut SideAlsaStream) -> c_int {
+    ffi_status(|| unsafe {
+        let stream = stream.as_mut().ok_or(libc::EINVAL)?;
+        if !stream.pro || !stream.playback || !stream.running {
+            return Ok(());
+        }
+        let nonblock = stream.nonblock;
+        stream.nonblock = true;
+        let result = stream.flush_playback_blocks();
+        stream.nonblock = nonblock;
+        result.map(|_| ())
     })
 }
 
@@ -435,13 +477,25 @@ impl SideAlsaStream {
     }
 
     fn start(&mut self) -> Result<(), c_int> {
-        self.stream.start().map_err(client_error_code)?;
+        if self.pro && self.stream.supports_aligned_pro_start() {
+            self.stream.start_aligned_pro().map_err(client_error_code)?;
+        } else {
+            self.stream.start().map_err(client_error_code)?;
+        }
         if self.running {
             return Ok(());
         }
-        self.start_sequence = self.stream.activation_sequence();
+        self.start_sequence = None;
         self.position = 0;
-        if let Err(error) = self.flush_partial_playback() {
+        // start must not block waiting for hardware periods while the sibling
+        // still needs its start call. Prepared data remains in the bounded FIFO.
+        let nonblock = self.nonblock;
+        if self.pro {
+            self.nonblock = true;
+        }
+        let result = self.flush_partial_playback();
+        self.nonblock = nonblock;
+        if let Err(error) = result {
             let _ = self.stream.stop();
             self.reset_transfer_state();
             return Err(error);
@@ -460,6 +514,15 @@ impl SideAlsaStream {
                 self.capture_frames as u64,
                 self.stream.capture_frames_ready(),
             );
+        }
+        if self.pro && self.playback {
+            return self
+                .pro_playback_origin
+                .and_then(|origin| {
+                    sequence_forward_distance(origin, self.stream.playback_sequence())
+                        .and_then(|periods| periods.checked_mul(self.period_frames as u64))
+                })
+                .unwrap_or(self.position);
         }
         if let Some(origin) = self
             .start_sequence
@@ -483,6 +546,7 @@ impl SideAlsaStream {
         self.last_observed_playback_sequence = None;
         self.last_playback_sequence = None;
         self.start_sequence = None;
+        self.pro_playback_origin = None;
         self.position = 0;
         self.scratch.fill(0);
     }
@@ -721,9 +785,14 @@ impl SideAlsaStream {
                 return Ok(progressed);
             }
             self.discard_playback_periods(1)?;
+            if self.pro {
+                self.pro_playback_origin.get_or_insert(sequence);
+            }
             self.next_playback_sequence = Some(sequence.wrapping_add(1));
             self.last_playback_sequence = Some(sequence);
-            self.update_position(sequence)?;
+            if !self.pro {
+                self.update_position(sequence)?;
+            }
             progressed = true;
         }
         Ok(progressed)
@@ -1175,14 +1244,6 @@ fn plugin_buffer_size(period_size: u32, buffer_size: u32) -> u32 {
     period_size.saturating_mul(periods)
 }
 
-fn requested_buffer_size(mode: c_int, hardware: u32, shared: u32) -> u32 {
-    if mode == MODE_SHARED {
-        shared
-    } else {
-        hardware
-    }
-}
-
 fn plugin_period_size(mode: c_int, internal_period_size: u32, buffer_size: u32) -> u32 {
     if mode != MODE_SHARED || internal_period_size == 0 {
         return internal_period_size;
@@ -1219,6 +1280,15 @@ fn plugin_stream_geometry(
     requested_buffer_size: u32,
     slot_count: u32,
 ) -> (u32, u32) {
+    if mode == MODE_PRO {
+        // Client capacity is independent of the physical ALSA ring. Storage is
+        // allocated once for the transport's slot capacity; hw_params selects
+        // the actual application capacity (including a single logical period).
+        return (
+            internal_period_size,
+            internal_period_size.saturating_mul(slot_count),
+        );
+    }
     let buffer_size = plugin_buffer_size(internal_period_size, requested_buffer_size);
     let period_size = plugin_period_size(mode, internal_period_size, buffer_size);
     let buffer_size = plugin_buffer_size(period_size, buffer_size);
@@ -1241,7 +1311,10 @@ fn minimum_plugin_buffer_size(
     maximum_buffer_size: u32,
 ) -> u32 {
     // Require the full capture reserve so negotiation cannot discard it.
-    if mode != MODE_SHARED || direction == STREAM_CAPTURE {
+    if mode == MODE_PRO {
+        return internal_period_size;
+    }
+    if direction == STREAM_CAPTURE {
         return maximum_buffer_size;
     }
     let internal_periods = if direction == STREAM_PLAYBACK {
@@ -1505,8 +1578,8 @@ mod tests {
         for (mode, direction, internal, requested, slots, period, buffer, minimum) in [
             (MODE_SHARED, STREAM_CAPTURE, 64, 512, 16, 256, 1024, 1024),
             (MODE_SHARED, STREAM_PLAYBACK, 64, 512, 8, 256, 768, 768),
-            (MODE_PRO, STREAM_CAPTURE, 64, 64, 8, 64, 128, 128),
-            (MODE_PRO, STREAM_PLAYBACK, 32, 32, 8, 32, 64, 64),
+            (MODE_PRO, STREAM_CAPTURE, 64, 64, 8, 64, 512, 64),
+            (MODE_PRO, STREAM_PLAYBACK, 32, 32, 8, 32, 256, 32),
         ] {
             let geometry = plugin_stream_geometry(mode, direction, internal, requested, slots);
             assert_eq!(geometry, (period, buffer));
@@ -1518,13 +1591,11 @@ mod tests {
     }
 
     #[test]
-    fn ioplug_buffer_has_at_least_two_periods() {
+    fn shared_geometry_keeps_reserve_while_pro_allows_one_period() {
         assert_eq!(plugin_buffer_size(32, 64), 64);
         assert_eq!(plugin_buffer_size(64, 64), 128);
         assert_eq!(plugin_buffer_size(64, 160), 192);
         assert_eq!(plugin_buffer_size(64, 256), 256);
-        assert_eq!(requested_buffer_size(MODE_PRO, 256, 512), 256);
-        assert_eq!(requested_buffer_size(MODE_SHARED, 256, 512), 512);
         assert_eq!(plugin_period_size(MODE_PRO, 64, 256), 64);
         assert_eq!(plugin_period_size(MODE_SHARED, 64, 512), 256);
         assert_eq!(plugin_period_size(MODE_SHARED, 64, 1024), 512);
@@ -1552,8 +1623,14 @@ mod tests {
         );
         assert_eq!(
             minimum_plugin_buffer_size(MODE_PRO, STREAM_PLAYBACK, 64, 64, 7, 256),
-            256
+            64
         );
+        for hardware in [64, 128, 256, 1024] {
+            assert_eq!(
+                plugin_stream_geometry(MODE_PRO, STREAM_PLAYBACK, 64, hardware, 8),
+                (64, 512)
+            );
+        }
     }
 
     #[test]

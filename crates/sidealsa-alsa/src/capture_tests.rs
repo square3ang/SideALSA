@@ -22,6 +22,99 @@ struct Fixture {
 }
 
 #[test]
+fn blocking_pro_start_does_not_wait_for_first_hardware_period() {
+    let mut f = Fixture::new_mode(false, MODE_PRO, STREAM_PLAYBACK, true);
+    assert_eq!(unsafe { sidealsa_stream_stop(&mut f.adapter) }, 0);
+    assert_eq!(
+        unsafe { sidealsa_stream_set_buffer_size(&mut f.adapter, 64) },
+        0
+    );
+    let source = [42; 64];
+    let area = SideAlsaChannelArea {
+        addr: source.as_ptr().cast_mut().cast(),
+        first: 0,
+        step: 32,
+    };
+    assert_eq!(f.adapter.transfer_playback(&area, 0, 64).unwrap(), 64);
+    f.adapter.nonblock = false;
+    // The fake hardware never publishes an activation or period. Start must
+    // still return, retaining all prepared data for later pointer/I/O pumping.
+    f.adapter.start().unwrap();
+    assert!(f.adapter.running);
+    assert!(!f.adapter.nonblock);
+    assert_eq!(f.adapter.playback_fifo_frames, 64);
+    assert_eq!(f.adapter.position(), 0);
+}
+
+#[test]
+fn pro_pointer_counts_consumption_not_unpublished_clock_cycles() {
+    let mut f = Fixture::new_mode(false, MODE_PRO, STREAM_PLAYBACK, true);
+    f.region.reset_activation();
+    assert!(f.region.establish_activation(10));
+    f.region.set_cycle_sequence(11);
+    f.region.set_playback_sequence(11);
+    assert_eq!(f.adapter.position(), 0);
+    let source = [42_i32; 64];
+    let area = SideAlsaChannelArea {
+        addr: source.as_ptr().cast_mut().cast(),
+        first: 0,
+        step: 32,
+    };
+    assert_eq!(f.adapter.transfer_playback(&area, 0, 64).unwrap(), 64);
+    assert_eq!(f.adapter.position(), 0);
+    f.region.set_cycle_sequence(12);
+    assert_eq!(f.adapter.position(), 0);
+    let mut output = [0; 64];
+    assert!(f.region.try_consume_playback(11, &mut output));
+    assert_eq!(output, source);
+    f.region.set_playback_sequence(12);
+    assert_eq!(f.adapter.position(), 64);
+    assert_eq!(unsafe { sidealsa_stream_stop(&mut f.adapter) }, 0);
+    f.region.set_playback_sequence(13);
+    assert_eq!(f.adapter.position(), 64);
+}
+
+#[test]
+fn pro_negotiated_capacity_bounds_prepared_writes_and_cannot_change_live() {
+    let mut f = Fixture::new_mode(false, MODE_PRO, STREAM_PLAYBACK, true);
+    assert_eq!(
+        unsafe { sidealsa_stream_set_buffer_size(&mut f.adapter, 64) },
+        -libc::EBUSY
+    );
+    assert_eq!(unsafe { sidealsa_stream_stop(&mut f.adapter) }, 0);
+    for invalid in [0, 32, 65, 1024] {
+        assert_eq!(
+            unsafe { sidealsa_stream_set_buffer_size(&mut f.adapter, invalid) },
+            -libc::EINVAL
+        );
+    }
+    assert_eq!(
+        unsafe { sidealsa_stream_set_buffer_size(&mut f.adapter, 64) },
+        0
+    );
+    let source: [i32; 128] = std::array::from_fn(|i| i as i32);
+    let area = SideAlsaChannelArea {
+        addr: source.as_ptr().cast_mut().cast(),
+        first: 0,
+        step: 32,
+    };
+    assert_eq!(f.adapter.transfer_playback(&area, 0, 128).unwrap(), 64);
+    assert_eq!(f.adapter.playback_fifo_frames, 64);
+    assert_eq!(&f.adapter.playback_fifo[..64], &source[..64]);
+    assert_eq!(f.adapter.transfer_playback(&area, 64, 1), Err(libc::EAGAIN));
+    assert_eq!(
+        unsafe { sidealsa_stream_set_buffer_size(&mut f.adapter, 128) },
+        -libc::EBUSY
+    );
+    assert_eq!(unsafe { sidealsa_stream_prepare(&mut f.adapter) }, 0);
+    assert_eq!(
+        unsafe { sidealsa_stream_set_buffer_size(&mut f.adapter, 128) },
+        0
+    );
+    assert_eq!(f.adapter.playback_fifo_frames, 0);
+}
+
+#[test]
 fn c_shim_tracks_post_callback_cursor_without_opening_pcm() {
     let executable =
         std::env::temp_dir().join(format!("sidealsa-shim-test-{}", std::process::id()));
