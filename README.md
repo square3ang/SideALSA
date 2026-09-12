@@ -316,4 +316,4 @@ Rust components live in [`crates/`](crates/); device-specific configurations liv
 
 ## License
 
-[GPL-3.0-or-later](LICENSE)
+[GPL-3.0-or-later](LICENSE.md)
