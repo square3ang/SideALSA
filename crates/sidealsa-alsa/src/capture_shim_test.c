@@ -16,6 +16,8 @@ struct sidealsa_stream {
 	uint64_t expected, current, boundary, buffer, position;
 	ssize_t transfer_result;
 	int sync_result, sync_calls;
+	uint64_t rewound, forwarded, reset_queued;
+	int reset_calls;
 };
 
 int sidealsa_stream_capture_sync(sidealsa_stream_t *s, uint64_t expected,
@@ -45,6 +47,14 @@ int sidealsa_stream_drain(sidealsa_stream_t *s) { (void)s; return 0; }
 int sidealsa_stream_close(sidealsa_stream_t *s) { (void)s; return 0; }
 int sidealsa_stream_is_buffered_capture(const sidealsa_stream_t *s) { (void)s; return 1; }
 void sidealsa_stream_record_playback_xrun(sidealsa_stream_t *s) { (void)s; }
+int sidealsa_stream_playback_rewind(sidealsa_stream_t *s, uint64_t n) { s->rewound += n; return 0; }
+int sidealsa_stream_playback_forward(sidealsa_stream_t *s, uint64_t n) { s->forwarded += n; return 0; }
+int sidealsa_stream_playback_reset(sidealsa_stream_t *s, uint64_t queued)
+{
+	s->reset_calls++;
+	s->reset_queued = queued;
+	return 0;
+}
 int sidealsa_stream_open(const char *socket, int mode, const char *port,
 	int direction, int nonblock, sidealsa_stream_t **stream,
 	unsigned int *rate, unsigned int *channels, unsigned int *period,
@@ -61,6 +71,7 @@ int main(void)
 	sidealsa_stream_t stream = { .position = 128, .transfer_result = 16 };
 	sidealsa_pcm_t pcm = { .stream = &stream, .shared = 1,
 		.buffered_capture = 1, .boundary = 4096 };
+	pthread_mutex_init(&pcm.lock, NULL);
 	snd_pcm_ioplug_t *io = &pcm.io;
 	io->private_data = &pcm;
 	io->stream = SND_PCM_STREAM_CAPTURE;
@@ -112,5 +123,38 @@ int main(void)
 	assert(sidealsa_pointer(io) == 128);
 	assert(stream.sync_calls == calls);
 	assert(pcm.capture_expected_appl_ptr == 0);
+
+	/* Playback cursor tracking: rewind, forward and reset bypass the plugin. */
+	io->appl_ptr = 0;
+	io->hw_ptr = 0;
+	assert(sidealsa_prepare(io) == 0);
+	stream.rewound = stream.forwarded = 0;
+	stream.position = 0;
+	assert(sidealsa_transfer(io, NULL, 0, 64) == 16);
+	assert(pcm.playback_expected_appl_ptr == 16);
+	io->appl_ptr = 16;
+	assert(sidealsa_pointer(io) == 0);
+	assert(stream.rewound == 0 && stream.forwarded == 0);
+	io->appl_ptr = 10; /* snd_pcm_rewind(6) */
+	assert(sidealsa_pointer(io) == 0);
+	assert(stream.rewound == 6 && pcm.playback_expected_appl_ptr == 10);
+	io->appl_ptr = 30; /* snd_pcm_forward(20) */
+	assert(sidealsa_transfer(io, NULL, 0, 64) == 16);
+	assert(stream.forwarded == 20 && pcm.playback_expected_appl_ptr == 46);
+	io->appl_ptr = 4090; /* rewinding across the boundary */
+	pcm.playback_expected_appl_ptr = 6;
+	assert(sidealsa_pointer(io) == 0);
+	assert(stream.rewound == 6 + 12);
+	pcm.playback_expected_appl_ptr = io->appl_ptr = 100;
+	stream.position = 40;
+	assert(sidealsa_pointer(io) == 40);
+	assert(pcm.playback_reported_hw_ptr == 40);
+	io->hw_ptr = 40; /* libasound applies the reported pointer */
+	assert(sidealsa_pointer(io) == 40 && stream.reset_calls == 0);
+	io->appl_ptr = io->hw_ptr = 0; /* snd_pcm_reset while running */
+	stream.position = 0;
+	assert(sidealsa_pointer(io) == 0);
+	assert(stream.reset_calls == 1 && stream.reset_queued == 60);
+	assert(pcm.playback_expected_appl_ptr == 0 && pcm.playback_reported_hw_ptr == 0);
 	return 0;
 }

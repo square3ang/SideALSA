@@ -1139,14 +1139,19 @@ struct DuplexStartGate {
     started: AtomicBool,
 }
 
+// Probe cycles per post-recovery phase attempt; kept short because clients are live.
+const LINKED_PHASE_RECOVERY_CYCLES: u64 = 16;
+
 struct ProClock {
     sequence: AtomicU64,
+    capture_next: AtomicU64,
 }
 
 impl ProClock {
     fn new(sequence: u64) -> Self {
         Self {
             sequence: AtomicU64::new(sequence),
+            capture_next: AtomicU64::new(sequence),
         }
     }
 
@@ -1156,6 +1161,14 @@ impl ProClock {
 
     fn publish(&self, sequence: u64) {
         self.sequence.store(sequence, Ordering::Release);
+    }
+
+    fn capture_next(&self) -> u64 {
+        self.capture_next.load(Ordering::Acquire)
+    }
+
+    fn publish_capture_next(&self, sequence: u64) {
+        self.capture_next.store(sequence, Ordering::Release);
     }
 }
 
@@ -1334,9 +1347,11 @@ fn normalize_startup_loopback(
         return Ok(());
     };
     let deadline = Instant::now() + Duration::from_secs(2);
-    if let Some(ready) = control.hardware_ready {
-        ready.store(false, Ordering::Release);
-    }
+    // Requalification during recovery must not leave the engine looking unqualified,
+    // or the next XRUN would be treated as a fatal startup interruption.
+    let was_ready = control
+        .hardware_ready
+        .is_some_and(|ready| ready.swap(false, Ordering::AcqRel));
     let result = (|| {
         let period = config.period as usize;
         let interval = (u64::from(loopback.target_frames) + 2 * period as u64)
@@ -1428,6 +1443,12 @@ fn normalize_startup_loopback(
         }
         check_startup_loopback_deadline(control, deadline)
     })();
+    if result.is_ok()
+        && was_ready
+        && let Some(ready) = control.hardware_ready
+    {
+        ready.store(true, Ordering::Release);
+    }
     result.map_err(|error| {
         record_linked_hardware_xruns(&error, control);
         startup_loopback_error(error)
@@ -1668,6 +1689,86 @@ fn calibrate_linked_phase(
 
         let dither_frames = linked_phase_dither_frames(attempt, config.hardware_period);
         rebase_linked_streams(playback_pcm, capture_pcm, control, config, dither_frames)?;
+    }
+    Ok(())
+}
+
+/// A restart lands on an arbitrary USB phase, so the startup phase qualification no longer
+/// holds. Unlike startup this runs inside a live session: keep each probe short and never
+/// stop the engine just because the target phase could not be reached.
+fn recalibrate_linked_phase(
+    playback_pcm: &PCM,
+    capture_pcm: &PCM,
+    capture_scratch: &mut [i32],
+    config: LinkedProConfig<'_>,
+    control: WorkerControl<'_>,
+) -> Result<(), EngineError> {
+    if config.phase_max_attempts == 0 {
+        return Ok(());
+    }
+    let target_nanos =
+        linked_phase_target_nanos(config.hardware_period, config.rate, config.handoff_nanos);
+    for attempt in 1..=config.phase_max_attempts {
+        let mut minimum_write_nanos = u64::MAX;
+        let mut recovered = false;
+        for _ in 0..LINKED_PHASE_RECOVERY_CYCLES {
+            match linked_phase_calibration_cycle(
+                playback_pcm,
+                capture_pcm,
+                capture_scratch,
+                config,
+                control,
+            ) {
+                Ok(Some(elapsed_nanos)) => {
+                    minimum_write_nanos = minimum_write_nanos.min(elapsed_nanos);
+                    if elapsed_nanos < target_nanos {
+                        break;
+                    }
+                }
+                Ok(None) => return Ok(()),
+                Err(error) if error.is_stopped() => return Ok(()),
+                Err(error) if error.is_recoverable() => {
+                    recover_linked_streams(
+                        playback_pcm,
+                        capture_pcm,
+                        &error,
+                        control,
+                        config,
+                        linked_phase_dither_frames(attempt, config.hardware_period),
+                    )?;
+                    recovered = true;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if recovered {
+            control
+                .timeline
+                .record_linked_phase_calibration(u64::from(attempt), 0, false);
+            continue;
+        }
+        let score_nanos = if minimum_write_nanos == u64::MAX {
+            0
+        } else {
+            minimum_write_nanos
+        };
+        let target_met = score_nanos >= target_nanos;
+        control.timeline.record_linked_phase_calibration(
+            u64::from(attempt),
+            score_nanos,
+            target_met,
+        );
+        if target_met || attempt == config.phase_max_attempts {
+            return Ok(());
+        }
+        rebase_linked_streams(
+            playback_pcm,
+            capture_pcm,
+            control,
+            config,
+            linked_phase_dither_frames(attempt, config.hardware_period),
+        )?;
     }
     Ok(())
 }
@@ -1971,6 +2072,7 @@ fn linked_pro_cycle_loop(
                     recover_linked_streams_during_cycle(
                         playback_pcm,
                         capture_pcm,
+                        capture_scratch,
                         &error,
                         config,
                         control,
@@ -2004,6 +2106,7 @@ fn linked_pro_cycle_loop(
                 recover_linked_streams_during_cycle(
                     playback_pcm,
                     capture_pcm,
+                    capture_scratch,
                     &error,
                     config,
                     control,
@@ -2094,8 +2197,21 @@ fn linked_pro_cycle_loop(
                 // This is a real duplex rebase after an observed hardware-cycle
                 // stall AND sustained added buffering, not a client miss/XRUN.
                 // Do it before publishing this capture block to any clients.
-                rebase_linked_streams(playback_pcm, capture_pcm, control, config, 0)?;
-                normalize_startup_loopback(playback_pcm, capture_pcm, config, control)?;
+                match rebase_linked_streams(playback_pcm, capture_pcm, control, config, 0) {
+                    Ok(()) => {
+                        normalize_startup_loopback(playback_pcm, capture_pcm, config, control)?
+                    }
+                    // An XRUN while rebasing is still an ordinary recoverable hardware fault.
+                    Err(error) if error.is_recoverable() => recover_linked_streams_during_cycle(
+                        playback_pcm,
+                        capture_pcm,
+                        capture_scratch,
+                        &error,
+                        config,
+                        control,
+                    )?,
+                    Err(error) => return Err(error),
+                }
                 continue 'cycles;
             }
         }
@@ -2245,6 +2361,7 @@ fn linked_pro_cycle_loop(
                     recover_linked_streams_during_cycle(
                         playback_pcm,
                         capture_pcm,
+                        capture_scratch,
                         &error,
                         config,
                         control,
@@ -2304,6 +2421,7 @@ fn linked_pro_cycle_loop(
                         recover_linked_streams_during_cycle(
                             playback_pcm,
                             capture_pcm,
+                            capture_scratch,
                             &error,
                             config,
                             control,
@@ -2363,6 +2481,7 @@ fn linked_pro_cycle_loop(
                     recover_linked_streams_during_cycle(
                         playback_pcm,
                         capture_pcm,
+                        capture_scratch,
                         &error,
                         config,
                         control,
@@ -2450,6 +2569,7 @@ fn linked_pro_ahead_cycle_loop(
                 recover_linked_streams_during_cycle(
                     playback_pcm,
                     capture_pcm,
+                    capture_scratch,
                     &error,
                     config,
                     control,
@@ -2512,6 +2632,7 @@ fn linked_pro_ahead_cycle_loop(
                 recover_linked_streams_during_cycle(
                     playback_pcm,
                     capture_pcm,
+                    capture_scratch,
                     &error,
                     config,
                     control,
@@ -2542,6 +2663,7 @@ fn linked_pro_ahead_cycle_loop(
                 recover_linked_streams_during_cycle(
                     playback_pcm,
                     capture_pcm,
+                    capture_scratch,
                     &error,
                     config,
                     control,
@@ -2681,6 +2803,7 @@ fn linked_pro_packet_cycle_loop(
                 recover_linked_streams_during_cycle(
                     playback_pcm,
                     capture_pcm,
+                    capture_scratch,
                     &error,
                     config,
                     control,
@@ -2947,6 +3070,7 @@ fn playback_worker(
         while !gate.capture_ready.load(Ordering::Acquire) {
             if control.stop.load(Ordering::Relaxed) || control.done.load(Ordering::Acquire) {
                 control.done.store(true, Ordering::Release);
+                unlink_unstarted_playback(&pcm, gate);
                 return (pcm, Ok(()));
             }
             std::thread::yield_now();
@@ -2954,12 +3078,14 @@ fn playback_worker(
         while !gate.linked && !gate.capture_started.load(Ordering::Acquire) {
             if control.stop.load(Ordering::Relaxed) || control.done.load(Ordering::Acquire) {
                 control.done.store(true, Ordering::Release);
+                unlink_unstarted_playback(&pcm, gate);
                 return (pcm, Ok(()));
             }
             std::thread::yield_now();
         }
         if control.stop.load(Ordering::Relaxed) || control.done.load(Ordering::Acquire) {
             control.done.store(true, Ordering::Release);
+            unlink_unstarted_playback(&pcm, gate);
             return (pcm, Ok(()));
         }
         if config.realtime_priority != startup_priority
@@ -2967,6 +3093,7 @@ fn playback_worker(
             && let Err(error) = set_current_realtime(priority, "raise playback SCHED_FIFO")
         {
             control.done.store(true, Ordering::Release);
+            unlink_unstarted_playback(&pcm, gate);
             return (pcm, Err(error));
         }
         let start_result = alsa_call(
@@ -3003,6 +3130,14 @@ fn playback_worker(
         max_periods,
     );
     (pcm, result)
+}
+
+// Workers that exit before starting must not leave the PCMs linked: `stop()` does not know
+// about this link, and the next `link()` would fail with -EALREADY.
+fn unlink_unstarted_playback(pcm: &PCM, gate: &DuplexStartGate) {
+    if gate.linked {
+        let _ = pcm.unlink();
+    }
 }
 
 fn playback_startup_priority(priority: Option<i32>, deferred_start: bool) -> Option<i32> {
@@ -3083,7 +3218,19 @@ fn playback_worker_loop(
                         config.start_frames,
                     )),
                 ) {
-                    Ok(()) => continue,
+                    Ok(()) => {
+                        if let Some(clock) = pro_clock
+                            && realign_playback_after_recovery(
+                                &mut sequence,
+                                clock,
+                                config.sequence_lead,
+                            )
+                        {
+                            announced_output = None;
+                            prepared_output = None;
+                        }
+                        continue;
+                    }
                     Err(error) if error.is_stopped() => {
                         control.done.store(true, Ordering::Release);
                         return Ok(());
@@ -3253,7 +3400,18 @@ fn playback_worker_loop(
                         config.start_frames,
                     )),
                 ) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        if let Some(clock) = pro_clock
+                            && realign_playback_after_recovery(
+                                &mut sequence,
+                                clock,
+                                config.sequence_lead,
+                            )
+                        {
+                            announced_output = None;
+                            prepared_output = None;
+                        }
+                    }
                     Err(error) if error.is_stopped() => {
                         control.done.store(true, Ordering::Release);
                         return Ok(());
@@ -3411,6 +3569,7 @@ fn capture_worker_loop(
                         current_generation,
                         rebase_target,
                     );
+                    clock.publish_capture_next(next_pro_sequence);
                     control
                         .timeline
                         .record_pro_capture_read(sequence, capture_read_nanos);
@@ -3480,6 +3639,19 @@ fn take_pro_capture_sequence(
     let sequence = *next;
     *next = next.wrapping_add(1);
     sequence
+}
+
+// Capture keeps running while playback recovers, so playback must skip the periods it lost;
+// otherwise every playback XRUN permanently adds that many periods of round-trip latency.
+// One period of slack absorbs normal capture/playback thread phase jitter.
+fn realign_playback_after_recovery(sequence: &mut u64, clock: &ProClock, lead: u64) -> bool {
+    let target = clock.capture_next().wrapping_sub(lead).wrapping_sub(1);
+    if !sequence_before(*sequence, target) {
+        return false;
+    }
+    *sequence = target;
+    clock.publish(pro_target_sequence(target, lead));
+    true
 }
 
 fn align_sequence_forward(next: &mut u64, target: u64) {
@@ -4083,6 +4255,7 @@ fn recover_linked_streams(
 fn recover_linked_streams_during_cycle(
     playback_pcm: &PCM,
     capture_pcm: &PCM,
+    capture_scratch: &mut [i32],
     error: &EngineError,
     config: LinkedProConfig<'_>,
     control: WorkerControl<'_>,
@@ -4095,7 +4268,11 @@ fn recover_linked_streams_during_cycle(
         record_linked_hardware_xruns(error, control);
         return Err(EngineError::LinkedStartupInterrupted);
     }
-    recover_linked_streams(playback_pcm, capture_pcm, error, control, config, 0)
+    recover_linked_streams(playback_pcm, capture_pcm, error, control, config, 0)?;
+    if !config.event_driven {
+        recalibrate_linked_phase(playback_pcm, capture_pcm, capture_scratch, config, control)?;
+    }
+    Ok(())
 }
 
 fn record_linked_hardware_xruns(error: &EngineError, control: WorkerControl<'_>) {
@@ -4126,6 +4303,27 @@ fn record_linked_hardware_xruns(error: &EngineError, control: WorkerControl<'_>)
     }
 }
 
+// snd_pcm_recover() sleeps a whole second per -EAGAIN resume attempt and ignores the stop
+// flag; poll resume briefly instead and fall back to prepare like alsa-lib does.
+fn resume_suspended_stream(
+    pcm: &PCM,
+    direction: StreamDirection,
+    control: WorkerControl<'_>,
+) -> Result<(), EngineError> {
+    for _ in 0..200 {
+        match pcm.resume() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.errno() == libc::EAGAIN => {
+                control.ensure_running()?;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => break,
+        }
+    }
+    control.ensure_running()?;
+    alsa_call(pcm.prepare(), "prepare suspended stream", direction)
+}
+
 fn recover_stream(
     pcm: &PCM,
     direction: StreamDirection,
@@ -4138,7 +4336,11 @@ fn recover_stream(
         control.timeline.record_hardware_xrun(direction);
     }
     control.ensure_running()?;
-    alsa_call(pcm.recover(errno, true), "recover failed stream", direction)?;
+    if errno == libc::ESTRPIPE {
+        resume_suspended_stream(pcm, direction, control)?;
+    } else {
+        alsa_call(pcm.recover(errno, true), "recover failed stream", direction)?;
+    }
     control.ensure_running()?;
 
     let restarted = if pcm.state() != State::Running {
@@ -4429,9 +4631,9 @@ mod tests {
         linked_phase_warmup_cycles, linked_start_frames, linked_zero_lead_playback_floor,
         observe_pro_capture_target, period_limit_reached, playback_startup_priority,
         playback_target_sleep, prepared_output_matches, pro_target_sequence,
-        record_linked_hardware_xruns, staged_playback_chunk_before_capture, startup_loopback_error,
-        startup_loopback_padding, take_pending_pro_capture, take_pro_capture_sequence,
-        uses_staged_packet_cycle,
+        realign_playback_after_recovery, record_linked_hardware_xruns,
+        staged_playback_chunk_before_capture, startup_loopback_error, startup_loopback_padding,
+        take_pending_pro_capture, take_pro_capture_sequence, uses_staged_packet_cycle,
     };
     use crate::HardwareTimeline;
     use std::{
@@ -4739,6 +4941,29 @@ mod tests {
             take_pro_capture_sequence(&mut next, &mut generation, 0, 6),
             6
         );
+    }
+
+    #[test]
+    fn playback_recovery_catches_up_with_capture_without_moving_backward() {
+        let clock = ProClock::new(2);
+        let mut sequence = 0;
+        assert!(!realign_playback_after_recovery(&mut sequence, &clock, 2));
+        assert_eq!(sequence, 0);
+
+        // Normal one-period phase jitter is left alone.
+        clock.publish_capture_next(3);
+        assert!(!realign_playback_after_recovery(&mut sequence, &clock, 2));
+        assert_eq!(sequence, 0);
+
+        // Capture ran 5 periods while playback was recovering.
+        clock.publish_capture_next(8);
+        assert!(realign_playback_after_recovery(&mut sequence, &clock, 2));
+        assert_eq!(sequence, 5);
+        assert_eq!(clock.load(), 7);
+
+        clock.publish_capture_next(4);
+        assert!(!realign_playback_after_recovery(&mut sequence, &clock, 2));
+        assert_eq!(sequence, 5);
     }
 
     #[test]

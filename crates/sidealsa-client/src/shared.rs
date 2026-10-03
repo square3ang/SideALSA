@@ -343,9 +343,17 @@ impl SharedRegion {
 
     pub fn reset_activation(&self) {
         let pending = activation_token(self.lifecycle_generation(), SHARED_ACTIVATION_PENDING);
+        // The peer can write this word, so a stuck CLAIMED value must not hang the caller.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
         loop {
             let current = self.header().activation_state.load(Ordering::Acquire);
             if current & 3 == SHARED_ACTIVATION_CLAIMED {
+                if std::time::Instant::now() >= deadline {
+                    self.header()
+                        .activation_state
+                        .store(pending, Ordering::Release);
+                    return;
+                }
                 std::thread::yield_now();
                 continue;
             }

@@ -4,6 +4,7 @@
 #include <alsa/pcm_external.h>
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,9 @@ extern int sidealsa_stream_is_buffered_capture(const sidealsa_stream_t *stream);
 extern int sidealsa_stream_capture_sync(sidealsa_stream_t *stream,
                                         uint64_t expected, uint64_t current,
                                         uint64_t boundary, uint64_t buffer);
+extern int sidealsa_stream_playback_rewind(sidealsa_stream_t *stream, uint64_t frames);
+extern int sidealsa_stream_playback_forward(sidealsa_stream_t *stream, uint64_t frames);
+extern int sidealsa_stream_playback_reset(sidealsa_stream_t *stream, uint64_t queued);
 
 typedef struct {
 	snd_pcm_ioplug_t io;
@@ -46,8 +50,20 @@ typedef struct {
 	snd_pcm_uframes_t buffer_size;
 	snd_pcm_uframes_t boundary;
 	snd_pcm_uframes_t capture_expected_appl_ptr;
+	/*
+	 * libasound implements rewind/forward/reset by moving its own cursors
+	 * without calling the plugin. Track what the plugin last saw so those
+	 * moves can be applied to the FIFO instead of silently desynchronising.
+	 */
+	snd_pcm_uframes_t playback_expected_appl_ptr;
+	snd_pcm_uframes_t playback_reported_hw_ptr;
 	int shared;
 	int buffered_capture;
+	/*
+	 * libasound calls drain, prepare and sw_params without the PCM lock, so a
+	 * blocking drain could otherwise race pointer/transfer from another thread.
+	 */
+	pthread_mutex_t lock;
 } sidealsa_pcm_t;
 
 static void sidealsa_set_error_state(snd_pcm_ioplug_t *io, long result)
@@ -73,26 +89,31 @@ static int sidealsa_sync_nonblock(snd_pcm_ioplug_t *io)
 static int sidealsa_start(snd_pcm_ioplug_t *io)
 {
 	sidealsa_pcm_t *pcm = io->private_data;
+	pthread_mutex_lock(&pcm->lock);
 	int result = sidealsa_sync_nonblock(io);
 
 	if (result >= 0)
 		result = sidealsa_stream_start(pcm->stream);
 	sidealsa_set_error_state(io, result);
+	pthread_mutex_unlock(&pcm->lock);
 	return result;
 }
 
 static int sidealsa_stop(snd_pcm_ioplug_t *io)
 {
 	sidealsa_pcm_t *pcm = io->private_data;
+	pthread_mutex_lock(&pcm->lock);
 	int result = sidealsa_stream_stop(pcm->stream);
 
 	sidealsa_set_error_state(io, result);
+	pthread_mutex_unlock(&pcm->lock);
 	return result;
 }
 
 static int sidealsa_prepare(snd_pcm_ioplug_t *io)
 {
 	sidealsa_pcm_t *pcm = io->private_data;
+	pthread_mutex_lock(&pcm->lock);
 	int result = sidealsa_sync_nonblock(io);
 
 	if (result >= 0)
@@ -100,18 +121,25 @@ static int sidealsa_prepare(snd_pcm_ioplug_t *io)
 	/* libasound resets its pointers before calling prepare. */
 	if (result >= 0 && pcm->buffered_capture)
 		pcm->capture_expected_appl_ptr = io->appl_ptr;
+	if (result >= 0) {
+		pcm->playback_expected_appl_ptr = io->appl_ptr;
+		pcm->playback_reported_hw_ptr = io->hw_ptr;
+	}
 	sidealsa_set_error_state(io, result);
+	pthread_mutex_unlock(&pcm->lock);
 	return result;
 }
 
 static int sidealsa_drain(snd_pcm_ioplug_t *io)
 {
 	sidealsa_pcm_t *pcm = io->private_data;
+	pthread_mutex_lock(&pcm->lock);
 	int result = sidealsa_sync_nonblock(io);
 
 	if (result >= 0)
 		result = sidealsa_stream_drain(pcm->stream);
 	sidealsa_set_error_state(io, result);
+	pthread_mutex_unlock(&pcm->lock);
 	return result;
 }
 
@@ -129,30 +157,78 @@ static int sidealsa_capture_sync(snd_pcm_ioplug_t *io)
 	return result;
 }
 
+static snd_pcm_uframes_t sidealsa_wrap_distance(snd_pcm_uframes_t from,
+						snd_pcm_uframes_t to,
+						snd_pcm_uframes_t boundary)
+{
+	return to >= from ? to - from : boundary - from + to;
+}
+
+static int sidealsa_playback_sync(snd_pcm_ioplug_t *io)
+{
+	sidealsa_pcm_t *pcm = io->private_data;
+	snd_pcm_uframes_t boundary = pcm->boundary;
+	snd_pcm_uframes_t moved;
+	int result = 0;
+
+	if (io->stream != SND_PCM_STREAM_PLAYBACK || !boundary)
+		return 0;
+	if (io->hw_ptr != pcm->playback_reported_hw_ptr) {
+		/* Only snd_pcm_reset moves hw_ptr without asking our pointer callback. */
+		result = sidealsa_stream_playback_reset(pcm->stream,
+			sidealsa_wrap_distance(pcm->playback_reported_hw_ptr,
+					       pcm->playback_expected_appl_ptr, boundary));
+		pcm->playback_reported_hw_ptr = io->hw_ptr;
+	} else if (io->appl_ptr != pcm->playback_expected_appl_ptr) {
+		moved = sidealsa_wrap_distance(pcm->playback_expected_appl_ptr,
+					       io->appl_ptr, boundary);
+		if (moved <= io->buffer_size)
+			result = sidealsa_stream_playback_forward(pcm->stream, moved);
+		else if (boundary - moved <= io->buffer_size)
+			result = sidealsa_stream_playback_rewind(pcm->stream,
+								 boundary - moved);
+		else
+			result = -EPIPE;
+	}
+	pcm->playback_expected_appl_ptr = io->appl_ptr;
+	return result;
+}
+
 static snd_pcm_sframes_t sidealsa_transfer(snd_pcm_ioplug_t *io,
 						   const snd_pcm_channel_area_t *areas,
 						   snd_pcm_uframes_t offset,
 						   snd_pcm_uframes_t size)
 {
 	sidealsa_pcm_t *pcm = io->private_data;
+	pthread_mutex_lock(&pcm->lock);
 	snd_pcm_sframes_t result = sidealsa_sync_nonblock(io);
 
 	if (result >= 0)
 		result = sidealsa_capture_sync(io);
 	if (result >= 0)
+		result = sidealsa_playback_sync(io);
+	if (result >= 0)
 		result = sidealsa_stream_transfer(pcm->stream, areas, offset, size);
+	if (result > 0 && io->stream == SND_PCM_STREAM_PLAYBACK) {
+		snd_pcm_uframes_t next = io->appl_ptr + (snd_pcm_uframes_t)result;
+		pcm->playback_expected_appl_ptr = pcm->boundary ? next % pcm->boundary : next;
+	}
 	/* The transfer callback sees the old appl_ptr; ALSA advances it on return. */
-	if (result > 0 && pcm->buffered_capture && io->stream == SND_PCM_STREAM_CAPTURE)
-		pcm->capture_expected_appl_ptr =
-			(io->appl_ptr + (snd_pcm_uframes_t)result) % pcm->boundary;
+	if (result > 0 && pcm->buffered_capture && io->stream == SND_PCM_STREAM_CAPTURE) {
+		snd_pcm_uframes_t next = io->appl_ptr + (snd_pcm_uframes_t)result;
+		pcm->capture_expected_appl_ptr = pcm->boundary ? next % pcm->boundary : next;
+	}
 	sidealsa_set_error_state(io, result);
+	pthread_mutex_unlock(&pcm->lock);
 	return result;
 }
 
-static snd_pcm_sframes_t sidealsa_pointer(snd_pcm_ioplug_t *io)
+static snd_pcm_sframes_t sidealsa_pointer_locked(snd_pcm_ioplug_t *io)
 {
 	sidealsa_pcm_t *pcm = io->private_data;
-	int result = sidealsa_stream_pump_pro_playback(pcm->stream);
+	int result = sidealsa_playback_sync(io);
+	if (result >= 0)
+		result = sidealsa_stream_pump_pro_playback(pcm->stream);
 	if (result >= 0)
 		result = sidealsa_capture_sync(io);
 	if (result < 0)
@@ -167,13 +243,27 @@ static snd_pcm_sframes_t sidealsa_pointer(snd_pcm_ioplug_t *io)
 		sidealsa_stream_record_playback_xrun(pcm->stream);
 		return -EPIPE;
 	}
+	if (io->stream == SND_PCM_STREAM_PLAYBACK)
+		pcm->playback_reported_hw_ptr = hw_ptr;
 	return (snd_pcm_sframes_t)hw_ptr;
+}
+
+static snd_pcm_sframes_t sidealsa_pointer(snd_pcm_ioplug_t *io)
+{
+	sidealsa_pcm_t *pcm = io->private_data;
+	pthread_mutex_lock(&pcm->lock);
+	snd_pcm_sframes_t result = sidealsa_pointer_locked(io);
+	pthread_mutex_unlock(&pcm->lock);
+	return result;
 }
 
 static int sidealsa_sw_params(snd_pcm_ioplug_t *io, snd_pcm_sw_params_t *params)
 {
 	sidealsa_pcm_t *pcm = io->private_data;
-	return snd_pcm_sw_params_get_boundary(params, &pcm->boundary);
+	pthread_mutex_lock(&pcm->lock);
+	int result = snd_pcm_sw_params_get_boundary(params, &pcm->boundary);
+	pthread_mutex_unlock(&pcm->lock);
+	return result;
 }
 
 static int sidealsa_poll_revents(snd_pcm_ioplug_t *io, struct pollfd *pfds,
@@ -222,6 +312,7 @@ static int sidealsa_close(snd_pcm_ioplug_t *io)
 		close(pcm->poll_fd);
 	if (pcm->control_fd >= 0)
 		close(pcm->control_fd);
+	pthread_mutex_destroy(&pcm->lock);
 	free(pcm);
 	return result;
 }
@@ -230,6 +321,7 @@ static int sidealsa_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params)
 {
 	sidealsa_pcm_t *pcm = io->private_data;
 	int valid_buffer;
+	int result;
 
 	(void)params;
 	valid_buffer =
@@ -242,7 +334,10 @@ static int sidealsa_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params)
 	    io->period_size != pcm->period_size ||
 	    !valid_buffer)
 		return -EINVAL;
-	return sidealsa_stream_set_buffer_size(pcm->stream, io->buffer_size);
+	pthread_mutex_lock(&pcm->lock);
+	result = sidealsa_stream_set_buffer_size(pcm->stream, io->buffer_size);
+	pthread_mutex_unlock(&pcm->lock);
+	return result;
 }
 
 static int sidealsa_set_constraints(sidealsa_pcm_t *pcm)
@@ -370,6 +465,11 @@ int sidealsa_plugin_open(snd_pcm_t **pcmp, const char *name,
 		return -ENOMEM;
 	pcm->poll_fd = -1;
 	pcm->control_fd = -1;
+	result = pthread_mutex_init(&pcm->lock, NULL);
+	if (result) {
+		free(pcm);
+		return -result;
+	}
 	result = sidealsa_stream_open(socket, sidealsa_mode, port, direction,
 					     !!(mode & SND_PCM_NONBLOCK), &pcm->stream,
 					     &pcm->rate, &pcm->channels,
@@ -412,6 +512,7 @@ error:
 		close(pcm->poll_fd);
 	if (pcm->control_fd >= 0)
 		close(pcm->control_fd);
+	pthread_mutex_destroy(&pcm->lock);
 	free(pcm);
 	return result;
 }

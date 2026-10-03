@@ -13,6 +13,9 @@ const MODE_PRO: c_int = 0;
 const MODE_SHARED: c_int = 1;
 const STREAM_PLAYBACK: c_int = 0;
 const STREAM_CAPTURE: c_int = 1;
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+// Consecutive one-second blocking waits before giving up, matching ALSA's 10 s I/O timeout.
+const BLOCKING_WAIT_TIMEOUTS: u32 = 10;
 
 #[repr(C)]
 pub struct SideAlsaChannelArea {
@@ -73,6 +76,11 @@ pub struct SideAlsaStream {
     start_sequence: Option<u64>,
     pro_playback_origin: Option<u64>,
     position: u64,
+    // Silence the plugin queued that ALSA's appl_ptr never accounted for (period padding,
+    // or audio still owed by the daemon after snd_pcm_reset). Hidden from the pointer.
+    playback_hidden_frames: u64,
+    // Leading FIFO frames that a rewind may not remove because they contain padding.
+    playback_fifo_locked_frames: usize,
     running: bool,
 }
 
@@ -123,7 +131,9 @@ pub unsafe extern "C" fn sidealsa_stream_open(
             None
         };
 
-        let mut client = SideAlsaClient::connect(socket).map_err(client_error_code)?;
+        // A wedged daemon must not hang the host's (often PipeWire's) open/start/close forever.
+        let mut client = SideAlsaClient::connect_with_timeout(socket, CONTROL_TIMEOUT)
+            .map_err(client_error_code)?;
         let device_info = client.get_info().map_err(client_error_code)?;
         let stream = match (mode, port) {
             (MODE_PRO, None) if client.features() & FEATURE_PRO_DIRECTIONS != 0 => client
@@ -209,6 +219,8 @@ pub unsafe extern "C" fn sidealsa_stream_open(
             start_sequence: None,
             pro_playback_origin: None,
             position: 0,
+            playback_hidden_frames: 0,
+            playback_fifo_locked_frames: 0,
             running: false,
         });
         *stream_out = Box::into_raw(stream);
@@ -370,6 +382,45 @@ pub unsafe extern "C" fn sidealsa_stream_record_playback_xrun(stream: *mut SideA
 
 #[unsafe(no_mangle)]
 /// # Safety
+/// `stream` must be a live, exclusively borrowed playback handle.
+pub unsafe extern "C" fn sidealsa_stream_playback_rewind(
+    stream: *mut SideAlsaStream,
+    frames: u64,
+) -> c_int {
+    ffi_status(|| unsafe {
+        let stream = stream.as_mut().ok_or(libc::EINVAL)?;
+        stream.rewind_playback(frames)
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `stream` must be a live, exclusively borrowed playback handle.
+pub unsafe extern "C" fn sidealsa_stream_playback_forward(
+    stream: *mut SideAlsaStream,
+    frames: u64,
+) -> c_int {
+    ffi_status(|| unsafe {
+        let stream = stream.as_mut().ok_or(libc::EINVAL)?;
+        stream.forward_playback(frames)
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `stream` must be a live, exclusively borrowed playback handle.
+pub unsafe extern "C" fn sidealsa_stream_playback_reset(
+    stream: *mut SideAlsaStream,
+    queued_frames: u64,
+) -> c_int {
+    ffi_status(|| unsafe {
+        let stream = stream.as_mut().ok_or(libc::EINVAL)?;
+        stream.reset_playback(queued_frames)
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
 /// `stream` must be null or a live handle returned by `sidealsa_stream_open`.
 pub unsafe extern "C" fn sidealsa_stream_is_buffered_capture(
     stream: *const SideAlsaStream,
@@ -508,6 +559,15 @@ impl SideAlsaStream {
         if !self.running {
             return self.position;
         }
+        let position = self.running_position();
+        if self.playback {
+            position.saturating_sub(self.playback_hidden_frames)
+        } else {
+            position
+        }
+    }
+
+    fn running_position(&self) -> u64 {
         if self.is_buffered_capture() {
             return capture_production_position(
                 self.capture_retired_frames,
@@ -548,7 +608,81 @@ impl SideAlsaStream {
         self.start_sequence = None;
         self.pro_playback_origin = None;
         self.position = 0;
+        self.playback_hidden_frames = 0;
+        self.playback_fifo_locked_frames = 0;
         self.scratch.fill(0);
+    }
+
+    fn pad_playback_period(&mut self) -> Result<(), c_int> {
+        let before = self.playback_fifo_frames;
+        pad_final_playback_period(
+            &mut self.playback_fifo,
+            &mut self.playback_fifo_frames,
+            self.period_frames,
+            self.channels,
+        )?;
+        let padded = self.playback_fifo_frames - before;
+        if padded > 0 {
+            self.playback_hidden_frames = self.playback_hidden_frames.wrapping_add(padded as u64);
+            self.playback_fifo_locked_frames = self.playback_fifo_frames;
+        }
+        Ok(())
+    }
+
+    /// `snd_pcm_rewind` moved appl_ptr back. Only audio that has not been handed to the
+    /// daemon can be taken back; anything else must surface as an XRUN, not a silent shift.
+    fn rewind_playback(&mut self, frames: u64) -> Result<(), c_int> {
+        if !self.playback {
+            return Err(libc::EINVAL);
+        }
+        let rewindable = self
+            .playback_fifo_frames
+            .saturating_sub(self.playback_fifo_locked_frames);
+        match usize::try_from(frames) {
+            Ok(frames) if frames <= rewindable => {
+                self.playback_fifo_frames -= frames;
+                Ok(())
+            }
+            _ => {
+                self.clear_playback_fifo();
+                Err(libc::EPIPE)
+            }
+        }
+    }
+
+    /// `snd_pcm_forward` moved appl_ptr ahead without data: queue the skipped frames as silence.
+    fn forward_playback(&mut self, frames: u64) -> Result<(), c_int> {
+        if !self.playback {
+            return Err(libc::EINVAL);
+        }
+        let frames = usize::try_from(frames).map_err(|_| libc::EPIPE)?;
+        let queued = self
+            .playback_fifo_frames
+            .checked_add(frames)
+            .filter(|queued| *queued <= self.buffer_frames)
+            .ok_or(libc::EPIPE)?;
+        let start = self.playback_fifo_frames * self.channels;
+        self.playback_fifo[start..queued * self.channels].fill(0);
+        self.playback_fifo_frames = queued;
+        Ok(())
+    }
+
+    /// `snd_pcm_reset` while running zeroed ALSA's pointers. Unsent audio is dropped; audio
+    /// already owned by the daemon will still play, so hide it from the restarted pointer.
+    fn reset_playback(&mut self, queued_frames: u64) -> Result<(), c_int> {
+        if !self.playback {
+            return Err(libc::EINVAL);
+        }
+        let submitted = queued_frames.saturating_sub(self.playback_fifo_frames as u64);
+        self.playback_fifo_frames = 0;
+        self.playback_fifo_locked_frames = 0;
+        if self.running {
+            self.playback_hidden_frames = self.running_position().wrapping_add(submitted);
+        } else {
+            self.position = 0;
+            self.playback_hidden_frames = 0;
+        }
+        Ok(())
     }
 
     fn transfer(
@@ -601,7 +735,16 @@ impl SideAlsaStream {
                 self.channels,
             )?;
             consumed += chunk;
-            let _ = self.flush_playback_blocks()?;
+            // ALSA already reported this space as writable. Waiting here for the next
+            // cycle would delay a duplex PRO application's following capture read by a
+            // period; only the full-FIFO branch above may block.
+            let nonblock = self.nonblock;
+            if self.pro {
+                self.nonblock = true;
+            }
+            let flushed = self.flush_playback_blocks();
+            self.nonblock = nonblock;
+            let _ = flushed?;
         }
         isize::try_from(consumed).map_err(|_| libc::EOVERFLOW)
     }
@@ -629,12 +772,7 @@ impl SideAlsaStream {
 
     fn flush_partial_playback(&mut self) -> Result<(), c_int> {
         if self.playback_fifo_frames > 0 && self.playback_fifo_frames < self.period_frames {
-            pad_final_playback_period(
-                &mut self.playback_fifo,
-                &mut self.playback_fifo_frames,
-                self.period_frames,
-                self.channels,
-            )?;
+            self.pad_playback_period()?;
         }
         let _ = self.flush_playback_blocks()?;
         Ok(())
@@ -647,12 +785,7 @@ impl SideAlsaStream {
         if !self.running {
             self.start()?;
         }
-        pad_final_playback_period(
-            &mut self.playback_fifo,
-            &mut self.playback_fifo_frames,
-            self.period_frames,
-            self.channels,
-        )?;
+        self.pad_playback_period()?;
 
         while self.playback_fifo_frames >= self.period_frames {
             let progressed = self.flush_playback_blocks()?;
@@ -815,6 +948,7 @@ impl SideAlsaStream {
 
     fn clear_playback_fifo(&mut self) {
         self.playback_fifo_frames = 0;
+        self.playback_fifo_locked_frames = 0;
         self.next_playback_sequence = None;
         self.playback_cycle_sequence = None;
         self.last_observed_playback_sequence = None;
@@ -822,6 +956,9 @@ impl SideAlsaStream {
     }
 
     fn discard_playback_periods(&mut self, periods: usize) -> Result<(), c_int> {
+        self.playback_fifo_locked_frames = self
+            .playback_fifo_locked_frames
+            .saturating_sub(periods.saturating_mul(self.period_frames));
         discard_playback_fifo_periods(
             &mut self.playback_fifo,
             &mut self.playback_fifo_frames,
@@ -980,6 +1117,9 @@ impl SideAlsaStream {
     }
 
     fn wait_period(&mut self) -> Result<u64, c_int> {
+        // Like native ALSA, a hardware timeline that stops advancing must surface as -EIO
+        // instead of blocking the application forever.
+        let mut timeouts = 0_u32;
         loop {
             let wait = if self.playback && self.pro {
                 self.stream
@@ -994,7 +1134,12 @@ impl SideAlsaStream {
                     }
                     return Ok(sequence);
                 }
-                Err(ClientError::Timeout) if !self.nonblock => continue,
+                Err(ClientError::Timeout) if !self.nonblock => {
+                    timeouts += 1;
+                    if timeouts >= BLOCKING_WAIT_TIMEOUTS {
+                        return Err(libc::EIO);
+                    }
+                }
                 Err(ClientError::Timeout) => return Err(libc::EAGAIN),
                 Err(error) => return Err(client_error_code(error)),
             }

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering, fence};
 
 use crate::StreamDirection;
 
@@ -292,8 +292,20 @@ impl HardwareTimeline {
         score_nanos: u64,
         target_met: bool,
     ) {
-        self.linked_phase_result_epoch
-            .fetch_add(1, Ordering::AcqRel);
+        // Both duplex workers can reset after a restart; keep the writer side exclusive.
+        loop {
+            let epoch = self.linked_phase_result_epoch.load(Ordering::Relaxed);
+            if epoch.is_multiple_of(2)
+                && self
+                    .linked_phase_result_epoch
+                    .compare_exchange_weak(epoch, epoch + 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        fence(Ordering::Release);
         self.linked_phase_attempts
             .store(attempts, Ordering::Relaxed);
         self.linked_phase_score_nanos
@@ -314,7 +326,8 @@ impl HardwareTimeline {
             let attempts = self.linked_phase_attempts.load(Ordering::Relaxed);
             let score_nanos = self.linked_phase_score_nanos.load(Ordering::Relaxed);
             let target_met = self.linked_phase_target_met.load(Ordering::Relaxed) != 0;
-            if start == self.linked_phase_result_epoch.load(Ordering::Acquire) {
+            fence(Ordering::Acquire);
+            if start == self.linked_phase_result_epoch.load(Ordering::Relaxed) {
                 return (attempts, score_nanos, target_met);
             }
         }
@@ -322,6 +335,10 @@ impl HardwareTimeline {
 
     pub(crate) fn record_pro_capture_read(&self, sequence: u64, nanos: u64) {
         let slot = &self.pro_timing[sequence as usize % PRO_TIMING_SLOT_COUNT];
+        // Invalidate first so a reader on another thread cannot pair the old sequence
+        // with the new timestamp.
+        slot.sequence.store(u64::MAX, Ordering::Relaxed);
+        fence(Ordering::Release);
         slot.capture_read_nanos.store(nanos, Ordering::Relaxed);
         slot.sequence.store(sequence, Ordering::Release);
     }
@@ -334,6 +351,10 @@ impl HardwareTimeline {
             return None;
         }
         let capture_read_nanos = slot.capture_read_nanos.load(Ordering::Relaxed);
+        fence(Ordering::Acquire);
+        if slot.sequence.load(Ordering::Relaxed) != sequence {
+            return None;
+        }
         if capture_read_nanos == 0 || nanos < capture_read_nanos {
             return None;
         }

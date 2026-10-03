@@ -16,6 +16,8 @@ use crate::diagnostics::{ProDiagnostics, ProDiagnosticsSnapshot, ProMiss};
 use crate::shared::{PlaybackReadyWait, SharedError, SharedEvents, SharedRegion};
 
 const SESSION_CLOSING: u64 = u64::MAX;
+// A stalled-but-connected client must not turn a repeated block into a sustained tone.
+const MAX_REPEATED_PLAYBACK_PERIODS: u32 = 4;
 
 struct SessionState {
     endpoint: Arc<EndpointSlot>,
@@ -1044,6 +1046,7 @@ impl DaemonState {
             prepared_shared_sequence: None,
             last_valid_pro: vec![0; self.period_frames * self.playback_channels].into_boxed_slice(),
             last_valid_pro_identity: None,
+            pro_repeated_periods: 0,
             core_miss_pro_sequence: None,
             timeline: Arc::clone(&self.timeline),
         };
@@ -1095,6 +1098,7 @@ pub struct DaemonPlaybackBridge {
     prepared_shared_sequence: Option<u64>,
     last_valid_pro: Box<[i32]>,
     last_valid_pro_identity: Option<ProPlaybackIdentity>,
+    pro_repeated_periods: u32,
     core_miss_pro_sequence: Option<u64>,
     timeline: Arc<HardwareTimeline>,
 }
@@ -1194,6 +1198,7 @@ struct SharedAudioPortBridge {
     index: usize,
     scratch: Box<[i32]>,
     last_valid_playback: Option<SharedPlaybackIdentity>,
+    repeated_periods: u32,
     observed_hardware_generation: Option<u64>,
     prepared: Option<PreparedSharedPlayback>,
 }
@@ -1227,6 +1232,7 @@ impl SharedAudioPortBridge {
             index: 0,
             scratch: vec![0; port.logical_samples].into_boxed_slice(),
             last_valid_playback: None,
+            repeated_periods: 0,
             observed_hardware_generation: None,
             prepared: None,
         }
@@ -1317,7 +1323,11 @@ impl SharedAudioPortBridge {
                         .compare_exchange(session_id, 0, Ordering::AcqRel, Ordering::Acquire);
                 self.outage.store(session_id, Ordering::Release);
             }
-            if self.repeat_on_underrun && self.last_valid_playback == Some(identity) {
+            if self.repeat_on_underrun
+                && self.last_valid_playback == Some(identity)
+                && self.repeated_periods < MAX_REPEATED_PLAYBACK_PERIODS
+            {
+                self.repeated_periods += 1;
                 self.prepared = Some(PreparedSharedPlayback {
                     sequence,
                     identity,
@@ -1369,6 +1379,7 @@ impl SharedAudioPortBridge {
                 );
             }
             self.last_valid_playback = Some(prepared.identity);
+            self.repeated_periods = 0;
         }
         let logical_channels = self.channels.len();
         for frame in 0..self.period_frames {
@@ -1553,6 +1564,7 @@ impl DaemonCaptureBridge {
                 endpoint.events.notify_capture();
             } else {
                 self.timeline.record_pro_capture_overrun();
+                endpoint.region.record_capture_discontinuity();
             }
         }
     }
@@ -1844,6 +1856,7 @@ impl DaemonPlaybackBridge {
                     .record_pro_playback_block(playback.iter().any(|sample| *sample != 0));
                 self.last_valid_pro.copy_from_slice(playback);
                 self.last_valid_pro_identity = Some(identity);
+                self.pro_repeated_periods = 0;
                 if self.pro_gate.armed.load(Ordering::Acquire) != session_id {
                     self.pro_gate.warmup_blocks.store(1, Ordering::Release);
                     let _ = self.pro_gate.armed.compare_exchange(
@@ -1885,13 +1898,21 @@ impl DaemonPlaybackBridge {
                         late: outcome == PlaybackConsume::Late,
                     });
                 }
-                if self.last_valid_pro_identity == Some(identity) {
+                if self.last_valid_pro_identity == Some(identity)
+                    && self.pro_repeated_periods < MAX_REPEATED_PLAYBACK_PERIODS
+                {
+                    self.pro_repeated_periods += 1;
                     playback.copy_from_slice(&self.last_valid_pro);
                 }
             } else if endpoint.region.client_state() == SHARED_CLIENT_STARTING {
                 self.pro_gate.warmup_blocks.store(0, Ordering::Release);
                 self.last_valid_pro_identity = None;
             }
+            // Publish the consumed watermark before waking the client so it never
+            // observes the stale sequence after poll returns.
+            endpoint
+                .region
+                .set_playback_sequence(sequence.wrapping_add(1));
             endpoint.events.notify_playback();
         } else {
             self.last_valid_pro_identity = None;
@@ -3717,6 +3738,88 @@ mod tests {
         assert!(state.start(shared.session_id));
         bridge.process(5, &[0; 8], &mut output);
         assert_eq!(output, [0; 8]);
+    }
+
+    #[test]
+    fn shared_playback_repeat_is_bounded_for_a_stalled_client() {
+        let profile_text = PROFILE.replace(
+            "shared_latency_periods = 0",
+            "shared_latency_periods = 0\n        shared_playback_repeat_on_underrun = true",
+        );
+        let profile = Profile::from_toml(&profile_text).expect("profile should parse");
+        let state = DaemonState::new(&profile, Arc::new(HardwareTimeline::default()))
+            .expect("state should create");
+        let shared = state
+            .open_shared("line1")
+            .expect("port should exist")
+            .expect("shared port should open");
+        assert!(state.start(shared.session_id));
+        activate_session(&state, shared.session_id, u64::MAX);
+
+        let mut producer_index = 0;
+        assert!(
+            state.shared[0]
+                .session
+                .current()
+                .region
+                .try_client_publish_playback(&mut producer_index, 0, &[10; 8])
+        );
+        let mut bridge = state.bridge();
+        let mut output = [0; 8];
+        bridge.process(0, &[0; 8], &mut output);
+        assert_eq!(output, [10; 8]);
+        let limit = u64::from(MAX_REPEATED_PLAYBACK_PERIODS);
+        for sequence in 1..=limit {
+            bridge.process(sequence, &[0; 8], &mut output);
+            assert_eq!(output, [10; 8]);
+        }
+        bridge.process(limit + 1, &[0; 8], &mut output);
+        assert_eq!(output, [0; 8]);
+
+        assert!(
+            state.shared[0]
+                .session
+                .current()
+                .region
+                .try_client_publish_playback(&mut producer_index, limit + 2, &[20; 8])
+        );
+        bridge.process(limit + 2, &[0; 8], &mut output);
+        assert_eq!(output, [20; 8]);
+        bridge.process(limit + 3, &[0; 8], &mut output);
+        assert_eq!(output, [20; 8]);
+    }
+
+    #[test]
+    fn pro_playback_repeat_is_bounded_for_a_stalled_client() {
+        let profile = Profile::from_toml(PROFILE).expect("profile should parse");
+        let timeline = Arc::new(HardwareTimeline::default());
+        let state = DaemonState::new(&profile, Arc::clone(&timeline)).expect("state should create");
+        let pro_session = open_pro(&state).0;
+        assert!(state.start(pro_session));
+        activate_session(&state, pro_session, 9);
+
+        let (_, mut playback) = state.bridges();
+        let mut pro_index = 0;
+        assert!(state.pro.current().region.try_client_publish_playback(
+            &mut pro_index,
+            10,
+            &[100; 8],
+        ));
+        let mut output = [0; 8];
+        playback.process_playback(10, &mut output);
+        playback.commit_playback(10, &mut output);
+        assert_eq!(output, [100; 8]);
+
+        let limit = u64::from(MAX_REPEATED_PLAYBACK_PERIODS);
+        for sequence in 11..=10 + limit {
+            playback.process_playback(sequence, &mut output);
+            playback.commit_playback(sequence, &mut output);
+            assert_eq!(output, [100; 8]);
+        }
+        playback.process_playback(11 + limit, &mut output);
+        playback.commit_playback(11 + limit, &mut output);
+        assert_eq!(output, [0; 8]);
+        assert_eq!(timeline.snapshot().pro_deadline_misses, limit + 1);
     }
 
     #[test]

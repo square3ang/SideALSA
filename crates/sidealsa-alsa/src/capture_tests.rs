@@ -500,3 +500,122 @@ fn partial_transfer_returns_prefix_and_latches_later_error() {
     assert_eq!(f.sync(64, 64, 4096), -libc::ENODEV);
     assert_eq!(f.read(1).0, -(libc::ENODEV as isize));
 }
+
+fn playback_area(samples: &[i32]) -> SideAlsaChannelArea {
+    SideAlsaChannelArea {
+        addr: samples.as_ptr().cast_mut().cast(),
+        first: 0,
+        step: 32,
+    }
+}
+
+fn restart_pro_playback_with_prepared(f: &mut Fixture, prepared: &[i32]) {
+    assert_eq!(unsafe { sidealsa_stream_stop(&mut f.adapter) }, 0);
+    assert_eq!(unsafe { sidealsa_stream_prepare(&mut f.adapter) }, 0);
+    let area = playback_area(prepared);
+    assert_eq!(
+        f.adapter
+            .transfer_playback(&area, 0, prepared.len())
+            .unwrap(),
+        prepared.len() as isize
+    );
+    f.adapter.start().unwrap();
+    f.region.reset_activation();
+    assert!(f.region.establish_activation(10));
+    f.region.set_cycle_sequence(11);
+    f.region.set_playback_sequence(11);
+    assert_eq!(
+        unsafe { sidealsa_stream_pump_pro_playback(&mut f.adapter) },
+        0
+    );
+}
+
+#[test]
+fn start_padding_is_hidden_from_the_playback_pointer() {
+    let mut f = Fixture::new_mode(false, MODE_PRO, STREAM_PLAYBACK, true);
+    let source = [42_i32; 30];
+    restart_pro_playback_with_prepared(&mut f, &source);
+    assert_eq!(f.adapter.playback_fifo_frames, 0);
+
+    let mut output = [0; 64];
+    assert!(f.region.try_consume_playback(11, &mut output));
+    assert_eq!(&output[..30], &source);
+    assert_eq!(&output[30..], &[0; 34]);
+    f.region.set_playback_sequence(12);
+    // ALSA's appl_ptr is 30; reporting the padded 64 would be a false XRUN.
+    assert_eq!(f.adapter.position(), 30);
+}
+
+#[test]
+fn playback_rewind_and_forward_edit_only_unsent_fifo() {
+    let mut f = Fixture::new_mode(false, MODE_PRO, STREAM_PLAYBACK, true);
+    assert_eq!(unsafe { sidealsa_stream_stop(&mut f.adapter) }, 0);
+    assert_eq!(unsafe { sidealsa_stream_prepare(&mut f.adapter) }, 0);
+    let source: [i32; 40] = std::array::from_fn(|i| i as i32 + 1);
+    let area = playback_area(&source);
+    assert_eq!(f.adapter.transfer_playback(&area, 0, 40).unwrap(), 40);
+
+    assert_eq!(
+        unsafe { sidealsa_stream_playback_rewind(&mut f.adapter, 10) },
+        0
+    );
+    assert_eq!(f.adapter.playback_fifo_frames, 30);
+    let rewritten = [7_i32; 10];
+    let area = playback_area(&rewritten);
+    assert_eq!(f.adapter.transfer_playback(&area, 0, 10).unwrap(), 10);
+    assert_eq!(&f.adapter.playback_fifo[..30], &source[..30]);
+    assert_eq!(&f.adapter.playback_fifo[30..40], &rewritten);
+
+    assert_eq!(
+        unsafe { sidealsa_stream_playback_forward(&mut f.adapter, 5) },
+        0
+    );
+    assert_eq!(f.adapter.playback_fifo_frames, 45);
+    assert_eq!(&f.adapter.playback_fifo[40..45], &[0; 5]);
+
+    assert_eq!(
+        unsafe { sidealsa_stream_playback_rewind(&mut f.adapter, 46) },
+        -libc::EPIPE
+    );
+    assert_eq!(f.adapter.playback_fifo_frames, 0);
+}
+
+#[test]
+fn playback_rewind_cannot_take_back_padding_or_submitted_audio() {
+    let mut f = Fixture::new_mode(false, MODE_PRO, STREAM_PLAYBACK, true);
+    restart_pro_playback_with_prepared(&mut f, &[42; 30]);
+    let more = [9_i32; 20];
+    let area = playback_area(&more);
+    assert_eq!(f.adapter.transfer_playback(&area, 0, 20).unwrap(), 20);
+    assert_eq!(f.adapter.playback_fifo_frames, 20);
+    assert_eq!(
+        unsafe { sidealsa_stream_playback_rewind(&mut f.adapter, 20) },
+        0
+    );
+    assert_eq!(
+        unsafe { sidealsa_stream_playback_rewind(&mut f.adapter, 1) },
+        -libc::EPIPE
+    );
+}
+
+#[test]
+fn running_reset_hides_audio_already_owned_by_the_daemon() {
+    let mut f = Fixture::new_mode(false, MODE_PRO, STREAM_PLAYBACK, true);
+    let source = [42_i32; 84];
+    restart_pro_playback_with_prepared(&mut f, &source);
+    assert_eq!(f.adapter.playback_fifo_frames, 20);
+    assert_eq!(f.adapter.position(), 0);
+
+    // ALSA believed 84 frames were queued: 64 submitted plus 20 in the FIFO.
+    assert_eq!(
+        unsafe { sidealsa_stream_playback_reset(&mut f.adapter, 84) },
+        0
+    );
+    assert_eq!(f.adapter.playback_fifo_frames, 0);
+    let mut output = [0; 64];
+    assert!(f.region.try_consume_playback(11, &mut output));
+    f.region.set_playback_sequence(12);
+    assert_eq!(f.adapter.position(), 0);
+    f.region.set_playback_sequence(13);
+    assert_eq!(f.adapter.position(), 64);
+}

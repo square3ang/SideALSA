@@ -629,7 +629,7 @@ else
     run_privileged install -D -m 0644 "$TMP_DIR/profile.toml" "$PROFILE_ACTUAL"
     info "installed profile: $PROFILE_ACTUAL"
 fi
-run_privileged install -D -m 0644 "$ROOT/LICENSE" "$(destination "$LICENSE_PATH")"
+run_privileged install -D -m 0644 "$ROOT/LICENSE.md" "$(destination "$LICENSE_PATH")"
 for doc in "$ROOT"/docs/*.md; do
     run_privileged install -D -m 0644 "$doc" "$(destination "$DOC_PREFIX/$(basename -- "$doc")")"
 done

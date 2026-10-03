@@ -38,6 +38,13 @@ Direct whole-period PRO requires `linked_phase_max_attempts = 0` and does not
 dither or restart a healthy linked stream during startup. The former Q32
 startup-qualification experiments remain documented in the ASIO history.
 
+When polled linked mode does use `linked_phase_max_attempts > 0`, every
+mid-run hardware recovery re-measures the restarted phase, because a restart
+lands on an arbitrary USB phase. Each attempt probes at most 16 periods. If the
+target is still missed after the configured attempts, streaming continues and
+`linked_phase_target_met` stays false; a recovery never stops the daemon just
+because the phase target was not reached.
+
 `device.realtime = true` is default. The linked hardware worker runs at
 `device.realtime_priority`; the reference profile uses `48`, below the
 PREEMPT_RT xHCI IRQ thread at `50` on the reference host. Setting realtime

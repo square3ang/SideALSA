@@ -66,6 +66,24 @@ lookahead. A paused endpoint does not increment the counter every period. The
 optional SHARED repeat setting reuses the last valid logical period during that
 outage without changing ioplug sequencing or XRUN behavior.
 
+## Playback cursor handling
+
+libasound implements `snd_pcm_rewind`, `snd_pcm_forward` and `snd_pcm_reset`
+by moving its own pointers without calling the plugin. The plugin tracks the
+playback `appl_ptr`/`hw_ptr` it last saw and applies such moves on the next
+transfer or pointer callback:
+
+- Forward queues the skipped frames as silence.
+- Rewind removes frames that are still in the plugin FIFO. Audio already handed
+  to the daemon, or padding inserted by the plugin, cannot be taken back; such a
+  rewind reports `-EPIPE` rather than silently shifting the timeline.
+- A reset while running drops the unsent FIFO. Audio the daemon already owns
+  still plays, and is hidden from the restarted pointer so `delay` stays truthful.
+
+Silence the plugin adds to complete a partial period at start or drain is also
+excluded from the reported pointer, so a short first write cannot cause a false
+XRUN or a permanent unreported SHARED delay.
+
 ## Limitations
 
 - S32_LE only.

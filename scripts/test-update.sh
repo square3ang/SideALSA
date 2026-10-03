@@ -16,7 +16,7 @@ mkdir -p "$CHECKOUT/scripts" "$CHECKOUT/target/release" "$CHECKOUT/build-gui" \
     "$CHECKOUT/build-asio" "$CHECKOUT/assets" "$STAGE" "$TMP/guard" "$TMP/bin"
 cp "$ROOT/scripts/install.sh" "$ROOT/scripts/update.sh" "$CHECKOUT/scripts/"
 cp "$ROOT/assets/sidealsa-icon.png" "$CHECKOUT/assets/"
-cp -a "$ROOT/packaging" "$ROOT/configs" "$ROOT/profiles" "$ROOT/docs" "$ROOT/LICENSE" "$CHECKOUT/"
+cp -a "$ROOT/packaging" "$ROOT/configs" "$ROOT/profiles" "$ROOT/docs" "$ROOT/LICENSE.md" "$CHECKOUT/"
 cp "$GENERATOR" "$CHECKOUT/target/release/"
 for binary in sidealsa-setup sidealsa-reconnect sidealsad sidealsa-hw-test sidealsa-pro-test sidealsa-loopback-test \
     sidealsa-stats sidealsa-pro-client-test sidealsa-shared-test sidealsa-admin; do

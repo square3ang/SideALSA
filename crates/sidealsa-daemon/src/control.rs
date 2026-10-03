@@ -78,6 +78,10 @@ pub fn run_control_listener(
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
             }
+            Err(error) if is_transient_accept_error(&error) => {
+                // Descriptor/memory pressure must not take the hardware engine down.
+                thread::sleep(Duration::from_millis(100));
+            }
             Err(error) => return Err(error.into()),
         }
     }
@@ -89,6 +93,24 @@ pub fn run_control_listener(
         let _ = std::fs::remove_file(path);
     }
     Ok(())
+}
+
+fn is_transient_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+    ) || matches!(
+        error.raw_os_error(),
+        Some(
+            libc::EMFILE
+                | libc::ENFILE
+                | libc::ENOBUFS
+                | libc::ENOMEM
+                | libc::EPROTO
+                | libc::EPERM
+                | libc::ECONNABORTED
+        )
+    )
 }
 
 fn remove_stale_socket(path: &Path) -> Result<(), io::Error> {
@@ -145,6 +167,17 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
                     io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
                 ) =>
             {
+                break;
+            }
+            Err(ProtocolError::UnsupportedVersion(version)) => {
+                let _ = send_response(
+                    &mut stream,
+                    &Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("unsupported client protocol version {version}"),
+                    },
+                    &[],
+                );
                 break;
             }
             Err(_) => break,
