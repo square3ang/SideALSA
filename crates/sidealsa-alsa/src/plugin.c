@@ -57,7 +57,6 @@ typedef struct {
 	 */
 	snd_pcm_uframes_t playback_expected_appl_ptr;
 	snd_pcm_uframes_t playback_reported_hw_ptr;
-	snd_pcm_uframes_t avail_min;
 	int buffered_capture;
 	/*
 	 * libasound calls drain, prepare and sw_params without the PCM lock, so a
@@ -262,8 +261,6 @@ static int sidealsa_sw_params(snd_pcm_ioplug_t *io, snd_pcm_sw_params_t *params)
 	sidealsa_pcm_t *pcm = io->private_data;
 	pthread_mutex_lock(&pcm->lock);
 	int result = snd_pcm_sw_params_get_boundary(params, &pcm->boundary);
-	if (result >= 0)
-		result = snd_pcm_sw_params_get_avail_min(params, &pcm->avail_min);
 	pthread_mutex_unlock(&pcm->lock);
 	return result;
 }
@@ -279,33 +276,8 @@ static int sidealsa_poll_revents(snd_pcm_ioplug_t *io, struct pollfd *pfds,
 		return 0;
 	}
 	*revents = (pfds[0].revents | pfds[1].revents) & (POLLERR | POLLNVAL);
-	if (pfds[0].revents & POLLIN) {
-		sidealsa_pcm_t *pcm = io->private_data;
-		uint64_t ignored;
-		pthread_mutex_lock(&pcm->lock);
-		/*
-		 * The eventfd fires every internal period but only transfer drains it.
-		 * Drain before reading the pointer so a wake racing this check is not
-		 * lost, and stay quiet below avail_min or libasound re-polls in a spin.
-		 */
-		while (read(pfds[0].fd, &ignored, sizeof(ignored)) > 0)
-			;
-		snd_pcm_sframes_t hw_ptr = sidealsa_pointer_locked(io);
-		int ready = 0;
-		if (hw_ptr == -EPIPE)
-			/* The pointer already counted this XRUN. */
-			snd_pcm_ioplug_set_state(io, SND_PCM_STATE_XRUN);
-		else if (hw_ptr < 0)
-			sidealsa_set_error_state(io, hw_ptr);
-		else
-			ready = snd_pcm_ioplug_avail(io, (snd_pcm_uframes_t)hw_ptr,
-						     io->appl_ptr) >= pcm->avail_min;
-		pthread_mutex_unlock(&pcm->lock);
-		if (hw_ptr < 0)
-			*revents |= POLLERR;
-		else if (ready)
-			*revents |= io->stream == SND_PCM_STREAM_PLAYBACK ? POLLOUT : POLLIN;
-	}
+	if (pfds[0].revents & POLLIN)
+		*revents |= io->stream == SND_PCM_STREAM_PLAYBACK ? POLLOUT : POLLIN;
 	return 0;
 }
 
@@ -492,7 +464,6 @@ int sidealsa_plugin_open(snd_pcm_t **pcmp, const char *name,
 		return -ENOMEM;
 	pcm->poll_fd = -1;
 	pcm->control_fd = -1;
-	pcm->avail_min = 1;
 	result = pthread_mutex_init(&pcm->lock, NULL);
 	if (result) {
 		free(pcm);
