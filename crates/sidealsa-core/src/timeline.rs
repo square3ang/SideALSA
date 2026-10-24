@@ -41,7 +41,6 @@ pub struct HardwareTimeline {
     capture_delay_min_frames: AtomicU64,
     capture_delay_max_frames: AtomicU64,
     playback_target_overshoot_max_frames: AtomicU64,
-    capture_clock_wait_max_nanos: AtomicU64,
     pro_wait_budget_min_nanos: AtomicU64,
     pro_wait_budget_max_nanos: AtomicU64,
     pro_ready_wait_max_nanos: AtomicU64,
@@ -91,7 +90,6 @@ pub struct HardwareStats {
     pub capture_delay_min_frames: u64,
     pub capture_delay_max_frames: u64,
     pub playback_target_overshoot_max_frames: u64,
-    pub capture_clock_wait_max_nanos: u64,
     pub pro_wait_budget_min_nanos: u64,
     pub pro_wait_budget_max_nanos: u64,
     pub pro_ready_wait_max_nanos: u64,
@@ -169,7 +167,6 @@ impl HardwareTimeline {
             playback_target_overshoot_max_frames: self
                 .playback_target_overshoot_max_frames
                 .load(Ordering::Relaxed),
-            capture_clock_wait_max_nanos: self.capture_clock_wait_max_nanos.load(Ordering::Relaxed),
             pro_wait_budget_min_nanos: decode_minimum(
                 self.pro_wait_budget_min_nanos.load(Ordering::Relaxed),
             ),
@@ -446,15 +443,17 @@ impl HardwareTimeline {
         }
     }
 
-    pub(crate) fn reset_after_hardware_xrun(&self) {
-        self.reset_after_hardware_restart();
-    }
-
-    pub(crate) fn reset_after_hardware_restart(&self) {
+    // Split workers restart each stream on its own FIFO thread and never calibrate linked phase,
+    // so they must not contend on the calibration seqlock.
+    pub(crate) fn reset_after_stream_restart(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.timeline_resets.fetch_add(1, Ordering::Relaxed);
         self.duplex_pointer_phase_sample_count
             .store(0, Ordering::Release);
+    }
+
+    pub(crate) fn reset_after_hardware_restart(&self) {
+        self.reset_after_stream_restart();
         self.record_linked_phase_calibration(0, 0, false);
     }
 
@@ -504,7 +503,7 @@ mod tests {
         timeline.update_capture_position(64);
         timeline.processed_frames(64, 1);
         timeline.record_hardware_xrun(StreamDirection::Capture);
-        timeline.reset_after_hardware_xrun();
+        timeline.reset_after_hardware_restart();
         timeline.update_playback_position(0);
         timeline.update_capture_position(0);
         timeline.processed_frames(64, 1);
@@ -560,12 +559,25 @@ mod tests {
         let timeline = HardwareTimeline::default();
         timeline.record_linked_phase_calibration(3, 300_000, true);
 
-        timeline.reset_after_hardware_xrun();
+        timeline.reset_after_hardware_restart();
 
         let stats = timeline.snapshot();
         assert_eq!(stats.linked_phase_attempts, 0);
         assert_eq!(stats.linked_phase_score_nanos, 0);
         assert!(!stats.linked_phase_target_met);
+    }
+
+    #[test]
+    fn split_stream_restart_leaves_linked_phase_score_alone() {
+        let timeline = HardwareTimeline::default();
+        timeline.record_linked_phase_calibration(3, 300_000, true);
+
+        timeline.reset_after_stream_restart();
+
+        let stats = timeline.snapshot();
+        assert_eq!(stats.generation, 1);
+        assert_eq!(stats.linked_phase_attempts, 3);
+        assert!(stats.linked_phase_target_met);
     }
 
     #[test]
@@ -690,7 +702,6 @@ mod tests {
 
         let stats = timeline.snapshot();
         assert_eq!(stats.playback_target_overshoot_max_frames, 4);
-        assert_eq!(stats.capture_clock_wait_max_nanos, 0);
         assert_eq!(stats.pro_wait_budget_min_nanos, 0);
         assert_eq!(stats.pro_wait_budget_max_nanos, 50);
         assert_eq!(stats.pro_ready_wait_max_nanos, 30);

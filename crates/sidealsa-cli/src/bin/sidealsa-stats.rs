@@ -97,8 +97,8 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
             stats.capture_delay_min_frames, stats.capture_delay_max_frames,
         );
         println!(
-            "playback_overshoot_max={} capture_clock_wait_max_nanos={}",
-            stats.playback_target_overshoot_max_frames, stats.capture_clock_wait_max_nanos,
+            "playback_overshoot_max={}",
+            stats.playback_target_overshoot_max_frames,
         );
         println!(
             "pro_wait_budget_nanos_min={} pro_wait_budget_nanos_max={} pro_ready_wait_max_nanos={} playback_write_max_nanos={}",
@@ -163,7 +163,7 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
 
 fn parse_args() -> Result<Args, String> {
     let mut arguments = std::env::args_os().skip(1);
-    let mut socket = PathBuf::from("/tmp/sidealsad.sock");
+    let mut socket = PathBuf::from(sidealsa_config::selection::DEFAULT_SOCKET_PATH);
     let mut samples = 100;
     let mut interval_ms = 10;
     let mut expect_peer_pid = None;

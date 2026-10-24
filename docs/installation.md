@@ -33,11 +33,11 @@ Installer defaults:
 - PipeWire Pulse scheduling: `/etc/pipewire/pipewire-pulse.conf.d/99-sidealsa.conf`
 - WirePlumber scheduling: `/etc/wireplumber/wireplumber.conf.d/99-sidealsa.conf`
 - daemon service: `sidealsad.service`
-- socket: `/tmp/sidealsad.sock`
+- socket: `/run/sidealsa/sidealsad.sock` (systemd `RuntimeDirectory`)
 - control panel: `/usr/local/bin/sidealsa-control`
 - privileged helper: `/usr/libexec/sidealsa-admin`
 - polkit action: `org.sidealsa.configure`
-- socket access: `audio` group when available
+- socket access: `audio` group (required; installation stops without it)
 - realtime scheduling: profile-controlled, enabled by default
 
 The profile is seeded only on first install. Reinstalling or upgrading never

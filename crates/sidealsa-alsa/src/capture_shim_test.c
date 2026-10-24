@@ -3,13 +3,15 @@
 #include "plugin.c"
 #undef snd_pcm_ioplug_avail
 #include <assert.h>
+#include <sys/eventfd.h>
 
 /* Pointer arithmetic is tested in Rust; do not dereference a real ALSA PCM. */
+static snd_pcm_uframes_t test_avail;
 snd_pcm_uframes_t test_ioplug_avail(const snd_pcm_ioplug_t *io,
 	snd_pcm_uframes_t hw, snd_pcm_uframes_t app)
 {
 	(void)io; (void)hw; (void)app;
-	return 0;
+	return test_avail;
 }
 
 struct sidealsa_stream {
@@ -69,8 +71,8 @@ int sidealsa_stream_open(const char *socket, int mode, const char *port,
 int main(void)
 {
 	sidealsa_stream_t stream = { .position = 128, .transfer_result = 16 };
-	sidealsa_pcm_t pcm = { .stream = &stream, .shared = 1,
-		.buffered_capture = 1, .boundary = 4096 };
+	sidealsa_pcm_t pcm = { .stream = &stream,
+		.buffered_capture = 1, .boundary = 4096, .avail_min = 1 };
 	pthread_mutex_init(&pcm.lock, NULL);
 	snd_pcm_ioplug_t *io = &pcm.io;
 	io->private_data = &pcm;
@@ -106,7 +108,6 @@ int main(void)
 	assert(pcm.capture_expected_appl_ptr == 0);
 	assert(sidealsa_pointer(io) == 128);
 	int calls = stream.sync_calls;
-	pcm.shared = 0;
 	io->state = SND_PCM_STATE_RUNNING;
 	assert(sidealsa_transfer(io, NULL, 0, 64) == 16);
 	assert(stream.sync_calls == calls + 1); /* directional PRO capture */
@@ -116,7 +117,6 @@ int main(void)
 	calls = stream.sync_calls;
 	assert(sidealsa_transfer(io, NULL, 0, 64) == 16);
 	assert(sidealsa_pointer(io) == 128);
-	pcm.shared = 1;
 	pcm.buffered_capture = 1; /* direction check is defensive too */
 	io->stream = SND_PCM_STREAM_PLAYBACK;
 	assert(sidealsa_transfer(io, NULL, 0, 64) == 16);
@@ -156,5 +156,22 @@ int main(void)
 	assert(sidealsa_pointer(io) == 0);
 	assert(stream.reset_calls == 1 && stream.reset_queued == 60);
 	assert(pcm.playback_expected_appl_ptr == 0 && pcm.playback_reported_hw_ptr == 0);
+
+	/* Poll readiness honours avail_min and drains the period eventfd. */
+	int event = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	assert(event >= 0);
+	uint64_t one = 1;
+	struct pollfd fds[2] = { { .fd = event, .revents = POLLIN }, { .fd = -1 } };
+	unsigned short revents;
+	pcm.avail_min = 256;
+	test_avail = 64;
+	assert(write(event, &one, sizeof(one)) == sizeof(one));
+	assert(sidealsa_poll_revents(io, fds, 2, &revents) == 0);
+	assert(revents == 0);
+	assert(read(event, &one, sizeof(one)) < 0 && errno == EAGAIN);
+	test_avail = 256;
+	assert(sidealsa_poll_revents(io, fds, 2, &revents) == 0);
+	assert(revents == POLLOUT);
+	close(event);
 	return 0;
 }

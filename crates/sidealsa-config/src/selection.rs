@@ -10,7 +10,7 @@ use std::{
 
 pub const INSTALLED_SELECTION_PATH: &str = "/etc/sidealsa/active.toml";
 pub const LEGACY_PROFILE_PATH: &str = "/etc/sidealsa/profiles/topping-e1x2.toml";
-pub const DEFAULT_SOCKET_PATH: &str = "/tmp/sidealsad.sock";
+pub const DEFAULT_SOCKET_PATH: &str = "/run/sidealsa/sidealsad.sock";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

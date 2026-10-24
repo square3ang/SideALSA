@@ -157,7 +157,7 @@ fn maybe_delay(args: &Args, sequence: u64) {
 
 fn parse_args() -> Result<Args, String> {
     let mut arguments = std::env::args_os().skip(1);
-    let mut socket = PathBuf::from("/tmp/sidealsad.sock");
+    let mut socket = PathBuf::from(sidealsa_config::selection::DEFAULT_SOCKET_PATH);
     let mut port = None;
     let mut periods = 3000;
     let mut delay_ms = 0;
@@ -234,7 +234,10 @@ fn print_help() {
     println!(
         "sidealsa-shared-test [--socket PATH] [--port ID] [--periods COUNT] [--delay-ms MS] [--delay-every COUNT] [--tone-hz HZ]"
     );
-    println!("default socket: /tmp/sidealsad.sock");
+    println!(
+        "default socket: {}",
+        sidealsa_config::selection::DEFAULT_SOCKET_PATH
+    );
     println!("default port: first profile playback port, otherwise first capture port");
     println!("default periods: 3000");
 }

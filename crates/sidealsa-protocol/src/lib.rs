@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     io::{self, Read, Write},
     mem::{align_of, size_of},
     sync::atomic::{AtomicU32, AtomicU64},
@@ -6,7 +7,7 @@ use std::{
 
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 16;
+pub const PROTOCOL_VERSION: u16 = 17;
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"SALS";
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 pub const FEATURE_PRO: u32 = 1 << 0;
@@ -155,7 +156,6 @@ pub struct Stats {
     pub capture_delay_min_frames: u64,
     pub capture_delay_max_frames: u64,
     pub playback_target_overshoot_max_frames: u64,
-    pub capture_clock_wait_max_nanos: u64,
     pub pro_wait_budget_min_nanos: u64,
     pub pro_wait_budget_max_nanos: u64,
     pub pro_ready_wait_max_nanos: u64,
@@ -709,7 +709,6 @@ fn encode_stats(payload: &mut Vec<u8>, stats: &Stats) -> Result<(), ProtocolErro
         stats.capture_delay_min_frames,
         stats.capture_delay_max_frames,
         stats.playback_target_overshoot_max_frames,
-        stats.capture_clock_wait_max_nanos,
         stats.pro_wait_budget_min_nanos,
         stats.pro_wait_budget_max_nanos,
         stats.pro_ready_wait_max_nanos,
@@ -786,7 +785,6 @@ fn decode_stats(decoder: &mut Decoder<'_>) -> Result<Stats, ProtocolError> {
         capture_delay_min_frames: decoder.u64()?,
         capture_delay_max_frames: decoder.u64()?,
         playback_target_overshoot_max_frames: decoder.u64()?,
-        capture_clock_wait_max_nanos: decoder.u64()?,
         pro_wait_budget_min_nanos: decoder.u64()?,
         pro_wait_budget_max_nanos: decoder.u64()?,
         pro_ready_wait_max_nanos: decoder.u64()?,
@@ -1139,6 +1137,31 @@ pub fn shared_slot_header_alignment() -> usize {
     align_of::<SharedSlotHeader>()
 }
 
+/// Orders wrapping sequence numbers by forward distance; values exactly half
+/// the u64 range apart have no order.
+pub fn sequence_order(candidate: u64, reference: u64) -> Option<Ordering> {
+    const HALF_RANGE: u64 = 1_u64 << 63;
+
+    let distance = candidate.wrapping_sub(reference);
+    if distance == 0 {
+        Some(Ordering::Equal)
+    } else if distance < HALF_RANGE {
+        Some(Ordering::Greater)
+    } else if distance == HALF_RANGE {
+        None
+    } else {
+        Some(Ordering::Less)
+    }
+}
+
+pub fn sequence_is_after(candidate: u64, reference: u64) -> bool {
+    sequence_order(candidate, reference) == Some(Ordering::Greater)
+}
+
+pub fn sequence_is_before(candidate: u64, reference: u64) -> bool {
+    sequence_order(candidate, reference) == Some(Ordering::Less)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1155,8 +1178,17 @@ mod tests {
     }
 
     #[test]
+    fn sequence_order_wraps_at_half_range() {
+        assert!(sequence_is_after(0, u64::MAX));
+        assert!(sequence_is_before(u64::MAX, 0));
+        assert!(!sequence_is_after(5, 5) && !sequence_is_before(5, 5));
+        assert_eq!(sequence_order(1_u64 << 63, 0), None);
+        assert!(!sequence_is_after(1_u64 << 63, 0) && !sequence_is_before(1_u64 << 63, 0));
+    }
+
+    #[test]
     fn directional_pro_round_trips_without_changing_classic_wire() {
-        assert_eq!(PROTOCOL_VERSION, 16);
+        assert_eq!(PROTOCOL_VERSION, 17);
         assert_eq!(FEATURE_PRO_DIRECTIONS, 4);
         assert_eq!(
             encode_request(&Request::OpenPro).unwrap(),
@@ -1220,7 +1252,6 @@ mod tests {
             capture_delay_min_frames: 0,
             capture_delay_max_frames: 64,
             playback_target_overshoot_max_frames: 4,
-            capture_clock_wait_max_nanos: 20,
             pro_wait_budget_min_nanos: 30,
             pro_wait_budget_max_nanos: 40,
             pro_ready_wait_max_nanos: 50,

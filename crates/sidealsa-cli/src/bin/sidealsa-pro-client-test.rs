@@ -139,7 +139,7 @@ fn maybe_delay(args: &Args, sequence: u64) {
 
 fn parse_args() -> Result<Args, String> {
     let mut arguments = std::env::args_os().skip(1);
-    let mut socket = PathBuf::from("/tmp/sidealsad.sock");
+    let mut socket = PathBuf::from(sidealsa_config::selection::DEFAULT_SOCKET_PATH);
     let mut periods = 3000;
     let mut delay_ms = 0;
     let mut delay_every = 16;
@@ -201,6 +201,9 @@ fn print_help() {
     println!(
         "sidealsa-pro-client-test [--socket PATH] [--periods COUNT] [--delay-ms MS] [--delay-every COUNT]"
     );
-    println!("default socket: /tmp/sidealsad.sock");
+    println!(
+        "default socket: {}",
+        sidealsa_config::selection::DEFAULT_SOCKET_PATH
+    );
     println!("default periods: 3000");
 }

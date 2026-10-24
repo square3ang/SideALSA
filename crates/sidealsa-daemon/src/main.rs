@@ -36,7 +36,8 @@ fn main() {
         Ok(profile) => profile,
         Err(error) => {
             eprintln!("{error}");
-            std::process::exit(1);
+            // EX_CONFIG: a bad profile will not fix itself on a systemd restart.
+            std::process::exit(78);
         }
     };
     if args.pro_diagnostics && !profile.device.uses_event_driven_linked_pro() {

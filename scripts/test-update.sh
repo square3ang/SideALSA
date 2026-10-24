@@ -111,6 +111,14 @@ contains "$MANIFEST" 'sidealsa-asio64.dll'
 [[ -f "$STAGE/usr/local/lib/wine/x86_64-windows/sidealsa-asio64.dll" ]] || fail 'asio dll retired by update'
 [[ "$(sha256sum -- "$PROFILE")" == "$sha_before" ]] || fail 'asio update changed profile'
 
+# --prefix must select that prefix's manifest, not the environment PREFIX.
+DESTDIR="$TMP/opt-stage" PREFIX=/opt/sidealsa bash "$CHECKOUT/scripts/install.sh" \
+    --no-build --no-gui --no-start --profile profiles/generic.toml --with-asio \
+    > "$TMP/opt.log" 2>&1 || { cat "$TMP/opt.log"; fail 'opt install'; }
+DESTDIR="$TMP/opt-stage" bash "$CHECKOUT/scripts/update.sh" --no-build --no-start \
+    --prefix /opt/sidealsa > "$TMP/opt-update.log" 2>&1 || { cat "$TMP/opt-update.log"; fail 'opt update'; }
+contains "$TMP/opt-stage/opt/sidealsa/share/sidealsa/install-manifest" 'sidealsa-asio64.dll'
+
 # Profile-changing and unknown options are refused without touching staging.
 for refused in --profile --replace-profile --interactive --bogus; do
     rm -rf "$TMP/before"

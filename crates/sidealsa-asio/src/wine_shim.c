@@ -240,7 +240,7 @@ asio_socket_path(char *path, size_t size)
 {
     DWORD length = GetEnvironmentVariableA("SIDEALSA_SOCKET", path, (DWORD)size);
     if (!length || length >= size)
-        return "/tmp/sidealsad.sock";
+        return "/run/sidealsa/sidealsad.sock";
     return path;
 }
 

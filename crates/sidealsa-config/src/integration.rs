@@ -212,7 +212,7 @@ mod tests {
     fn legacy_golden() {
         let profile = profile();
         assert_eq!(
-            render_alsa(&profile, "/tmp/sidealsad.sock").unwrap(),
+            render_alsa(&profile, crate::selection::DEFAULT_SOCKET_PATH).unwrap(),
             format!(
                 "{HEADER}{}",
                 include_str!("../tests/fixtures/topping-asound.conf")

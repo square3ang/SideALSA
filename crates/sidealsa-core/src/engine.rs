@@ -269,10 +269,6 @@ impl DuplexEngine {
         RealtimeGuard::enter(self.config.realtime_priority as i32, "set SCHED_FIFO").map(Some)
     }
 
-    pub fn start(&mut self) -> Result<(), EngineError> {
-        self.start_with_capture_lead(Duration::ZERO)
-    }
-
     fn prepare_worker_start(&mut self) -> Result<bool, EngineError> {
         if self.started {
             return Ok(false);
@@ -480,7 +476,7 @@ impl DuplexEngine {
         Ok(start_frames)
     }
 
-    fn start_with_capture_lead(&mut self, capture_lead: Duration) -> Result<(), EngineError> {
+    pub fn start(&mut self) -> Result<(), EngineError> {
         if self.started {
             return Ok(());
         }
@@ -525,9 +521,6 @@ impl DuplexEngine {
                     StreamDirection::Capture,
                 )?;
             }
-            if !capture_lead.is_zero() {
-                std::thread::sleep(capture_lead);
-            }
             if playback_pcm.state() != State::Running {
                 alsa_call(
                     playback_pcm.start(),
@@ -546,130 +539,7 @@ impl DuplexEngine {
     }
 
     pub fn run(&mut self, stop: &AtomicBool, max_periods: Option<u64>) -> Result<(), EngineError> {
-        let deferred_worker_start = self.prepare_worker_start()?;
-
-        let done = AtomicBool::new(false);
-        let playback_pcm = self
-            .playback_pcm
-            .take()
-            .ok_or_else(|| EngineError::InvalidConfig("playback worker is active".into()))?;
-        let capture_pcm = match self.capture_pcm.take() {
-            Some(pcm) => pcm,
-            None => {
-                self.playback_pcm = Some(playback_pcm);
-                return Err(EngineError::InvalidConfig(
-                    "capture worker is active".into(),
-                ));
-            }
-        };
-        let playback_silence = &self.playback_silence;
-        let capture_scratch = &mut self.capture_scratch;
-        let timeline = &self.timeline;
-        let capture_channels = self.capture_channels;
-        let capture_period_samples = self.capture_period_samples;
-        let playback_channels = self.playback_channels;
-        let playback_period_samples = self.playback_period_samples;
-        let period = self.period;
-        let buffer = self.buffer;
-        let capture_config = CaptureWorkerConfig {
-            channels: capture_channels,
-            period_samples: capture_period_samples,
-            period,
-            initial_pro_sequence: 0,
-            realtime_priority: self
-                .config
-                .realtime
-                .then_some((self.config.realtime_priority as i32 - 1).max(1)),
-        };
-        let playback_config = PlaybackWorkerConfig {
-            silence: playback_silence,
-            channels: playback_channels,
-            period_samples: playback_period_samples,
-            start_samples: self.playback_start_samples,
-            start_frames: self.playback_start_frames,
-            period,
-            buffer,
-            rate: self.config.rate,
-            timer_scheduling: self.playback_timer_scheduling,
-            sequence_lead: 0,
-            guard_frames: period,
-            realtime_priority: self
-                .config
-                .realtime
-                .then_some(self.config.realtime_priority as i32),
-        };
-        let start_gate = DuplexStartGate::new(self.duplex_link);
-        let capture_control = WorkerControl {
-            timeline,
-            stop,
-            done: &done,
-            start_gate: deferred_worker_start.then_some(&start_gate),
-            hardware_ready: None,
-            capture_cycle_generation: None,
-        };
-        let playback_control = capture_control;
-        std::thread::scope(|scope| -> Result<_, EngineError> {
-            let capture_handle = std::thread::Builder::new()
-                .spawn_scoped(scope, move || {
-                    signal_worker_panic(capture_control, || {
-                        capture_worker(
-                            capture_pcm,
-                            capture_scratch,
-                            capture_config,
-                            capture_control,
-                            None,
-                            None,
-                        )
-                    })
-                })
-                .map_err(|source| EngineError::WorkerSpawn {
-                    worker: "capture",
-                    source,
-                })?;
-            let playback_handle = match std::thread::Builder::new().spawn_scoped(scope, move || {
-                signal_worker_panic(playback_control, || {
-                    playback_worker(
-                        playback_pcm,
-                        playback_config,
-                        playback_control,
-                        None,
-                        None,
-                        None,
-                        max_periods,
-                    )
-                })
-            }) {
-                Ok(handle) => handle,
-                Err(source) => {
-                    done.store(true, Ordering::Release);
-                    return Err(EngineError::WorkerSpawn {
-                        worker: "playback",
-                        source,
-                    });
-                }
-            };
-            let playback_result = playback_handle
-                .join()
-                .map_err(|_| EngineError::WorkerPanic)?;
-            let capture_result = capture_handle
-                .join()
-                .map_err(|_| EngineError::WorkerPanic)?;
-            Ok((playback_result, capture_result))
-        })
-        .map(
-            |((playback_pcm, playback_result), (capture_pcm, capture_result))| {
-                self.playback_pcm = Some(playback_pcm);
-                self.capture_pcm = Some(capture_pcm);
-                let result = playback_result.and(capture_result);
-                if result.is_err() {
-                    self.cleanup_startup_failure();
-                }
-                result
-            },
-        )
-        .inspect_err(|_| {
-            self.started = false;
-        })?
+        self.run_split_workers(stop, max_periods, None, 0, None)
     }
 
     pub fn run_pro<C: ProCaptureSink, P: ProPlaybackSource>(
@@ -718,8 +588,30 @@ impl DuplexEngine {
             );
         }
 
-        let mut playback_scratch = vec![0; self.playback_period_samples];
-        let sequence_lead = u64::from(self.config.pro_latency_periods);
+        self.run_split_workers(
+            stop,
+            max_periods,
+            hardware_ready,
+            u64::from(self.config.pro_latency_periods),
+            Some((&mut capture_sink, &mut playback_source)),
+        )
+    }
+
+    fn run_split_workers(
+        &mut self,
+        stop: &AtomicBool,
+        max_periods: Option<u64>,
+        hardware_ready: Option<&AtomicBool>,
+        sequence_lead: u64,
+        pro: Option<(&mut dyn ProCaptureSink, &mut dyn ProPlaybackSource)>,
+    ) -> Result<(), EngineError> {
+        let is_pro = pro.is_some();
+        let (capture_sink, playback_source) = pro.unzip();
+        let mut playback_scratch = if is_pro {
+            vec![0; self.playback_period_samples]
+        } else {
+            Vec::new()
+        };
         let pro_clock = ProClock::new(sequence_lead);
         let deferred_worker_start = self.prepare_worker_start()?;
 
@@ -738,6 +630,9 @@ impl DuplexEngine {
                 ));
             }
         };
+        // Workers hand their PCM back through these slots, so a failed spawn keeps the device.
+        let mut playback_slot = Some(playback_pcm);
+        let mut capture_slot = Some(capture_pcm);
         let playback_silence = &self.playback_silence;
         let capture_scratch = &mut self.capture_scratch;
         let timeline = &self.timeline;
@@ -775,23 +670,30 @@ impl DuplexEngine {
             done: &done,
             start_gate: deferred_worker_start.then_some(&start_gate),
             hardware_ready,
-            capture_cycle_generation: Some(&capture_cycle_generation),
+            capture_cycle_generation: is_pro.then_some(&capture_cycle_generation),
         };
         let playback_control = capture_control;
-        std::thread::scope(|scope| -> Result<_, EngineError> {
-            let capture_clock = &pro_clock;
-            let playback_clock = &pro_clock;
+        let outcome = std::thread::scope(|scope| -> Result<_, EngineError> {
+            let pro_clock = is_pro.then_some(&pro_clock);
+            let capture_slot = &mut capture_slot;
+            let playback_slot = &mut playback_slot;
+            let playback_scratch = is_pro.then_some(&mut playback_scratch[..]);
             let capture_handle = std::thread::Builder::new()
                 .spawn_scoped(scope, move || {
                     signal_worker_panic(capture_control, || {
-                        capture_worker(
-                            capture_pcm,
+                        let pcm = capture_slot.take().ok_or_else(|| {
+                            EngineError::InvalidConfig("capture worker is active".into())
+                        })?;
+                        let (pcm, result) = capture_worker(
+                            pcm,
                             capture_scratch,
                             capture_config,
                             capture_control,
-                            Some(capture_clock),
-                            Some(&mut capture_sink),
-                        )
+                            pro_clock,
+                            capture_sink,
+                        );
+                        *capture_slot = Some(pcm);
+                        result
                     })
                 })
                 .map_err(|source| EngineError::WorkerSpawn {
@@ -800,20 +702,26 @@ impl DuplexEngine {
                 })?;
             let playback_handle = match std::thread::Builder::new().spawn_scoped(scope, move || {
                 signal_worker_panic(playback_control, || {
-                    playback_worker(
-                        playback_pcm,
+                    let pcm = playback_slot.take().ok_or_else(|| {
+                        EngineError::InvalidConfig("playback worker is active".into())
+                    })?;
+                    let (pcm, result) = playback_worker(
+                        pcm,
                         playback_config,
                         playback_control,
-                        Some(playback_clock),
-                        Some(&mut playback_scratch),
-                        Some(&mut playback_source),
+                        pro_clock,
+                        playback_scratch,
+                        playback_source,
                         max_periods,
-                    )
+                    );
+                    *playback_slot = Some(pcm);
+                    result
                 })
             }) {
                 Ok(handle) => handle,
                 Err(source) => {
                     done.store(true, Ordering::Release);
+                    let _ = capture_handle.join();
                     return Err(EngineError::WorkerSpawn {
                         worker: "playback",
                         source,
@@ -826,22 +734,15 @@ impl DuplexEngine {
             let capture_result = capture_handle
                 .join()
                 .map_err(|_| EngineError::WorkerPanic)?;
-            Ok((playback_result, capture_result))
-        })
-        .map(
-            |((playback_pcm, playback_result), (capture_pcm, capture_result))| {
-                self.playback_pcm = Some(playback_pcm);
-                self.capture_pcm = Some(capture_pcm);
-                let result = playback_result.and(capture_result);
-                if result.is_err() {
-                    self.cleanup_startup_failure();
-                }
-                result
-            },
-        )
-        .inspect_err(|_| {
-            self.started = false;
-        })?
+            Ok(playback_result.and(capture_result))
+        });
+        self.playback_pcm = playback_slot;
+        self.capture_pcm = capture_slot;
+        let result = outcome.and_then(|result| result);
+        if result.is_err() {
+            self.cleanup_startup_failure();
+        }
+        result
     }
 
     fn run_pro_linked(
@@ -1991,6 +1892,16 @@ impl Drop for PlaybackCommitGuard<'_> {
     }
 }
 
+// Stream recovery can take seconds; client STOP/CLOSE must not spin on the barrier meanwhile.
+fn recover_with_commit_released(
+    playback_commit: &mut PlaybackCommitGuard<'_>,
+    control: WorkerControl<'_>,
+    recover: impl FnOnce() -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    playback_commit.finish(control)?;
+    recover()
+}
+
 fn publish_deferred_capture(
     capture_sink: &mut dyn ProCaptureSink,
     pending: PendingProCapture,
@@ -2358,14 +2269,16 @@ fn linked_pro_cycle_loop(
             ) {
                 Ok(()) => {}
                 Err(error) if error.is_recoverable() => {
-                    recover_linked_streams_during_cycle(
-                        playback_pcm,
-                        capture_pcm,
-                        capture_scratch,
-                        &error,
-                        config,
-                        control,
-                    )?;
+                    recover_with_commit_released(&mut playback_commit, control, || {
+                        recover_linked_streams_during_cycle(
+                            playback_pcm,
+                            capture_pcm,
+                            capture_scratch,
+                            &error,
+                            config,
+                            control,
+                        )
+                    })?;
                     sequence = sequence.wrapping_add(1);
                     continue;
                 }
@@ -2379,16 +2292,9 @@ fn linked_pro_cycle_loop(
             continue;
         }
 
-        let write_frames = if config.sequence_lead == 0 {
-            config.period
-        } else {
-            config.hardware_period
-        };
-        let write_samples = usize::try_from(write_frames)
-            .ok()
-            .and_then(|frames| frames.checked_mul(config.playback_channels))
-            .ok_or_else(|| EngineError::InvalidConfig("playback chunk size overflow".into()))?;
-        let chunks = config.period / write_frames;
+        // Zero lead always writes one whole period; leads and packets use other loops.
+        let write_frames = config.period;
+        let write_samples = config.playback_period_samples;
 
         if !config.event_driven
             && let Ok(status) = playback_pcm.status()
@@ -2406,78 +2312,38 @@ fn linked_pro_cycle_loop(
             );
         }
 
-        for chunk in 0..chunks {
-            if chunk > 0 && !config.event_driven {
-                match wait_for_playback_target(
-                    playback_pcm,
-                    config.buffer,
-                    config.playback_floor,
-                    config.rate,
-                    config.handoff_nanos,
-                    control,
-                ) {
-                    Ok(()) => {}
-                    Err(error) if error.is_recoverable() => {
-                        recover_linked_streams_during_cycle(
-                            playback_pcm,
-                            capture_pcm,
-                            capture_scratch,
-                            &error,
-                            config,
-                            control,
-                        )?;
-                        sequence = sequence.wrapping_add(1);
-                        continue 'cycles;
-                    }
-                    Err(error) => {
-                        control.done.store(true, Ordering::Release);
-                        return Err(error);
-                    }
+        let write_started = Instant::now();
+        let write_result = write_playback_samples(
+            playback_pcm,
+            &playback_scratch[..write_samples],
+            config.playback_channels,
+            write_samples,
+            Some(control),
+        );
+        control
+            .timeline
+            .record_playback_write(duration_nanos(write_started.elapsed()));
+        match write_result {
+            Ok(written) if written == write_frames => {
+                playback_position = playback_position.wrapping_add(write_frames as u64);
+                control.timeline.update_playback_position(playback_position);
+                if let Some(readiness) = direct_readiness {
+                    latency_guard.completed(readiness.observed_nanos, monotonic_nanos());
                 }
-                if control.stop.load(Ordering::Relaxed) {
-                    continue 'cycles;
-                }
+                control
+                    .timeline
+                    .record_pro_playback_write(sequence, monotonic_nanos());
             }
-
-            let offset = usize::try_from(chunk)
-                .ok()
-                .and_then(|chunk| chunk.checked_mul(write_samples))
-                .ok_or_else(|| {
-                    EngineError::InvalidConfig("playback chunk offset overflow".into())
-                })?;
-            let write_started = Instant::now();
-            let write_result = write_playback_samples(
-                playback_pcm,
-                &playback_scratch[offset..offset + write_samples],
-                config.playback_channels,
-                write_samples,
-                Some(control),
-            );
-            control
-                .timeline
-                .record_playback_write(duration_nanos(write_started.elapsed()));
-            match write_result {
-                Ok(written) if written == write_frames => {
-                    playback_position = playback_position.wrapping_add(write_frames as u64);
-                    control.timeline.update_playback_position(playback_position);
-                    if chunk == 0 {
-                        if let Some(readiness) = direct_readiness {
-                            latency_guard.completed(readiness.observed_nanos, monotonic_nanos());
-                        }
-                        control
-                            .timeline
-                            .record_pro_playback_write(sequence, monotonic_nanos());
-                    }
-                }
-                Ok(written) => {
-                    control.done.store(true, Ordering::Release);
-                    return Err(EngineError::ShortCommit {
-                        direction: StreamDirection::Playback,
-                        actual: written,
-                        required: write_frames,
-                    });
-                }
-                Err(error) if error.is_recoverable() => {
+            Ok(written) => {
+                control.done.store(true, Ordering::Release);
+                return Err(EngineError::ShortCommit {
+                    direction: StreamDirection::Playback,
+                    actual: written,
+                    required: write_frames,
+                });
+            }
+            Err(error) if error.is_recoverable() => {
+                recover_with_commit_released(&mut playback_commit, control, || {
                     recover_linked_streams_during_cycle(
                         playback_pcm,
                         capture_pcm,
@@ -2485,18 +2351,18 @@ fn linked_pro_cycle_loop(
                         &error,
                         config,
                         control,
-                    )?;
-                    sequence = sequence.wrapping_add(1);
-                    continue 'cycles;
-                }
-                Err(error) if error.is_stopped() => {
-                    control.done.store(true, Ordering::Release);
-                    return Ok(());
-                }
-                Err(error) => {
-                    control.done.store(true, Ordering::Release);
-                    return Err(error);
-                }
+                    )
+                })?;
+                sequence = sequence.wrapping_add(1);
+                continue;
+            }
+            Err(error) if error.is_stopped() => {
+                control.done.store(true, Ordering::Release);
+                return Ok(());
+            }
+            Err(error) => {
+                control.done.store(true, Ordering::Release);
+                return Err(error);
             }
         }
         playback_commit.finish(control)?;
@@ -3276,16 +3142,13 @@ fn playback_worker_loop(
                 if let (Some(source), Some(scratch)) = (
                     playback_commit.as_mut().map(PlaybackCommitGuard::source),
                     output_scratch.as_deref_mut(),
-                ) {
-                    control.timeline.record_pro_wait_budget(0);
-                    if catch_unwind(AssertUnwindSafe(|| {
-                        source.process_playback(sequence, &mut scratch[..config.period_samples]);
-                    }))
-                    .is_err()
-                    {
-                        control.done.store(true, Ordering::Release);
-                        return Err(EngineError::WorkerPanic);
-                    }
+                ) && catch_unwind(AssertUnwindSafe(|| {
+                    source.process_playback(sequence, &mut scratch[..config.period_samples]);
+                }))
+                .is_err()
+                {
+                    control.done.store(true, Ordering::Release);
+                    return Err(EngineError::WorkerPanic);
                 }
                 if let (Some(source), Some(scratch)) = (
                     playback_commit.as_mut().map(PlaybackCommitGuard::source),
@@ -3533,7 +3396,6 @@ fn capture_worker_loop(
     let mut position = 0_u64;
     let mut hardware_sequence = 0_u64;
     let mut next_pro_sequence = config.initial_pro_sequence;
-    let mut pro_generation = control.timeline.generation();
     loop {
         if control.stop.load(Ordering::Relaxed) || control.done.load(Ordering::Acquire) {
             control.done.store(true, Ordering::Release);
@@ -3561,14 +3423,7 @@ fn capture_worker_loop(
                     return Ok(());
                 }
                 if let (Some(clock), Some(sink)) = (pro_clock, capture_sink.as_deref_mut()) {
-                    let (current_generation, rebase_target) =
-                        observe_pro_capture_target(control.timeline, clock);
-                    let sequence = take_pro_capture_sequence(
-                        &mut next_pro_sequence,
-                        &mut pro_generation,
-                        current_generation,
-                        rebase_target,
-                    );
+                    let sequence = take_pro_capture_sequence(&mut next_pro_sequence, clock.load());
                     clock.publish_capture_next(next_pro_sequence);
                     control
                         .timeline
@@ -3626,15 +3481,7 @@ fn pro_target_sequence(playback_sequence: u64, lead: u64) -> u64 {
     playback_sequence.wrapping_add(lead)
 }
 
-fn take_pro_capture_sequence(
-    next: &mut u64,
-    generation: &mut u64,
-    current_generation: u64,
-    rebase_target: u64,
-) -> u64 {
-    if *generation != current_generation {
-        *generation = current_generation;
-    }
+fn take_pro_capture_sequence(next: &mut u64, rebase_target: u64) -> u64 {
     align_sequence_forward(next, rebase_target);
     let sequence = *next;
     *next = next.wrapping_add(1);
@@ -3658,10 +3505,6 @@ fn align_sequence_forward(next: &mut u64, target: u64) {
     if sequence_before(*next, target) {
         *next = target;
     }
-}
-
-fn observe_pro_capture_target(timeline: &HardwareTimeline, clock: &ProClock) -> (u64, u64) {
-    (timeline.generation(), clock.load())
 }
 
 fn sequence_before(sequence: u64, target: u64) -> bool {
@@ -4244,11 +4087,7 @@ fn recover_linked_streams(
         StreamDirection::Playback,
     )?;
     normalize_startup_loopback(playback_pcm, capture_pcm, config, control)?;
-    if error.is_xrun() {
-        control.timeline.reset_after_hardware_xrun();
-    } else {
-        control.timeline.reset_after_hardware_restart();
-    }
+    control.timeline.reset_after_hardware_restart();
     Ok(())
 }
 
@@ -4291,13 +4130,9 @@ fn record_linked_hardware_xruns(error: &EngineError, control: WorkerControl<'_>)
                     .record_hardware_xrun(StreamDirection::Capture);
             }
         }
-        EngineError::Xrun { .. } => {
-            control
-                .timeline
-                .record_hardware_xrun(StreamDirection::Playback);
-            control
-                .timeline
-                .record_hardware_xrun(StreamDirection::Capture);
+        // The linked peer stops too, but only the failing transfer's direction overran.
+        EngineError::Xrun { direction, .. } => {
+            control.timeline.record_hardware_xrun(*direction);
         }
         _ => {}
     }
@@ -4362,10 +4197,8 @@ fn recover_stream(
     } else {
         false
     };
-    if error.is_xrun() {
-        control.timeline.reset_after_hardware_xrun();
-    } else if restarted {
-        control.timeline.reset_after_hardware_restart();
+    if error.is_xrun() || restarted {
+        control.timeline.reset_after_stream_restart();
     }
     Ok(())
 }
@@ -4629,13 +4462,14 @@ mod tests {
         direct_linked_start_frames, direct_pro_cutoff_nanos, duplex_pointer_phase_from_timestamps,
         linked_ahead_start_frames, linked_phase_dither_frames, linked_phase_target_nanos,
         linked_phase_warmup_cycles, linked_start_frames, linked_zero_lead_playback_floor,
-        observe_pro_capture_target, period_limit_reached, playback_startup_priority,
-        playback_target_sleep, prepared_output_matches, pro_target_sequence,
-        realign_playback_after_recovery, record_linked_hardware_xruns,
-        staged_playback_chunk_before_capture, startup_loopback_error, startup_loopback_padding,
-        take_pending_pro_capture, take_pro_capture_sequence, uses_staged_packet_cycle,
+        period_limit_reached, playback_startup_priority, playback_target_sleep,
+        prepared_output_matches, pro_target_sequence, realign_playback_after_recovery,
+        record_linked_hardware_xruns, staged_playback_chunk_before_capture, startup_loopback_error,
+        startup_loopback_padding, take_pending_pro_capture, take_pro_capture_sequence,
+        uses_staged_packet_cycle,
     };
-    use crate::HardwareTimeline;
+    use super::{PlaybackCommitGuard, recover_with_commit_released};
+    use crate::{HardwareTimeline, ProPlaybackSource};
     use std::{
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
         time::{Duration, Instant},
@@ -4878,19 +4712,9 @@ mod tests {
     #[test]
     fn capture_publishes_one_monotonic_target_per_period() {
         let mut next = 4;
-        let mut generation = 0;
-        assert_eq!(
-            take_pro_capture_sequence(&mut next, &mut generation, 0, 4),
-            4
-        );
-        assert_eq!(
-            take_pro_capture_sequence(&mut next, &mut generation, 0, 5),
-            5
-        );
-        assert_eq!(
-            take_pro_capture_sequence(&mut next, &mut generation, 0, 6),
-            6
-        );
+        assert_eq!(take_pro_capture_sequence(&mut next, 4), 4);
+        assert_eq!(take_pro_capture_sequence(&mut next, 5), 5);
+        assert_eq!(take_pro_capture_sequence(&mut next, 6), 6);
     }
 
     #[test]
@@ -4905,42 +4729,19 @@ mod tests {
     #[test]
     fn capture_advances_to_target_without_moving_backward() {
         let mut next = 50;
-        let mut generation = 3;
-        assert_eq!(
-            take_pro_capture_sequence(&mut next, &mut generation, 3, 20),
-            50
-        );
-        assert_eq!(
-            take_pro_capture_sequence(&mut next, &mut generation, 4, 20),
-            51
-        );
-        assert_eq!(
-            take_pro_capture_sequence(&mut next, &mut generation, 4, 99),
-            99
-        );
-        assert_eq!(
-            take_pro_capture_sequence(&mut next, &mut generation, 4, 100),
-            100
-        );
+        assert_eq!(take_pro_capture_sequence(&mut next, 20), 50);
+        assert_eq!(take_pro_capture_sequence(&mut next, 20), 51);
+        assert_eq!(take_pro_capture_sequence(&mut next, 99), 99);
+        assert_eq!(take_pro_capture_sequence(&mut next, 100), 100);
     }
 
     #[test]
     fn capture_advances_locally_when_playback_clock_lags() {
         let mut next = 2;
-        let mut generation = 0;
 
-        assert_eq!(
-            take_pro_capture_sequence(&mut next, &mut generation, 0, 1),
-            2
-        );
-        assert_eq!(
-            take_pro_capture_sequence(&mut next, &mut generation, 0, 1),
-            3
-        );
-        assert_eq!(
-            take_pro_capture_sequence(&mut next, &mut generation, 0, 6),
-            6
-        );
+        assert_eq!(take_pro_capture_sequence(&mut next, 1), 2);
+        assert_eq!(take_pro_capture_sequence(&mut next, 1), 3);
+        assert_eq!(take_pro_capture_sequence(&mut next, 6), 6);
     }
 
     #[test]
@@ -4964,16 +4765,6 @@ mod tests {
         clock.publish_capture_next(4);
         assert!(!realign_playback_after_recovery(&mut sequence, &clock, 2));
         assert_eq!(sequence, 5);
-    }
-
-    #[test]
-    fn capture_observes_playback_clock_without_waiting_for_publish() {
-        let timeline = HardwareTimeline::default();
-        let clock = ProClock::new(4);
-
-        assert_eq!(observe_pro_capture_target(&timeline, &clock), (0, 4));
-        clock.publish(5);
-        assert_eq!(observe_pro_capture_target(&timeline, &clock), (0, 5));
     }
 
     #[test]
@@ -5022,6 +4813,45 @@ mod tests {
     }
 
     #[test]
+    fn stream_recovery_runs_with_playback_commit_released() {
+        struct CommitProbe<'a>(&'a AtomicBool);
+        impl ProPlaybackSource for CommitProbe<'_> {
+            fn begin_playback_commit(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+            fn end_playback_commit(&mut self) {
+                self.0.store(false, Ordering::Relaxed);
+            }
+            fn process_playback(&mut self, _sequence: u64, _playback: &mut [i32]) {}
+        }
+
+        let timeline = HardwareTimeline::default();
+        let stop = AtomicBool::new(false);
+        let done = AtomicBool::new(false);
+        let control = WorkerControl {
+            timeline: &timeline,
+            stop: &stop,
+            done: &done,
+            start_gate: None,
+            hardware_ready: None,
+            capture_cycle_generation: None,
+        };
+        let held = AtomicBool::new(false);
+        let mut source = CommitProbe(&held);
+        let mut commit = PlaybackCommitGuard::begin(&mut source, control).unwrap();
+        assert!(held.load(Ordering::Relaxed));
+
+        let mut held_during_recovery = true;
+        recover_with_commit_released(&mut commit, control, || {
+            held_during_recovery = held.load(Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(!held_during_recovery);
+    }
+
+    #[test]
     fn linked_xrun_records_each_stopped_direction() {
         let timeline = HardwareTimeline::default();
         let stop = AtomicBool::new(false);
@@ -5055,7 +4885,7 @@ mod tests {
         record_linked_hardware_xruns(&transfer_error, control);
 
         let stats = timeline.snapshot();
-        assert_eq!(stats.hw_playback_xruns, 2);
+        assert_eq!(stats.hw_playback_xruns, 1);
         assert_eq!(stats.hw_capture_xruns, 2);
     }
 

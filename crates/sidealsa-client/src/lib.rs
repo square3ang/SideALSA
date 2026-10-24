@@ -19,7 +19,7 @@ use std::{
 use sidealsa_protocol::{
     DeviceInfo, ErrorCode, FEATURE_PRO_DIRECTIONS, MAX_FRAME_PAYLOAD, PROTOCOL_MAGIC,
     PROTOCOL_VERSION, PortDirection, ProtocolError, Request, Response, SHARED_CLIENT_IDLE,
-    SharedRegionInfo, Stats, write_request,
+    SharedRegionInfo, Stats, sequence_is_before, write_request,
 };
 use thiserror::Error;
 
@@ -101,7 +101,7 @@ pub enum ClientError {
     Busy,
     #[error("daemon does not support requested operation")]
     Unsupported,
-    #[error("directional PRO client cannot be used after fork; exec a new process")]
+    #[error("SideALSA stream cannot be used after fork; exec a new process")]
     ForkedProcess,
     #[error("daemon rejected request: {code:?}: {message}")]
     Daemon { code: ErrorCode, message: String },
@@ -136,6 +136,33 @@ pub struct PeerCredentials {
     pub gid: u32,
 }
 
+fn socket_peer_credentials(control: &UnixStream) -> Result<PeerCredentials, ClientError> {
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = size_of::<libc::ucred>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            control.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(PeerCredentials {
+        pid: u32::try_from(credentials.pid)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon PID"))?,
+        uid: credentials.uid,
+        gid: credentials.gid,
+    })
+}
+
 pub struct SideAlsaClient {
     control: UnixStream,
     features: u32,
@@ -157,6 +184,15 @@ impl SideAlsaClient {
     fn connect_inner(path: &Path, timeout: Option<Duration>) -> Result<Self, ClientError> {
         let creator_pid = std::process::id();
         let mut control = UnixStream::connect(path)?;
+        // Only root (system daemon) or this user (dev daemon) may serve audio to us.
+        let peer_uid = socket_peer_credentials(&control)?.uid;
+        if peer_uid != 0 && peer_uid != unsafe { libc::getuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("socket peer uid {peer_uid} is neither root nor the current user"),
+            )
+            .into());
+        }
         control.set_read_timeout(timeout)?;
         control.set_write_timeout(timeout)?;
         write_request(
@@ -176,39 +212,12 @@ impl SideAlsaClient {
         })
     }
 
-    pub fn connect_default() -> Result<Self, ClientError> {
-        Self::connect("/tmp/sidealsad.sock")
-    }
-
     pub fn features(&self) -> u32 {
         self.features
     }
 
     pub fn peer_credentials(&self) -> Result<PeerCredentials, ClientError> {
-        let mut credentials = libc::ucred {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-        };
-        let mut length = size_of::<libc::ucred>() as libc::socklen_t;
-        if unsafe {
-            libc::getsockopt(
-                self.control.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&mut credentials as *mut libc::ucred).cast(),
-                &mut length,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error().into());
-        }
-        Ok(PeerCredentials {
-            pid: u32::try_from(credentials.pid)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon PID"))?,
-            uid: credentials.uid,
-            gid: credentials.gid,
-        })
+        socket_peer_credentials(&self.control)
     }
 
     pub fn peer_pid(&self) -> Result<u32, ClientError> {
@@ -389,8 +398,9 @@ impl AudioStream {
         self.pro_direction
     }
 
-    fn inherited_direction(&self) -> bool {
-        self.pro_direction.is_some() && self.creator_pid != std::process::id()
+    /// A forked child shares the parent's control socket and must never act on its session.
+    fn inherited(&self) -> bool {
+        self.creator_pid != std::process::id()
     }
 
     fn buffered_capture(&self) -> bool {
@@ -438,14 +448,14 @@ impl AudioStream {
     }
 
     pub fn record_realtime_failure(&self) {
-        if self.inherited_direction() {
+        if self.inherited() {
             return;
         }
         self.region.record_client_realtime_failure();
     }
 
     pub fn record_callback_timing(&self, duration_nanos: u64, period_nanos: u64) {
-        if self.inherited_direction() {
+        if self.inherited() {
             return;
         }
         self.region
@@ -453,14 +463,14 @@ impl AudioStream {
     }
 
     pub fn record_expired_playback_periods(&self, periods: u64) {
-        if self.inherited_direction() {
+        if self.inherited() {
             return;
         }
         self.region.record_client_expired_playback_periods(periods);
     }
 
     pub fn record_playback_xrun(&self) {
-        if self.inherited_direction() {
+        if self.inherited() {
             return;
         }
         self.region.record_client_playback_xrun();
@@ -566,7 +576,7 @@ impl AudioStream {
     }
 
     pub fn notification_fd(&self) -> Result<RawFd, ClientError> {
-        if self.inherited_direction() {
+        if self.inherited() {
             return Err(ClientError::ForkedProcess);
         }
         let fd = if self.info.capture_channels > 0 {
@@ -580,7 +590,7 @@ impl AudioStream {
     }
 
     pub fn control_fd(&self) -> Result<RawFd, ClientError> {
-        if self.inherited_direction() {
+        if self.inherited() {
             return Err(ClientError::ForkedProcess);
         }
         Ok(duplicate_cloexec(self.control.as_raw_fd())?)
@@ -754,11 +764,7 @@ impl AudioStream {
     /// Shared-memory readiness hint only; no notification I/O. Acquisition must
     /// still use the normal generation/expiry checks and monitor daemon control.
     pub fn has_ready_capture(&self) -> bool {
-        if self.inherited_direction()
-            || !self.started
-            || self.closed
-            || self.info.capture_channels == 0
-        {
+        if self.inherited() || !self.started || self.closed || self.info.capture_channels == 0 {
             return false;
         }
         let minimum = (self.mode == StreamMode::Pro && !self.buffered_capture())
@@ -772,7 +778,7 @@ impl AudioStream {
     /// wait_period for acquisition and generation checks, and monitor control_fd
     /// for daemon disconnects.
     pub fn has_ready_pro_playback(&self) -> bool {
-        if self.inherited_direction()
+        if self.inherited()
             || !self.started
             || self.closed
             || self.pro_direction != Some(PortDirection::Playback)
@@ -789,7 +795,7 @@ impl AudioStream {
     /// Complete capture frames currently published in shared memory, excluding
     /// any caller-owned scratch buffer. This is not a generation/expiry check.
     pub fn capture_frames_ready(&self) -> u64 {
-        if self.inherited_direction() || self.info.capture_channels == 0 {
+        if self.inherited() || self.info.capture_channels == 0 {
             return 0;
         }
         (self.region.ready_capture_slots() as u64)
@@ -915,7 +921,7 @@ impl AudioStream {
     }
 
     fn ensure_open(&self) -> Result<(), ClientError> {
-        if self.inherited_direction() {
+        if self.inherited() {
             return Err(ClientError::ForkedProcess);
         }
         if self.closed {
@@ -1011,7 +1017,7 @@ impl AudioStream {
 
 impl Drop for AudioStream {
     fn drop(&mut self) {
-        if self.inherited_direction() {
+        if self.inherited() {
             return;
         }
         if !self.closed {
@@ -1232,11 +1238,6 @@ fn response_error(response: Response) -> ClientError {
         Response::Error { code, message } => ClientError::Daemon { code, message },
         response => ClientError::UnexpectedResponse(Box::new(response)),
     }
-}
-
-fn sequence_is_before(candidate: u64, reference: u64) -> bool {
-    let distance = reference.wrapping_sub(candidate);
-    distance != 0 && distance < (1_u64 << 63)
 }
 
 fn receive_with_fds(stream: &UnixStream) -> Result<(Response, Vec<OwnedFd>), ClientError> {
@@ -1680,6 +1681,22 @@ mod tests {
             byte,
             [123],
             "drop must neither send CLOSE nor shutdown the socket"
+        );
+    }
+
+    #[test]
+    fn inherited_classic_stream_drop_sends_no_close() {
+        let (mut stream, _region, mut peer) = directional_stream(PortDirection::Playback);
+        let _parent_control = stream.control.try_clone().unwrap();
+        stream.pro_direction = None;
+        stream.mode = StreamMode::Shared(PortDirection::Playback);
+        stream.creator_pid = std::process::id().wrapping_add(1);
+        assert!(matches!(stream.close(), Err(ClientError::ForkedProcess)));
+        drop(stream);
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(
+            peer.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
         );
     }
 

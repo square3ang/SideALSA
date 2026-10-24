@@ -382,7 +382,7 @@ fn maybe_delay(args: &Args, sequence: u64) {
 
 fn parse_args() -> Result<Args, String> {
     let mut arguments = std::env::args_os().skip(1);
-    let mut socket = PathBuf::from("/tmp/sidealsad.sock");
+    let mut socket = PathBuf::from(sidealsa_config::selection::DEFAULT_SOCKET_PATH);
     let mut periods = 30_000;
     let mut output_channel = 0;
     let mut input_channel = 4;

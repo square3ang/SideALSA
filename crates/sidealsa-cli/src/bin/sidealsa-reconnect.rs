@@ -232,7 +232,7 @@ fn recover(pcms: &HashSet<String>) -> Result<()> {
 }
 
 fn run() -> Result<()> {
-    let mut socket = PathBuf::from("/tmp/sidealsad.sock");
+    let mut socket = PathBuf::from(sidealsa_config::selection::DEFAULT_SOCKET_PATH);
     let mut once = false;
     let mut initial_refresh = false;
     let mut args = std::env::args().skip(1);

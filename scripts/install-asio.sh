@@ -107,7 +107,7 @@ setting WINE explicitly bypasses both rules and counts as accepting
 responsibility.
 
 Environment:
-  SIDEALSA_SOCKET        Socket used by ASIO at runtime (default: /tmp/sidealsad.sock)
+  SIDEALSA_SOCKET        Socket used by ASIO at runtime (default: /run/sidealsa/sidealsad.sock)
   SIDEALSA_ASIO_INSTALL_ROOT
   SIDEALSA_ASIO_BUILD_DIR
   WINE
@@ -307,4 +307,4 @@ if ((${#BOTTLES_STAGED[@]} > 0)); then
     info '  bottles-cli shell -b <bottle> -i "regsvr32 /s sidealsa-asio64.dll"'
 fi
 info "Steam launch option: WINEDLLPATH=$WINE_ROOT %command%"
-info "ASIO uses /tmp/sidealsad.sock unless SIDEALSA_SOCKET is set"
+info "ASIO uses /run/sidealsa/sidealsad.sock unless SIDEALSA_SOCKET is set"

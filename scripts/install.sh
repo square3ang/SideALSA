@@ -15,7 +15,7 @@ fi
 PREFIX="${PREFIX:-/usr/local}"
 DESTDIR="${DESTDIR:-}"
 PROFILE_SOURCE="$ROOT/profiles/topping-e1x2.toml"
-SOCKET_PATH="${SIDEALSA_SOCKET:-/tmp/sidealsad.sock}"
+SOCKET_PATH="${SIDEALSA_SOCKET:-/run/sidealsa/sidealsad.sock}"
 PROFILE_EXPLICIT=0
 SOCKET_EXPLICIT="${SIDEALSA_SOCKET_EXPLICIT:-${SIDEALSA_SOCKET+x}}"
 ALSA_PLUGIN_DIR="${ALSA_PLUGIN_DIR:-}"
@@ -39,6 +39,7 @@ if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != root \
         DESTDIR="$DESTDIR" \
         SIDEALSA_SOCKET="$SOCKET_PATH" \
         SIDEALSA_SOCKET_EXPLICIT="${SOCKET_EXPLICIT:-0}" \
+        SIDEALSA_UPDATE="${SIDEALSA_UPDATE:-}" \
         ALSA_PLUGIN_DIR="$ALSA_PLUGIN_DIR" \
         "$ROOT/scripts/install.sh" "$@"
 fi
@@ -103,7 +104,7 @@ Options:
   --interactive             Terminal device/profile setup (use alone; default with no args)
   --prefix PATH             Binary and data prefix (default: /usr/local)
   --profile PATH            Profile seed for first install; existing config is preserved
-  --socket PATH             Daemon socket (default: /tmp/sidealsad.sock)
+  --socket PATH             Daemon socket (default: /run/sidealsa/sidealsad.sock)
   --alsa-plugin-dir PATH    ALSA external-plugin directory
   --no-build                Use existing target/release artifacts
   --with-asio               Build and install Wine ASIO binaries
@@ -195,6 +196,9 @@ done
 [[ "$SOCKET_PATH" == /* ]] || die "socket path must be absolute"
 [[ "$DESTDIR" == /* || -z "$DESTDIR" ]] || die "DESTDIR must be absolute"
 [[ "$ALSA_PLUGIN_DIR" == /* || -z "$ALSA_PLUGIN_DIR" ]] || die "ALSA plugin path must be absolute"
+# The socket grants microphone access; never fall back to a world-accessible socket.
+[[ -n "$DESTDIR" ]] || getent group audio >/dev/null || \
+    die "audio group not found; create it (groupadd -r audio) and add your user before installing"
 ((INSTALL_PIPEWIRE == 1 || PRESERVE_PIPEWIRE == 0)) || \
     die "--no-pipewire and --preserve-pipewire are mutually exclusive"
 
@@ -399,6 +403,8 @@ else
     [[ "$PROFILE_SOURCE" == /* ]] || PROFILE_SOURCE="$ROOT/$PROFILE_SOURCE"
     PROFILE_PATH="/etc/sidealsa/profiles/$(basename -- "$PROFILE_SOURCE")"
 fi
+# The old world-writable default migrates to the root-owned runtime directory.
+[[ "$PREVIOUS_SOCKET" != /tmp/sidealsad.sock ]] || PREVIOUS_SOCKET=
 if [[ -z "$SOCKET_EXPLICIT" || "$SOCKET_EXPLICIT" == 0 ]] && [[ -n "$PREVIOUS_SOCKET" ]]; then
     SOCKET_PATH=$PREVIOUS_SOCKET
 fi
@@ -585,20 +591,10 @@ if ((INSTALL_GUI == 1)); then
 fi
 
 service_temp="$TMP_DIR/sidealsad.service"
-SERVICE_GROUP_DIRECTIVE=
-SOCKET_UMASK=0000
-if command -v getent >/dev/null 2>&1 && getent group audio >/dev/null; then
-    SERVICE_GROUP_DIRECTIVE="Group=audio"
-    SOCKET_UMASK=0007
-else
-    warn "audio group not found; SideALSA socket will be world-accessible"
-fi
 sed \
     -e "s|@PREFIX@|$(sed_escape "$PREFIX")|g" \
     -e "s|@PROFILE@|$(sed_escape "$PROFILE_PATH")|g" \
     -e "s|@SOCKET@|$(sed_escape "$SOCKET_PATH")|g" \
-    -e "s|@GROUP_DIRECTIVE@|$(sed_escape "$SERVICE_GROUP_DIRECTIVE")|g" \
-    -e "s|@SOCKET_UMASK@|$SOCKET_UMASK|g" \
     "$ROOT/packaging/sidealsad.service.in" > "$service_temp"
 stage_managed_copy "$TMP_DIR/asound.sidealsa.conf" "$TMP_DIR/alsa.managed"
 stage_managed_copy "$TMP_DIR/active.toml" "$TMP_DIR/active.managed"

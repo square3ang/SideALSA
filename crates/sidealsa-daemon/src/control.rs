@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{self, Write},
     os::fd::{AsRawFd, RawFd},
     os::linux::fs::MetadataExt,
@@ -7,8 +8,8 @@ use std::{
     path::Path,
     ptr,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::Duration,
@@ -23,13 +24,61 @@ use thiserror::Error;
 use crate::{DaemonState, OpenSharedError};
 
 const MAX_CONTROL_CLIENTS: usize = 64;
+// One uid cannot take every slot; the rest stay free for other users and root.
+const MAX_CONTROL_CLIENTS_PER_UID: usize = 48;
+const MAX_REQUESTS_BEFORE_HELLO: usize = 3;
 const CONTROL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+// handle_client keeps frames on the heap; mlockall pins every thread stack.
+const CONTROL_THREAD_STACK: usize = 128 * 1024;
 
-struct ActiveClient(Arc<AtomicUsize>);
+#[derive(Default)]
+struct ClientSlots(Mutex<HashMap<libc::uid_t, usize>>);
 
-impl Drop for ActiveClient {
+struct ClientSlot {
+    slots: Arc<ClientSlots>,
+    uid: libc::uid_t,
+}
+
+impl ClientSlots {
+    fn acquire(self: &Arc<Self>, uid: libc::uid_t) -> Option<ClientSlot> {
+        let mut counts = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let total: usize = counts.values().sum();
+        let mine = counts.get(&uid).copied().unwrap_or(0);
+        if total >= MAX_CONTROL_CLIENTS || mine >= MAX_CONTROL_CLIENTS_PER_UID {
+            return None;
+        }
+        counts.insert(uid, mine + 1);
+        Some(ClientSlot {
+            slots: Arc::clone(self),
+            uid,
+        })
+    }
+}
+
+impl Drop for ClientSlot {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        let mut counts = self.slots.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = counts.get_mut(&self.uid) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.uid);
+            }
+        }
+    }
+}
+
+/// Closes the connection's session even when the control thread unwinds.
+struct SessionGuard<'a> {
+    state: &'a DaemonState,
+    id: Option<u64>,
+}
+
+impl Drop for SessionGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(session_id) = self.id {
+            self.state.close(session_id);
+        }
     }
 }
 
@@ -53,27 +102,26 @@ pub fn run_control_listener(
     let listener = UnixListener::bind(path)?;
     let listener_metadata = std::fs::metadata(path)?;
     listener.set_nonblocking(true)?;
-    let active_clients = Arc::new(AtomicUsize::new(0));
+    let slots = Arc::new(ClientSlots::default());
 
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
-                if active_clients.fetch_add(1, Ordering::AcqRel) >= MAX_CONTROL_CLIENTS {
-                    active_clients.fetch_sub(1, Ordering::AcqRel);
+                let Some(slot) = peer_credentials(&stream)
+                    .ok()
+                    .and_then(|peer| slots.acquire(peer.uid))
+                else {
                     continue;
-                }
+                };
                 let state = Arc::clone(&state);
-                let client_count = Arc::clone(&active_clients);
-                if thread::Builder::new()
+                // A failed spawn drops the closure, which releases the slot.
+                let _ = thread::Builder::new()
                     .name("sidealsa-control".into())
+                    .stack_size(CONTROL_THREAD_STACK)
                     .spawn(move || {
-                        let _active = ActiveClient(client_count);
+                        let _slot = slot;
                         handle_client(stream, state);
-                    })
-                    .is_err()
-                {
-                    active_clients.fetch_sub(1, Ordering::AcqRel);
-                }
+                    });
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
@@ -156,7 +204,11 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
         return;
     }
     let mut hello = false;
-    let mut session = None;
+    let mut requests_before_hello = 0;
+    let mut session = SessionGuard {
+        state: &state,
+        id: None,
+    };
 
     loop {
         let request = match sidealsa_protocol::read_request(&mut stream) {
@@ -180,10 +232,24 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
                 );
                 break;
             }
+            // The frame was fully read, so the stream stays in sync.
+            Err(ProtocolError::UnknownRequest(_)) => {
+                if !hello {
+                    requests_before_hello += 1;
+                }
+                if send_response(&mut stream, &Response::Unsupported, &[]).is_err()
+                    || requests_before_hello >= MAX_REQUESTS_BEFORE_HELLO
+                {
+                    break;
+                }
+                continue;
+            }
             Err(_) => break,
         };
 
         if !hello && !matches!(request, Request::Hello { .. }) {
+            requests_before_hello += 1;
+            // Each reply re-arms the read timeout, so cap the replies instead.
             if send_response(
                 &mut stream,
                 &Response::Error {
@@ -193,6 +259,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
                 &[],
             )
             .is_err()
+                || requests_before_hello >= MAX_REQUESTS_BEFORE_HELLO
             {
                 break;
             }
@@ -202,6 +269,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
         let (response, fds) = match request {
             Request::Hello { version } => {
                 if version != PROTOCOL_VERSION {
+                    requests_before_hello += 1;
                     (
                         Response::Error {
                             code: ErrorCode::InvalidRequest,
@@ -211,9 +279,6 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
                     )
                 } else {
                     hello = true;
-                    if stream.set_read_timeout(None).is_err() {
-                        break;
-                    }
                     (
                         Response::Hello {
                             version: PROTOCOL_VERSION,
@@ -231,7 +296,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
                 direction,
                 group_token,
             } => {
-                if session.is_some() {
+                if session.id.is_some() {
                     (
                         Response::Error {
                             code: ErrorCode::BadState,
@@ -247,7 +312,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
                         direction,
                     ) {
                         Ok(Some((session_id, shared, fds))) => {
-                            session = Some(session_id);
+                            session.id = Some(session_id);
                             (
                                 Response::OpenProDirection {
                                     session_id,
@@ -269,7 +334,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
                 }
             }
             Request::OpenPro => {
-                if session.is_some() {
+                if session.id.is_some() {
                     (
                         Response::Error {
                             code: ErrorCode::BadState,
@@ -280,7 +345,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
                 } else {
                     match state.open_pro() {
                         Ok(Some((session_id, shared, fds))) => {
-                            session = Some(session_id);
+                            session.id = Some(session_id);
                             (Response::OpenPro { session_id, shared }, fds.to_vec())
                         }
                         Ok(None) => (Response::Busy, Vec::new()),
@@ -295,7 +360,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
                 }
             }
             Request::OpenShared { port_id } => {
-                if session.is_some() {
+                if session.id.is_some() {
                     (
                         Response::Error {
                             code: ErrorCode::BadState,
@@ -306,7 +371,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
                 } else {
                     match state.open_shared(&port_id) {
                         Ok(Some(open)) => {
-                            session = Some(open.session_id);
+                            session.id = Some(open.session_id);
                             (
                                 Response::OpenShared {
                                     session_id: open.session_id,
@@ -335,29 +400,29 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
                 }
             }
             Request::Start { session_id } => {
-                if session == Some(session_id) && state.start(session_id) {
+                if session.id == Some(session_id) && state.start(session_id) {
                     (Response::Ack, Vec::new())
                 } else {
                     (not_owner(), Vec::new())
                 }
             }
             Request::StartProAligned { session_id } => {
-                if session == Some(session_id) && state.start_pro_aligned(session_id) {
+                if session.id == Some(session_id) && state.start_pro_aligned(session_id) {
                     (Response::Ack, Vec::new())
                 } else {
                     (not_owner(), Vec::new())
                 }
             }
             Request::Stop { session_id } => {
-                if session == Some(session_id) && state.stop(session_id) {
+                if session.id == Some(session_id) && state.stop(session_id) {
                     (Response::Ack, Vec::new())
                 } else {
                     (not_owner(), Vec::new())
                 }
             }
             Request::Close { session_id } => {
-                if session == Some(session_id) && state.close(session_id) {
-                    session = None;
+                if session.id == Some(session_id) && state.close(session_id) {
+                    session.id = None;
                     (Response::Ack, Vec::new())
                 } else {
                     (not_owner(), Vec::new())
@@ -366,13 +431,34 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
             Request::GetStats => (Response::Stats(Box::new(state.stats())), Vec::new()),
         };
 
-        if send_response(&mut stream, &response, &fds).is_err() {
+        // Clients without a session must not hold a slot forever.
+        let read_timeout = if session.id.is_some() {
+            None
+        } else if hello {
+            Some(CONTROL_IDLE_TIMEOUT)
+        } else {
+            Some(CONTROL_HANDSHAKE_TIMEOUT)
+        };
+        if requests_before_hello >= MAX_REQUESTS_BEFORE_HELLO
+            || stream.set_read_timeout(read_timeout).is_err()
+        {
+            let _ = send_response(&mut stream, &response, &fds);
             break;
         }
-    }
-
-    if let Some(session_id) = session {
-        state.close(session_id);
+        match send_response(&mut stream, &response, &fds) {
+            Ok(()) => {}
+            // Encoding failed before any byte was sent; report it and keep the session.
+            Err(ControlError::Protocol(error)) if !matches!(error, ProtocolError::Io(_)) => {
+                let failure = Response::Error {
+                    code: ErrorCode::Internal,
+                    message: format!("response could not be encoded: {error}"),
+                };
+                if send_response(&mut stream, &failure, &[]).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
     }
 }
 
@@ -575,6 +661,90 @@ mod tests {
         (response, fds)
     }
 
+    fn test_state() -> Arc<DaemonState> {
+        Arc::new(
+            DaemonState::new(
+                &Profile::from_toml(PROFILE).unwrap(),
+                Arc::new(HardwareTimeline::default()),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn unknown_request_keeps_the_open_session() {
+        let state = test_state();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let server_state = Arc::clone(&state);
+        let worker = thread::spawn(move || handle_client(server, server_state));
+        assert!(matches!(
+            request(
+                &mut client,
+                Request::Hello {
+                    version: PROTOCOL_VERSION
+                }
+            ),
+            Response::Hello { .. }
+        ));
+        let (response, fds) = request_with_fds(&mut client, Request::OpenPro);
+        for fd in fds {
+            unsafe { libc::close(fd) };
+        }
+        let Response::OpenPro { session_id, .. } = response else {
+            panic!("unexpected response {response:?}");
+        };
+
+        // Bytes 6..8 of the frame header carry the request code.
+        let mut frame = sidealsa_protocol::encode_request(&Request::GetInfo).unwrap();
+        frame[6..8].copy_from_slice(&u16::MAX.to_le_bytes());
+        client.write_all(&frame).unwrap();
+        assert_eq!(read_response(&mut client).unwrap(), Response::Unsupported);
+        assert!(state.owns(session_id));
+        assert!(matches!(
+            request(&mut client, Request::GetStats),
+            Response::Stats(_)
+        ));
+
+        drop(client);
+        worker.join().unwrap();
+        assert!(!state.owns(session_id));
+    }
+
+    #[test]
+    fn requests_before_hello_are_capped() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || handle_client(server, test_state()));
+        for _ in 0..MAX_REQUESTS_BEFORE_HELLO {
+            assert!(matches!(
+                request(&mut client, Request::GetInfo),
+                Response::Error {
+                    code: ErrorCode::BadState,
+                    ..
+                }
+            ));
+        }
+        worker.join().unwrap();
+        let _ = write_request(&mut client, &Request::GetInfo);
+        assert!(read_response(&mut client).is_err());
+    }
+
+    #[test]
+    fn client_slots_cap_each_uid_and_release_on_drop() {
+        let slots = Arc::new(ClientSlots::default());
+        let held: Vec<_> = (0..MAX_CONTROL_CLIENTS_PER_UID)
+            .map(|_| slots.acquire(1000).unwrap())
+            .collect();
+        assert!(slots.acquire(1000).is_none());
+        let others: Vec<_> = (MAX_CONTROL_CLIENTS_PER_UID..MAX_CONTROL_CLIENTS)
+            .map(|_| slots.acquire(1001).unwrap())
+            .collect();
+        assert!(slots.acquire(0).is_none());
+        drop(held);
+        assert!(slots.acquire(1000).is_some());
+        drop(others);
+        assert!(slots.0.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn directional_control_uses_kernel_credentials_and_connection_owned_ids() {
         use sidealsa_protocol::PortDirection;
@@ -596,7 +766,7 @@ mod tests {
         let c_thread = thread::spawn(move || handle_client(server_c, c_state));
         for stream in [&mut p, &mut c] {
             assert!(
-                matches!(request(stream, Request::Hello { version: 16 }), Response::Hello { version: 16, features } if features & FEATURE_PRO_DIRECTIONS != 0)
+                matches!(request(stream, Request::Hello { version: PROTOCOL_VERSION }), Response::Hello { version: PROTOCOL_VERSION, features } if features & FEATURE_PRO_DIRECTIONS != 0)
             );
         }
         let (response, fds) = request_with_fds(

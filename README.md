@@ -66,7 +66,7 @@ Install the following tools and development packages for your distribution, then
 | Service / desktop | systemd, PipeWire, WirePlumber |
 | Optional ASIO | CMake, `winegcc`, `winebuild`, 64-bit Wine development headers; the host `wine` executable for prefix registration |
 | Diagnostic tools | `aplay`, `arecord`, `speaker-test`, `wpctl` |
-| Access | If an `audio` group exists, your desktop user must belong to it; log out and back in after joining |
+| Access | An `audio` group must exist and your desktop user must belong to it; log out and back in after joining |
 
 The terminal menu includes both GUI and ASIO by default. You can deselect either, but on reinstalls, check whether doing so will remove an existing component.
 
@@ -158,7 +158,7 @@ For the default installation location, Steam launch options are:
 WINEDLLPATH="$HOME/.local/lib/wine" %command%
 ```
 
-ASIO connects to `/tmp/sidealsad.sock` unless `SIDEALSA_SOCKET` is set, so the
+ASIO connects to `/run/sidealsa/sidealsad.sock` unless `SIDEALSA_SOCKET` is set, so the
 default setup needs no extra variable. For a custom socket or installation
 location, substitute the actual paths printed by the installer. Select the SideALSA ASIO driver in your game or DAW's audio settings.
 The main installer's `--with-asio` installs system files only; **prefix registration still requires this separate step**.
@@ -304,12 +304,12 @@ Hardware, ASIO, and loopback validation require a separate test environment. Do 
 
 | Item | Default path |
 | --- | --- |
-| Executables / socket | `/usr/local/bin` / `/tmp/sidealsad.sock` |
+| Executables / socket | `/usr/local/bin` / `/run/sidealsa/sidealsad.sock` |
 | Selection state / profile | `/etc/sidealsa/active.toml` / `/etc/sidealsa/profiles/<selected-profile>.toml` |
 | ALSA / PipeWire configuration | `/etc/alsa/conf.d/99-sidealsa.conf` / `/etc/pipewire/pipewire.conf.d/99-sidealsa.conf` |
 | User ASIO | `$HOME/.local/lib/wine` |
 
-When the `audio` group exists, the socket is owned by `root:audio` with mode `0770`. Without that group, the installer warns and uses a socket accessible to all users.
+The socket lives in the root-owned `/run/sidealsa` directory (`root:audio`, mode `0750`) and is owned by `root:audio` with mode `0770`. The installer refuses to install when no `audio` group exists, because the socket grants microphone access. Clients only accept a daemon running as root or as the current user.
 Rust components live in [`crates/`](crates/); device-specific configurations live in [`profiles/`](profiles/).
 
 </details>

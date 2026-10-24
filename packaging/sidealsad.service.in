@@ -3,7 +3,6 @@
 Description=SideALSA physical audio daemon
 After=sound.target
 Wants=sound.target
-Before=pipewire.service
 
 [Service]
 Type=simple
@@ -11,8 +10,11 @@ ExecStart=@PREFIX@/bin/sidealsad --profile @PROFILE@ --socket @SOCKET@
 Restart=on-failure
 RestartPreventExitStatus=78
 RestartSec=2
-@GROUP_DIRECTIVE@
-UMask=@SOCKET_UMASK@
+Group=audio
+UMask=0007
+# Root-owned 0750 root:audio; /tmp let any user squat the socket path.
+RuntimeDirectory=sidealsa
+RuntimeDirectoryMode=0750
 LimitRTPRIO=99
 LimitMEMLOCK=infinity
 

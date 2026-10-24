@@ -15,7 +15,9 @@ use std::{
 };
 
 use sidealsa_client::{AudioStream, ClientError, SideAlsaClient};
-use sidealsa_protocol::{DeviceInfo, FEATURE_PRO_DIRECTIONS, PortDirection, SharedRegionInfo};
+use sidealsa_protocol::{
+    DeviceInfo, FEATURE_PRO_DIRECTIONS, PortDirection, SharedRegionInfo, sequence_is_after,
+};
 use thiserror::Error;
 
 pub const ASIO_SUCCESS: c_int = 0;
@@ -292,13 +294,14 @@ struct DriverInner {
     worker: Option<WorkerHandle>,
     worker_thread: Option<u32>,
     quiesce_generation: Option<u64>,
-    position: Arc<PositionSnapshot>,
     worker_failure: Option<WorkerFailure>,
     last_error: Option<String>,
 }
 
 pub struct AsioDriver {
     inner: Mutex<DriverInner>,
+    // Outside `inner`: bufferSwitch reads it and must not wait on UI-thread getters.
+    position: Arc<PositionSnapshot>,
     lifecycle: Mutex<()>,
     thread_ops: Option<ThreadOps>,
     control_timeout: Duration,
@@ -331,10 +334,10 @@ impl AsioDriver {
                 worker: None,
                 worker_thread: None,
                 quiesce_generation: None,
-                position: Arc::new(PositionSnapshot::new()),
                 worker_failure: None,
                 last_error: None,
             }),
+            position: Arc::new(PositionSnapshot::new()),
             lifecycle: Mutex::new(()),
             thread_ops,
             control_timeout,
@@ -608,7 +611,7 @@ impl AsioDriver {
         }
         if let Some(handle) = inner.worker.as_ref() {
             let gate = Arc::clone(&handle.gate);
-            inner.position.publish(0, 0);
+            self.position.publish(0, 0);
             let generation = gate.set_running(true);
             inner.state = DriverState::Running;
             drop(inner);
@@ -634,7 +637,7 @@ impl AsioDriver {
         let stop = Arc::new(StopSignal::new()?);
         let gate = Arc::new(WorkerGate::new(true)?);
         let start_gate = Arc::clone(&gate);
-        let position = Arc::clone(&inner.position);
+        let position = Arc::clone(&self.position);
         let period_frames =
             usize::try_from(shared.period_frames).map_err(|_| AsioError::NoMemory)?;
         let capture_samples = period_frames
@@ -688,7 +691,7 @@ impl AsioDriver {
         });
         inner.worker_thread = Some(thread_id);
         inner.quiesce_generation = None;
-        inner.position.publish(0, 0);
+        self.position.publish(0, 0);
         inner.state = DriverState::Running;
         unsafe { &*context }.ready.store(true, Ordering::Release);
         drop(inner);
@@ -716,6 +719,9 @@ impl AsioDriver {
     }
 
     pub fn dispose_buffers(&self) -> Result<(), AsioError> {
+        // A caught panic must not make teardown fail forever; every step below rechecks state.
+        self.inner.clear_poison();
+        self.lifecycle.clear_poison();
         if self.lock()?.worker_thread == Some(self.current_thread_id()) {
             return Err(AsioError::Reentrant);
         }
@@ -759,6 +765,9 @@ impl AsioDriver {
     }
 
     pub fn close(&self) -> Result<(), AsioError> {
+        // wine_shim retries CLOSE until it succeeds; a caught panic must not block it forever.
+        self.inner.clear_poison();
+        self.lifecycle.clear_poison();
         let current = self.current_thread_id();
         {
             let inner = self.lock()?;
@@ -801,10 +810,17 @@ impl AsioDriver {
     }
 
     pub fn sample_position(&self) -> Result<(u64, u64), AsioError> {
-        let mut inner = self.lock()?;
-        ensure_worker_healthy(&mut inner)?;
-        ensure_initialized(inner.state)?;
-        Ok(inner.position.load())
+        // Hosts call this from bufferSwitch; std Mutex has no priority inheritance, so never
+        // block the RT worker behind a getter. Contended reads skip the state checks only.
+        match self.inner.try_lock() {
+            Ok(mut inner) => {
+                ensure_worker_healthy(&mut inner)?;
+                ensure_initialized(inner.state)?;
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(AsioError::Worker),
+        }
+        Ok(self.position.load())
     }
 
     pub fn last_error(&self) -> Option<String> {
@@ -1124,7 +1140,9 @@ fn buffer_direction(input: &[bool], output: &[bool], features: u32) -> Option<Po
 struct AlignedSampleBlock([f32; 8]);
 
 struct ChannelBuffer {
-    data: std::cell::UnsafeCell<Box<[AlignedSampleBlock]>>,
+    // Raw pointer from Box::into_raw: no `&mut` is ever formed over memory the host aliases.
+    samples: ptr::NonNull<f32>,
+    blocks: usize,
     period: usize,
     half_stride: usize,
 }
@@ -1141,48 +1159,50 @@ impl ChannelBuffer {
         data.try_reserve_exact(blocks)
             .map_err(|_| AsioError::NoMemory)?;
         data.resize(blocks, AlignedSampleBlock([0.0; 8]));
+        let raw = Box::into_raw(data.into_boxed_slice());
         Ok(Self {
-            data: std::cell::UnsafeCell::new(data.into_boxed_slice()),
+            samples: ptr::NonNull::new(raw.cast::<f32>()).ok_or(AsioError::NoMemory)?,
+            blocks,
             period,
             half_stride,
         })
     }
 
     fn pointers(&self) -> [*mut c_void; 2] {
-        unsafe {
-            let data = &mut *self.data.get();
-            let samples = data.as_mut_ptr().cast::<f32>();
-            [samples.cast(), samples.add(self.half_stride).cast()]
-        }
+        let samples = self.samples.as_ptr();
+        unsafe { [samples.cast(), samples.add(self.half_stride).cast()] }
+    }
+
+    fn half_start(&self, index: usize) -> usize {
+        let start = index
+            .checked_mul(self.half_stride)
+            .expect("channel buffer index overflow");
+        let end = start
+            .checked_add(self.period)
+            .expect("channel buffer index overflow");
+        assert!(end <= self.blocks * 8, "channel buffer index out of range");
+        start
     }
 
     fn half(&self, index: usize) -> &[f32] {
-        unsafe {
-            let data = &*self.data.get();
-            let samples = std::slice::from_raw_parts(data.as_ptr().cast::<f32>(), data.len() * 8);
-            let start = index
-                .checked_mul(self.half_stride)
-                .expect("channel buffer index overflow");
-            let end = start
-                .checked_add(self.period)
-                .expect("channel buffer index overflow");
-            &samples[start..end]
-        }
+        let start = self.half_start(index);
+        unsafe { std::slice::from_raw_parts(self.samples.as_ptr().add(start), self.period) }
     }
 
     #[allow(clippy::mut_from_ref)]
     fn half_mut(&self, index: usize) -> &mut [f32] {
+        let start = self.half_start(index);
+        unsafe { std::slice::from_raw_parts_mut(self.samples.as_ptr().add(start), self.period) }
+    }
+}
+
+impl Drop for ChannelBuffer {
+    fn drop(&mut self) {
         unsafe {
-            let data = &mut *self.data.get();
-            let sample_count = data.len() * 8;
-            let samples = std::slice::from_raw_parts_mut(data.as_mut_ptr().cast(), sample_count);
-            let start = index
-                .checked_mul(self.half_stride)
-                .expect("channel buffer index overflow");
-            let end = start
-                .checked_add(self.period)
-                .expect("channel buffer index overflow");
-            &mut samples[start..end]
+            drop(Box::from_raw(ptr::slice_from_raw_parts_mut(
+                self.samples.as_ptr().cast::<AlignedSampleBlock>(),
+                self.blocks,
+            )));
         }
     }
 }
@@ -1668,6 +1688,9 @@ trait WorkerStreamRecovery {
 }
 
 impl WorkerStreamRecovery for AudioStream {
+    // shortcut: Stop/Start round trips block this worker for at most 2x the control timeout;
+    // no capture arrives until the daemon rebases anyway. Move off-thread only with a
+    // non-blocking client restart API, since a timed-out reply would desync the socket.
     fn restart_after_discontinuity(&mut self) -> Result<(), AsioError> {
         self.prepare()?;
         self.start()?;
@@ -1767,11 +1790,6 @@ fn advance_asio_cycle(
         sample_position: sample_position
             .saturating_add(period_frames.saturating_mul(elapsed_periods)),
     }
-}
-
-fn sequence_is_after(candidate: u64, reference: u64) -> bool {
-    let distance = candidate.wrapping_sub(reference);
-    distance != 0 && distance < (1_u64 << 63)
 }
 
 enum WorkerEvent {
@@ -3721,6 +3739,30 @@ mod tests {
             assert_eq!(pointers[1] as usize % 32, 0);
             assert!(pointers[1] as usize - pointers[0] as usize >= period * size_of::<f32>());
         }
+    }
+
+    #[test]
+    fn close_and_dispose_succeed_after_a_caught_panic_poisoned_the_driver() {
+        let driver = AsioDriver::new();
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _inner = driver.inner.lock().unwrap();
+            let _lifecycle = driver.lifecycle.lock().unwrap();
+            panic!("poison driver locks");
+        }));
+        assert!(driver.inner.is_poisoned());
+        assert!(matches!(
+            driver.dispose_buffers(),
+            Err(AsioError::InvalidState)
+        ));
+        assert!(driver.close().is_ok());
+    }
+
+    #[test]
+    fn sample_position_does_not_wait_for_a_held_driver_lock() {
+        let driver = AsioDriver::new();
+        driver.position.publish(128, 7);
+        let _held = driver.inner.lock().unwrap();
+        assert_eq!(driver.sample_position().unwrap(), (128, 7));
     }
 
     #[test]

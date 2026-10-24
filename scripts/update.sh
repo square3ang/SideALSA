@@ -57,6 +57,8 @@ while (($# > 0)); do
             ;;
         --prefix|--socket|--alsa-plugin-dir)
             (($# >= 2)) || die "$1 requires a value"
+            # The manifest below must come from the prefix being updated.
+            [[ "$1" != --prefix ]] || PREFIX=$2
             args+=("$1" "$2")
             shift 2
             ;;

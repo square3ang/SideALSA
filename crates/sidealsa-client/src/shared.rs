@@ -12,7 +12,7 @@ use sidealsa_protocol::{
     SHARED_ACTIVATION_CLAIMED, SHARED_ACTIVATION_PENDING, SHARED_ACTIVATION_READY,
     SHARED_CLIENT_IDLE, SHARED_MAGIC, SHARED_SLOT_FREE, SHARED_SLOT_READING, SHARED_SLOT_READY,
     SHARED_SLOT_WRITING, SHARED_VERSION, SharedRegionHeader, SharedRegionInfo, SharedRegionLayout,
-    SharedSlotHeader,
+    SharedSlotHeader, sequence_is_after, sequence_is_before,
 };
 use thiserror::Error;
 
@@ -115,6 +115,11 @@ impl SharedRegion {
         if layout.info() != info {
             close_fd(fd);
             return Err(SharedError::InvalidHeader);
+        }
+        // A short or still-shrinkable file would SIGBUS on access instead of failing here.
+        if let Err(error) = check_sealed_size(fd, layout.size()) {
+            close_fd(fd);
+            return Err(error);
         }
         let region = match Self::map(fd, layout) {
             Ok(region) => region,
@@ -901,15 +906,6 @@ fn next_index(index: usize, slot_count: usize) -> usize {
     (index + 1) % slot_count
 }
 
-fn sequence_is_after(candidate: u64, reference: u64) -> bool {
-    let distance = candidate.wrapping_sub(reference);
-    distance != 0 && distance < (1_u64 << 63)
-}
-
-fn sequence_is_before(candidate: u64, reference: u64) -> bool {
-    sequence_is_after(reference, candidate)
-}
-
 fn activation_token(generation: u64, state: u64) -> u64 {
     generation.wrapping_shl(2) | state
 }
@@ -959,6 +955,23 @@ fn set_size(fd: RawFd, size: usize) -> Result<(), io::Error> {
     }
 }
 
+fn check_sealed_size(fd: RawFd, size: usize) -> Result<(), SharedError> {
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+    if seals < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    if usize::try_from(stat.st_size).map_or(true, |actual| actual < size)
+        || seals & libc::F_SEAL_SHRINK == 0
+    {
+        return Err(SharedError::InvalidHeader);
+    }
+    Ok(())
+}
+
 fn close_fd(fd: RawFd) {
     unsafe {
         libc::close(fd);
@@ -978,6 +991,21 @@ mod tests {
         assert_eq!(output, [17]);
     }
     use super::*;
+
+    #[test]
+    fn map_fd_rejects_short_or_unsealed_memfd() {
+        let info = SharedRegion::create(1, 0, 1).unwrap().info();
+        let name = CString::new("sidealsa-test").unwrap();
+        for size in [info.size as usize - 1, info.size as usize] {
+            let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+            assert!(fd >= 0);
+            set_size(fd, size).unwrap();
+            assert!(matches!(
+                SharedRegion::map_fd(fd, info),
+                Err(SharedError::InvalidHeader)
+            ));
+        }
+    }
 
     #[test]
     fn sixteen_slot_layout_maps_and_reuses_full_capture_reserve() {

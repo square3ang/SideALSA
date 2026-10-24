@@ -3,7 +3,7 @@ use sidealsa_config::{PortConfig, Profile};
 use sidealsa_core::{HardwareStats, HardwareTimeline, ProCaptureSink, ProPlaybackSource};
 use sidealsa_protocol::{
     DeviceInfo, PortDirection, PortInfo, SHARED_CLIENT_IDLE, SHARED_CLIENT_RUNNING,
-    SHARED_CLIENT_STARTING, SharedPlaybackPortStats, SharedRegionInfo, Stats,
+    SHARED_CLIENT_STARTING, SharedPlaybackPortStats, SharedRegionInfo, Stats, sequence_is_before,
 };
 use std::sync::{
     Arc, Mutex,
@@ -275,7 +275,7 @@ impl PlaybackCommitBarrier {
     }
 
     fn wait_for(&self, target: u64) {
-        while sequence_before(self.completed.load(Ordering::SeqCst), target) {
+        while sequence_is_before(self.completed.load(Ordering::SeqCst), target) {
             std::thread::yield_now();
         }
     }
@@ -852,20 +852,28 @@ impl DaemonState {
         if session_id == 0 || session_id == SESSION_CLOSING {
             return false;
         }
-        let _ownership = self
-            .pro_ownership
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let hardware_generation = self.timeline.generation();
-        if self.pro_capture.owner.load(Ordering::Acquire) == session_id {
-            return self.pro_capture.start(session_id, hardware_generation);
-        }
-        if self.pro.owner.load(Ordering::Acquire) == session_id {
-            if self.pro.active.load(Ordering::SeqCst) != 0 {
-                return false;
+        // Only PRO needs the ownership lock. SHARED start may spin on client-written
+        // activation state, and its session ids are owned by a single connection.
+        if self.pro_capture.owner.load(Ordering::Acquire) == session_id
+            || self.pro.owner.load(Ordering::Acquire) == session_id
+        {
+            let _ownership = self
+                .pro_ownership
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let hardware_generation = self.timeline.generation();
+            if self.pro_capture.owner.load(Ordering::Acquire) == session_id {
+                return self.pro_capture.start(session_id, hardware_generation);
             }
-            return self.pro.start(session_id, hardware_generation);
+            if self.pro.owner.load(Ordering::Acquire) == session_id {
+                if self.pro.active.load(Ordering::SeqCst) != 0 {
+                    return false;
+                }
+                return self.pro.start(session_id, hardware_generation);
+            }
+            return false;
         }
+        let hardware_generation = self.timeline.generation();
         self.shared
             .iter()
             .any(|port| port.session.start(session_id, hardware_generation))
@@ -1976,7 +1984,6 @@ fn stats_from_core(
         capture_delay_min_frames: stats.capture_delay_min_frames,
         capture_delay_max_frames: stats.capture_delay_max_frames,
         playback_target_overshoot_max_frames: stats.playback_target_overshoot_max_frames,
-        capture_clock_wait_max_nanos: stats.capture_clock_wait_max_nanos,
         pro_wait_budget_min_nanos: stats.pro_wait_budget_min_nanos,
         pro_wait_budget_max_nanos: stats.pro_wait_budget_max_nanos,
         pro_ready_wait_max_nanos: stats.pro_ready_wait_max_nanos,
@@ -2019,10 +2026,6 @@ fn playback_sequence_lag(expected: u64, last_published: u64) -> u64 {
     } else {
         0
     }
-}
-
-fn sequence_before(sequence: u64, target: u64) -> bool {
-    sequence != target && target.wrapping_sub(sequence) < (1_u64 << 63)
 }
 
 fn monotonic_nanos() -> u64 {

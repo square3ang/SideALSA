@@ -7,7 +7,7 @@ use std::{
 };
 
 use sidealsa_client::{AudioStream, ClientError, SideAlsaClient, StreamMode};
-use sidealsa_protocol::{FEATURE_PRO_DIRECTIONS, PortDirection};
+use sidealsa_protocol::{FEATURE_PRO_DIRECTIONS, PortDirection, sequence_order};
 
 const MODE_PRO: c_int = 0;
 const MODE_SHARED: c_int = 1;
@@ -1286,21 +1286,6 @@ fn playback_sequence_consumed(
         Some(Ordering::Less) => Ok(false),
         Some(Ordering::Equal | Ordering::Greater) => Ok(true),
         None => Err(libc::EPIPE),
-    }
-}
-
-fn sequence_order(candidate: u64, reference: u64) -> Option<Ordering> {
-    const HALF_RANGE: u64 = 1_u64 << 63;
-
-    let distance = candidate.wrapping_sub(reference);
-    if distance == 0 {
-        Some(Ordering::Equal)
-    } else if distance < HALF_RANGE {
-        Some(Ordering::Greater)
-    } else if distance == HALF_RANGE {
-        None
-    } else {
-        Some(Ordering::Less)
     }
 }
 
