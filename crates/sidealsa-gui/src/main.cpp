@@ -125,7 +125,9 @@ QSpinBox *numberBox(int minimum, int maximum, const QString &suffix = {})
     auto *box = new NumberBox;
     box->setRange(minimum, maximum);
     box->setAccelerated(true);
-    box->setButtonSymbols(QAbstractSpinBox::NoButtons);
+    // Qt 6.12 shrinks the editor to 1 px with NoButtons plus a styled frame;
+    // the stylesheet hides the buttons instead and the margins replace padding.
+    box->findChild<QLineEdit *>()->setTextMargins(10, 0, 10, 0);
     configureField(box);
     if (!suffix.isEmpty())
         box->setSuffix(suffix);
@@ -443,6 +445,7 @@ private:
                 border: 1px solid palette(mid);
                 border-radius: 6px;
             }
+            QSpinBox::up-button, QSpinBox::down-button { width: 0; border: none; }
             QComboBox:focus, QSpinBox:focus {
                 border-color: palette(highlight);
             }
