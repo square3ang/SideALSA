@@ -64,6 +64,20 @@ proton_appid() {
     fi
 }
 
+# Proton a Steam game runs with: UMU-Proton overwrites WINEDLLPATH, so its
+# default would not find the DLL. Empty when the prefix never recorded one.
+proton_path() {
+    local info line
+    info="$(dirname -- "$1")/config_info"
+    [[ -f "$info" ]] || return 0
+    line=$(sed -n 2p -- "$info")
+    line=${line%/files/*}
+    line=${line%/dist/*}
+    if [[ -x "$line/proton" ]]; then
+        printf '%s' "$line"
+    fi
+}
+
 install_atomic() {
     local source=$1 target=$2 mode=$3 temporary
     mkdir -p -- "$(dirname -- "$target")"
@@ -107,7 +121,7 @@ setting WINE explicitly bypasses both rules and counts as accepting
 responsibility.
 
 Environment:
-  SIDEALSA_SOCKET        Socket used by ASIO at runtime (default: /run/sidealsa/sidealsad.sock)
+  SIDEALSA_SOCKET        Socket used by ASIO at runtime (default: /tmp/sidealsa/sidealsad.sock)
   SIDEALSA_ASIO_INSTALL_ROOT
   SIDEALSA_ASIO_BUILD_DIR
   WINE
@@ -281,10 +295,16 @@ for prefix in "${UNIQUE_PREFIXES[@]}"; do
         fi
     elif [[ "$(prefix_owner "$prefix")" == proton && "$WINE_EXPLICIT" -eq 0 ]]; then
         info "Proton prefix: registering through umu-run instead of system wine"
+        proton_override=${PROTONPATH:-$(proton_path "$prefix")}
+        proton_env=()
+        if [[ -n "$proton_override" ]]; then
+            proton_env=("PROTONPATH=$proton_override")
+        fi
         env \
             WINEPREFIX="$prefix" \
             GAMEID="${GAMEID:-$(proton_appid "$prefix")}" \
             WINEDLLPATH="$WINE_ROOT${WINEDLLPATH:+:$WINEDLLPATH}" \
+            "${proton_env[@]}" \
             umu-run regsvr32 /s sidealsa-asio64.dll \
             || die "umu-run regsvr32 failed in $prefix"
     else
@@ -307,4 +327,4 @@ if ((${#BOTTLES_STAGED[@]} > 0)); then
     info '  bottles-cli shell -b <bottle> -i "regsvr32 /s sidealsa-asio64.dll"'
 fi
 info "Steam launch option: WINEDLLPATH=$WINE_ROOT %command%"
-info "ASIO uses /run/sidealsa/sidealsad.sock unless SIDEALSA_SOCKET is set"
+info "ASIO uses /tmp/sidealsa/sidealsad.sock unless SIDEALSA_SOCKET is set"

@@ -1,0 +1,3 @@
+# Managed by SideALSA installer.
+# Root-owned so no other user can claim the socket path; Steam containers share /tmp but not /run.
+d /tmp/sidealsa 0750 root audio -

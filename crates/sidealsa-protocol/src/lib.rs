@@ -1192,7 +1192,7 @@ mod tests {
         assert_eq!(FEATURE_PRO_DIRECTIONS, 4);
         assert_eq!(
             encode_request(&Request::OpenPro).unwrap(),
-            b"SALS\x10\0\x03\0\0\0\0\0"
+            b"SALS\x11\0\x03\0\0\0\0\0"
         );
         for direction in [PortDirection::Playback, PortDirection::Capture] {
             let request = Request::OpenProDirection {

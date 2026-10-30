@@ -1,7 +1,7 @@
 # Managed by SideALSA installer.
 [Unit]
 Description=SideALSA physical audio daemon
-After=sound.target
+After=sound.target systemd-tmpfiles-setup.service
 Wants=sound.target
 
 [Service]
@@ -12,9 +12,6 @@ RestartPreventExitStatus=78
 RestartSec=2
 Group=audio
 UMask=0007
-# Root-owned 0750 root:audio; /tmp let any user squat the socket path.
-RuntimeDirectory=sidealsa
-RuntimeDirectoryMode=0750
 LimitRTPRIO=99
 LimitMEMLOCK=infinity
 

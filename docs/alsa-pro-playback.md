@@ -66,7 +66,7 @@ The external-poll model performs work **after**
 waking, before writing. The blocking model performs work before `writei`.
 The probe prefills the existing B256 application buffer and explicitly starts;
 it reports partial writes, EAGAIN, client EPIPE/recovery, CPU and wall time.
-It uses a private PRO definition for `/run/sidealsa/sidealsad.sock`; no device settings or
+It uses a private PRO definition for `/tmp/sidealsa/sidealsad.sock`; no device settings or
 services are modified. Its final queued silence is dropped, not drained.
 
 The runner saves logs under `target/alsa-pro`, checks daemon PID/generation and

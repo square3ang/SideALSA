@@ -158,7 +158,7 @@ For the default installation location, Steam launch options are:
 WINEDLLPATH="$HOME/.local/lib/wine" %command%
 ```
 
-ASIO connects to `/run/sidealsa/sidealsad.sock` unless `SIDEALSA_SOCKET` is set, so the
+ASIO connects to `/tmp/sidealsa/sidealsad.sock` unless `SIDEALSA_SOCKET` is set, so the
 default setup needs no extra variable. For a custom socket or installation
 location, substitute the actual paths printed by the installer. Select the SideALSA ASIO driver in your game or DAW's audio settings.
 The main installer's `--with-asio` installs system files only; **prefix registration still requires this separate step**.
@@ -304,12 +304,12 @@ Hardware, ASIO, and loopback validation require a separate test environment. Do 
 
 | Item | Default path |
 | --- | --- |
-| Executables / socket | `/usr/local/bin` / `/run/sidealsa/sidealsad.sock` |
+| Executables / socket | `/usr/local/bin` / `/tmp/sidealsa/sidealsad.sock` |
 | Selection state / profile | `/etc/sidealsa/active.toml` / `/etc/sidealsa/profiles/<selected-profile>.toml` |
 | ALSA / PipeWire configuration | `/etc/alsa/conf.d/99-sidealsa.conf` / `/etc/pipewire/pipewire.conf.d/99-sidealsa.conf` |
 | User ASIO | `$HOME/.local/lib/wine` |
 
-The socket lives in the root-owned `/run/sidealsa` directory (`root:audio`, mode `0750`) and is owned by `root:audio` with mode `0770`. The installer refuses to install when no `audio` group exists, because the socket grants microphone access. Clients only accept a daemon running as root or as the current user.
+The socket lives in the root-owned `/tmp/sidealsa` directory (`root:audio`, mode `0750`, created at boot by `/etc/tmpfiles.d/sidealsa.conf`; Steam containers share `/tmp` but not `/run`) and is owned by `root:audio` with mode `0770`. The installer refuses to install when no `audio` group exists, because the socket grants microphone access. Clients only accept a daemon running as root or as the current user; inside a user namespace, where root is unmapped, they rely on the directory ownership instead. The daemon refuses to start if the directory is not root-owned and writable only by root.
 Rust components live in [`crates/`](crates/); device-specific configurations live in [`profiles/`](profiles/).
 
 </details>

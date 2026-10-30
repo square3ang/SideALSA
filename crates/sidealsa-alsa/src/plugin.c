@@ -431,7 +431,7 @@ int sidealsa_plugin_open(snd_pcm_t **pcmp, const char *name,
 				 snd_config_t *root, snd_config_t *conf,
 				 snd_pcm_stream_t stream, int mode)
 {
-	const char *socket = "/run/sidealsa/sidealsad.sock";
+	const char *socket = "/tmp/sidealsa/sidealsad.sock";
 	const char *mode_name = "pro";
 	const char *port = NULL;
 	sidealsa_pcm_t *pcm;

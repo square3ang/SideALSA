@@ -136,6 +136,26 @@ pub struct PeerCredentials {
     pub gid: u32,
 }
 
+/// Uid a peer outside this user namespace appears as, such as root seen from a
+/// Steam container. None on the host, where a real `nobody` must not pass.
+/// shortcut: any unmapped user looks the same here, so inside a namespace only
+/// the root-owned socket directory proves the peer; no fix short of kernel help.
+fn unmapped_uid() -> Option<u32> {
+    let map = std::fs::read_to_string("/proc/self/uid_map").ok()?;
+    if is_identity_uid_map(&map) {
+        return None;
+    }
+    std::fs::read_to_string("/proc/sys/kernel/overflowuid")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn is_identity_uid_map(map: &str) -> bool {
+    map.split_whitespace().eq(["0", "0", "4294967295"])
+}
+
 fn socket_peer_credentials(control: &UnixStream) -> Result<PeerCredentials, ClientError> {
     let mut credentials = libc::ucred {
         pid: 0,
@@ -186,7 +206,10 @@ impl SideAlsaClient {
         let mut control = UnixStream::connect(path)?;
         // Only root (system daemon) or this user (dev daemon) may serve audio to us.
         let peer_uid = socket_peer_credentials(&control)?.uid;
-        if peer_uid != 0 && peer_uid != unsafe { libc::getuid() } {
+        if peer_uid != 0
+            && peer_uid != unsafe { libc::getuid() }
+            && Some(peer_uid) != unmapped_uid()
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("socket peer uid {peer_uid} is neither root nor the current user"),
@@ -1357,6 +1380,16 @@ fn close_fd(fd: RawFd) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_non_identity_uid_map_counts_as_a_namespace() {
+        assert!(super::is_identity_uid_map(
+            "         0          0 4294967295\n"
+        ));
+        assert!(!super::is_identity_uid_map(
+            "      1000       1000          1\n"
+        ));
+    }
+
     use super::*;
     use std::{
         fs,

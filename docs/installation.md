@@ -33,7 +33,7 @@ Installer defaults:
 - PipeWire Pulse scheduling: `/etc/pipewire/pipewire-pulse.conf.d/99-sidealsa.conf`
 - WirePlumber scheduling: `/etc/wireplumber/wireplumber.conf.d/99-sidealsa.conf`
 - daemon service: `sidealsad.service`
-- socket: `/run/sidealsa/sidealsad.sock` (systemd `RuntimeDirectory`)
+- socket: `/tmp/sidealsa/sidealsad.sock` (root-owned directory from `/etc/tmpfiles.d/sidealsa.conf`)
 - control panel: `/usr/local/bin/sidealsa-control`
 - privileged helper: `/usr/libexec/sidealsa-admin`
 - polkit action: `org.sidealsa.configure`

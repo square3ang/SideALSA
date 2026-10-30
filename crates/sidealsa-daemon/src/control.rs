@@ -3,7 +3,7 @@ use std::{
     io::{self, Write},
     os::fd::{AsRawFd, RawFd},
     os::linux::fs::MetadataExt,
-    os::unix::fs::FileTypeExt,
+    os::unix::fs::{DirBuilderExt, FileTypeExt},
     os::unix::net::{UnixListener, UnixStream},
     path::Path,
     ptr,
@@ -96,7 +96,7 @@ pub fn run_control_listener(
     stop: Arc<AtomicBool>,
 ) -> Result<(), ControlError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        prepare_socket_directory(parent)?;
     }
     remove_stale_socket(path)?;
     let listener = UnixListener::bind(path)?;
@@ -141,6 +141,33 @@ pub fn run_control_listener(
         let _ = std::fs::remove_file(path);
     }
     Ok(())
+}
+
+/// A root daemon serves microphones, so nobody else may be able to replace its
+/// socket: the directory must be root-owned and writable only by root.
+fn prepare_socket_directory(directory: &Path) -> io::Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        return std::fs::create_dir_all(directory);
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o750)
+        .create(directory)?;
+    let metadata = std::fs::symlink_metadata(directory)?;
+    if !socket_directory_is_safe(metadata.is_dir(), metadata.st_uid(), metadata.st_mode()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "socket directory {} must be root-owned and writable only by root",
+                directory.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn socket_directory_is_safe(is_dir: bool, uid: u32, mode: u32) -> bool {
+    is_dir && uid == 0 && mode & 0o022 == 0
 }
 
 fn is_transient_accept_error(error: &io::Error) -> bool {
@@ -557,6 +584,16 @@ fn send_with_fds(stream: &mut UnixStream, bytes: &[u8], fds: &[RawFd]) -> Result
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn socket_directory_must_be_root_only_writable() {
+        use super::socket_directory_is_safe as safe;
+        assert!(safe(true, 0, 0o750));
+        assert!(!safe(true, 1000, 0o750));
+        assert!(!safe(true, 0, 0o770));
+        assert!(!safe(true, 0, 0o1777));
+        assert!(!safe(false, 0, 0o750));
+    }
+
     use super::*;
     use std::{
         fs,

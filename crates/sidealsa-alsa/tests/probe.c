@@ -122,7 +122,7 @@ int main(int argc, char **argv)
     const char *stage = "configuration";
 #define CHECK(expr) do { err = (expr); if (err < 0) { stage = #expr; goto done; } } while (0)
     CHECK(snd_config_load_string(&config,
-        "pcm.sidealsa_pro { type sidealsa mode pro socket \"/run/sidealsa/sidealsad.sock\" }", 0));
+        "pcm.sidealsa_pro { type sidealsa mode pro socket \"/tmp/sidealsa/sidealsad.sock\" }", 0));
     CHECK(snd_pcm_open_lconf(&pcm, "sidealsa_pro", SND_PCM_STREAM_PLAYBACK,
                             external_poll ? SND_PCM_NONBLOCK : 0, config));
     CHECK(snd_pcm_hw_params_any(pcm, hw));

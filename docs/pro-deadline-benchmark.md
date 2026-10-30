@@ -24,7 +24,7 @@ Controls:
 | --- | --- |
 | `SIDEALSA_ASIO_BUILD_DIR` | Repository `build-asio`, containing the standard probe. |
 | `SIDEALSA_ASIO_DLL_DIR` | `/usr/local/lib/wine`; use the absolute `build-asio` path for the local candidate. |
-| `SIDEALSA_SOCKET` | `/run/sidealsa/sidealsad.sock`. |
+| `SIDEALSA_SOCKET` | `/tmp/sidealsa/sidealsad.sock`. |
 | `SIDEALSA_DEADLINE_RUN_MS` | 4000 per Start leg; 1000-30000. Each case has two legs. |
 | `SIDEALSA_DEADLINE_WORK_US` | Space-separated `0 50 100 150 200 250 300 200 100 0`; values 0-1000. |
 | `SIDEALSA_DEADLINE_WORKERS` | 0; 1-64 adds that many same-process background workers and 512 MiB of work memory. |

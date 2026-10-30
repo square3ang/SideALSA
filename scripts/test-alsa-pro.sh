@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Explicit opt-in only. No daemon/service management, installation, or registration.
-# Fixed private PCM in probe.c uses /run/sidealsa/sidealsad.sock, not system PCM definitions.
+# Fixed private PCM in probe.c uses /tmp/sidealsa/sidealsad.sock, not system PCM definitions.
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 usage() {
     printf 'Usage: bash %s --compile-only | --run installed|local [periods [work_us [blocking|poll [0|46 [prefill_periods=4]]]]]\n' "$0"
@@ -44,7 +44,7 @@ stat_value() {
     printf '%s\n' "${BASH_REMATCH[2]}"
 }
 read_stats() {
-    "$stats" --socket /run/sidealsa/sidealsad.sock --samples 1 --interval-ms 0 "$@"
+    "$stats" --socket /tmp/sidealsa/sidealsad.sock --samples 1 --interval-ms 0 "$@"
 }
 before=$(read_stats)
 printf '%s\n' "$before" > "$log_dir/before.log"

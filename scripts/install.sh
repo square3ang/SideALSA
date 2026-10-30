@@ -15,7 +15,7 @@ fi
 PREFIX="${PREFIX:-/usr/local}"
 DESTDIR="${DESTDIR:-}"
 PROFILE_SOURCE="$ROOT/profiles/topping-e1x2.toml"
-SOCKET_PATH="${SIDEALSA_SOCKET:-/run/sidealsa/sidealsad.sock}"
+SOCKET_PATH="${SIDEALSA_SOCKET:-/tmp/sidealsa/sidealsad.sock}"
 PROFILE_EXPLICIT=0
 SOCKET_EXPLICIT="${SIDEALSA_SOCKET_EXPLICIT:-${SIDEALSA_SOCKET+x}}"
 ALSA_PLUGIN_DIR="${ALSA_PLUGIN_DIR:-}"
@@ -104,7 +104,7 @@ Options:
   --interactive             Terminal device/profile setup (use alone; default with no args)
   --prefix PATH             Binary and data prefix (default: /usr/local)
   --profile PATH            Profile seed for first install; existing config is preserved
-  --socket PATH             Daemon socket (default: /run/sidealsa/sidealsad.sock)
+  --socket PATH             Daemon socket (default: /tmp/sidealsa/sidealsad.sock)
   --alsa-plugin-dir PATH    ALSA external-plugin directory
   --no-build                Use existing target/release artifacts
   --with-asio               Build and install Wine ASIO binaries
@@ -319,6 +319,7 @@ PIPEWIRE_CONFIG_PATH=/etc/pipewire/pipewire.conf.d/99-sidealsa.conf
 PIPEWIRE_PULSE_CONFIG_PATH=/etc/pipewire/pipewire-pulse.conf.d/99-sidealsa.conf
 WIREPLUMBER_CONFIG_PATH=/etc/wireplumber/wireplumber.conf.d/99-sidealsa.conf
 SERVICE_PATH=/etc/systemd/system/sidealsad.service
+TMPFILES_PATH=/etc/tmpfiles.d/sidealsa.conf
 SELECTION_PATH=/etc/sidealsa/active.toml
 INTEGRATION_PROFILE_PATH=/etc/sidealsa/integration-profile.toml
 GENERATOR="$ROOT/target/release/sidealsa-config-gen"
@@ -403,8 +404,9 @@ else
     [[ "$PROFILE_SOURCE" == /* ]] || PROFILE_SOURCE="$ROOT/$PROFILE_SOURCE"
     PROFILE_PATH="/etc/sidealsa/profiles/$(basename -- "$PROFILE_SOURCE")"
 fi
-# The old world-writable default migrates to the root-owned runtime directory.
-[[ "$PREVIOUS_SOCKET" != /tmp/sidealsad.sock ]] || PREVIOUS_SOCKET=
+# Earlier defaults migrate to the root-owned directory Steam containers can see.
+[[ "$PREVIOUS_SOCKET" != /tmp/sidealsad.sock && "$PREVIOUS_SOCKET" != /run/sidealsa/sidealsad.sock ]] \
+    || PREVIOUS_SOCKET=
 if [[ -z "$SOCKET_EXPLICIT" || "$SOCKET_EXPLICIT" == 0 ]] && [[ -n "$PREVIOUS_SOCKET" ]]; then
     SOCKET_PATH=$PREVIOUS_SOCKET
 fi
@@ -474,6 +476,7 @@ MANAGED_PATHS+=(
     "$ALSA_PLUGIN_DIR/libasound_module_pcm_sidealsa.so"
     "$ALSA_CONFIG_PATH"
     "$SERVICE_PATH"
+    "$TMPFILES_PATH"
     "$SELECTION_PATH"
     "$LICENSE_PATH"
 )
@@ -639,6 +642,7 @@ fi
 run_privileged install -D -m 0644 "$TMP_DIR/alsa.managed" "$(destination "$ALSA_CONFIG_PATH")"
 run_privileged install -D -m 0644 "$TMP_DIR/active.managed" "$(destination "$SELECTION_PATH")"
 run_privileged install -D -m 0644 "$service_temp" "$(destination "$SERVICE_PATH")"
+run_privileged install -D -m 0644 "$ROOT/packaging/sidealsa.tmpfiles" "$(destination "$TMPFILES_PATH")"
 if ((INSTALL_PIPEWIRE == 1)); then
     run_privileged install -D -m 0644 "$TMP_DIR/reconnect.service" "$(destination "$RECONNECT_UNIT")"
 fi

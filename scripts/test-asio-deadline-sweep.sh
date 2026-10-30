@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 BUILD_DIR="${SIDEALSA_ASIO_BUILD_DIR:-$ROOT/build-asio}"
 DLL_DIR="${SIDEALSA_ASIO_DLL_DIR:-/usr/local/lib/wine}"
-SOCKET="${SIDEALSA_SOCKET:-/run/sidealsa/sidealsad.sock}"
+SOCKET="${SIDEALSA_SOCKET:-/tmp/sidealsa/sidealsad.sock}"
 STATS="$ROOT/target/release/sidealsa-stats"
 PROBE="$BUILD_DIR/sidealsa-asio-probe.exe.so"
 RUN_MS="${SIDEALSA_DEADLINE_RUN_MS:-4000}"
