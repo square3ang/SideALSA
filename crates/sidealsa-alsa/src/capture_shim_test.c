@@ -154,5 +154,20 @@ int main(void)
 	assert(sidealsa_pointer(io) == 0);
 	assert(stream.reset_calls == 1 && stream.reset_queued == 60);
 	assert(pcm.playback_expected_appl_ptr == 0 && pcm.playback_reported_hw_ptr == 0);
+
+	static const struct { const char *text; int result; long periods; } limits[] = {
+		{ "max_periods 2", 0, 2 },
+		{ "max_periods 0", -EINVAL, 0 },
+		{ "max_periods \"2\"", -EINVAL, 0 },
+	};
+	for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
+		snd_config_t *conf;
+		const char *socket = NULL, *mode = NULL, *port = NULL;
+		long periods = 0;
+		assert(snd_config_load_string(&conf, limits[i].text, 0) == 0);
+		assert(sidealsa_parse_config(conf, &socket, &mode, &port, &periods) == limits[i].result);
+		assert(periods == limits[i].periods);
+		snd_config_delete(conf);
+	}
 	return 0;
 }

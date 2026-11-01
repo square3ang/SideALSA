@@ -400,7 +400,8 @@ static const snd_pcm_ioplug_callback_t sidealsa_callback = {
 };
 
 static int sidealsa_parse_config(snd_config_t *conf, const char **socket,
-					 const char **mode, const char **port)
+					 const char **mode, const char **port,
+					 long *max_periods)
 {
 	snd_config_iterator_t iterator, next;
 
@@ -413,6 +414,11 @@ static int sidealsa_parse_config(snd_config_t *conf, const char **socket,
 			continue;
 		if (!strcmp(id, "type") || !strcmp(id, "hint") || !strcmp(id, "comment"))
 			continue;
+		if (!strcmp(id, "max_periods")) {
+			if (snd_config_get_integer(node, max_periods) < 0 || *max_periods < 1)
+				return -EINVAL;
+			continue;
+		}
 		if (snd_config_get_string(node, &value) < 0)
 			return -EINVAL;
 		if (!strcmp(id, "socket"))
@@ -438,18 +444,22 @@ int sidealsa_plugin_open(snd_pcm_t **pcmp, const char *name,
 	unsigned int period_size;
 	unsigned int minimum_buffer_size;
 	unsigned int buffer_size;
+	long max_periods = 0;
 	int sidealsa_mode;
 	int direction;
 	int result;
 
 	(void)root;
-	result = sidealsa_parse_config(conf, &socket, &mode_name, &port);
+	result = sidealsa_parse_config(conf, &socket, &mode_name, &port, &max_periods);
 	if (result < 0)
 		return result;
 	if (!strcmp(mode_name, "pro")) {
 		sidealsa_mode = 0;
 	} else if (!strcmp(mode_name, "shared")) {
 		if (!port)
+			return -EINVAL;
+		/* SHARED geometry protects the daemon's latency reserve. */
+		if (max_periods)
 			return -EINVAL;
 		sidealsa_mode = 1;
 	} else {
@@ -478,6 +488,9 @@ int sidealsa_plugin_open(snd_pcm_t **pcmp, const char *name,
 		goto error;
 	pcm->period_size = period_size;
 	pcm->minimum_buffer_size = minimum_buffer_size;
+	/* Blocking writers keep the buffer full, so its maximum is their latency. */
+	if (max_periods && (unsigned long)max_periods < buffer_size / period_size)
+		buffer_size = (unsigned int)max_periods * period_size;
 	pcm->buffer_size = buffer_size;
 	pcm->buffered_capture = sidealsa_stream_is_buffered_capture(pcm->stream);
 

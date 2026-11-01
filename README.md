@@ -207,6 +207,7 @@ The E1x2 ports are listed below; other profiles generate ports from their own de
 | Purpose | ALSA PCM | PipeWire node |
 | --- | --- | --- |
 | Full PRO, 8 outputs / 10 inputs | `sidealsa_pro` | Not applicable |
+| Full PRO, at most a 2-period buffer | `sidealsa_pro_lowlat` | Not applicable |
 | Stereo outputs | `sidealsa_line1` through `sidealsa_line4` | `sidealsa-line1` through `sidealsa-line4` |
 | Mono inputs | `sidealsa_mic1`, `sidealsa_mic2` | `sidealsa-mic1`, `sidealsa-mic2` |
 | Stereo inputs | `sidealsa_input34`, `sidealsa_input56`, `sidealsa_input78`, `sidealsa_input910` | Same names with `sidealsa-` instead of `sidealsa_` |

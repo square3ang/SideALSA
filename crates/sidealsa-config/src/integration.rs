@@ -119,6 +119,17 @@ fn validate(profile: &Profile) -> Result<(), ProfileError> {
             "port id 'pro' is reserved by the generator for sidealsa_pro".into(),
         ));
     }
+    if profile
+        .ports
+        .playback
+        .iter()
+        .chain(&profile.ports.capture)
+        .any(|p| p.id == "pro_lowlat")
+    {
+        return Err(ProfileError::Invalid(
+            "port id 'pro_lowlat' is reserved by the generator for sidealsa_pro_lowlat".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -132,7 +143,7 @@ pub fn render_alsa(profile: &Profile, socket: &str) -> Result<String, ProfileErr
     validate_path(std::path::Path::new(socket))?;
     let socket = quote(socket);
     let mut out = format!(
-        "{HEADER}pcm.sidealsa_pro {{\n    type sidealsa\n    mode pro\n    socket {socket}\n    hint {{\n        show on\n        description \"SideALSA PRO\"\n    }}\n}}\n"
+        "{HEADER}pcm.sidealsa_pro {{\n    type sidealsa\n    mode pro\n    socket {socket}\n    hint {{\n        show on\n        description \"SideALSA PRO\"\n    }}\n}}\n\npcm.sidealsa_pro_lowlat {{\n    type sidealsa\n    mode pro\n    max_periods 2\n    socket {socket}\n    hint {{\n        show on\n        description \"SideALSA PRO (2-period buffer)\"\n    }}\n}}\n"
     );
     for port in profile.ports.playback.iter().chain(&profile.ports.capture) {
         writeln!(out, "\npcm.sidealsa_{} {{\n    type sidealsa\n    mode shared\n    port {}\n    socket {socket}\n}}", port.id, quote(&port.id)).unwrap();
@@ -262,7 +273,7 @@ mod tests {
                 .unwrap()
                 .matches("pcm.")
                 .count(),
-            1
+            2
         );
     }
 
@@ -287,6 +298,8 @@ mod tests {
         p.validate().unwrap();
         assert!(render_alsa(&p, "/tmp/socket").is_err());
         assert!(render_pipewire(&p).is_err());
+        p.ports.playback[0].id = "pro_lowlat".into();
+        assert!(render_alsa(&p, "/tmp/socket").is_err());
     }
 
     #[test]

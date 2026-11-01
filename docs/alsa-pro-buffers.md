@@ -20,6 +20,16 @@ The plugin allocates its maximum FIFO once during open, then uses the negotiated
 application size as its active capacity. Changing capacity while running or with
 pending data is rejected. SHARED buffer geometry/behavior is unchanged.
 
+### `sidealsa_pro_lowlat`
+
+Blocking writers keep the application buffer full, so the largest buffer they
+negotiate becomes queue latency. PortAudio's default low latency on
+`sidealsa_pro` selects B512 at Q64, about 10.7 ms. `sidealsa_pro_lowlat` is the
+same PRO stream with `max_periods 2` in its PCM definition, capping the buffer
+at two logical periods. Applications get less scheduling tolerance and may hit
+EPIPE where `sidealsa_pro` would not; requests for an exact larger buffer fail.
+`max_periods` is rejected on SHARED PCMs.
+
 ## Startup and sequence semantics
 
 PRO start no longer blocks while flushing prepared audio across hardware cycles.
