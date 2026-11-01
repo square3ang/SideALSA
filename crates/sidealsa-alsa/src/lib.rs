@@ -882,11 +882,11 @@ impl SideAlsaStream {
                         self.stream.record_expired_playback_periods(
                             u64::try_from(discarded_periods).unwrap_or(u64::MAX),
                         );
-                        self.next_playback_sequence =
-                            realigned_playback_sequence(plan.sequence, self.playback_fifo_frames);
-                        if self.next_playback_sequence.is_none() {
-                            self.playback_cycle_sequence = None;
-                        }
+                        self.next_playback_sequence = Some(realigned_playback_sequence(
+                            plan.sequence,
+                            plan.expired_periods,
+                            discarded_periods,
+                        ));
                         progressed = true;
                         continue;
                     }
@@ -1199,8 +1199,14 @@ fn expired_playback_action(
     ExpiredPlaybackAction::Realign { discarded_periods }
 }
 
-fn realigned_playback_sequence(sequence: u64, queued_frames: usize) -> Option<u64> {
-    (queued_frames != 0).then_some(sequence)
+// Advance only past discarded audio. Re-aligning an emptied FIFO to the newest cycle
+// would add latency that no later write could remove until the PCM is restarted.
+fn realigned_playback_sequence(
+    earliest: u64,
+    expired_periods: usize,
+    discarded_periods: usize,
+) -> u64 {
+    earliest.wrapping_sub(expired_periods.saturating_sub(discarded_periods) as u64)
 }
 
 fn plan_playback_sequence_with_queue(
@@ -2020,15 +2026,36 @@ mod tests {
                 discarded_periods: 1,
             }
         );
-        assert_eq!(realigned_playback_sequence(104, 0), None);
-        assert_eq!(realigned_playback_sequence(104, 1), Some(104));
+        // next=101 expired 3 periods with only 1 queued: the next write is still 102.
+        assert_eq!(realigned_playback_sequence(104, 3, 1), 102);
+        assert_eq!(realigned_playback_sequence(104, 1, 1), 104);
+        assert_eq!(realigned_playback_sequence(1, 3, 1), u64::MAX);
 
         let mut partial_fifo = [10, 11, 20, 21, 30];
         let mut partial_frames = 5;
         discard_playback_fifo_periods(&mut partial_fifo, &mut partial_frames, 2, 2, 1)
             .expect("complete expired periods should leave a partial period queued");
         assert_eq!(partial_frames, 1);
-        assert_eq!(realigned_playback_sequence(104, partial_frames), Some(104));
+    }
+
+    #[test]
+    fn stalled_shared_writer_catches_up_without_keeping_extra_latency() {
+        // Latency 5: label L is consumed at cycle L + 5. A one-period burst arrives
+        // after the writer fell three periods behind, then the writer catches up.
+        let plan = playback_plan(Some(100), 107, 5, false, 1);
+        assert_eq!(plan.expired_periods, 3);
+        let discarded = plan.expired_periods.min(1);
+        let next = realigned_playback_sequence(plan.sequence, plan.expired_periods, discarded);
+        assert_eq!(next, 101);
+
+        let plan = playback_plan(Some(next), 107, 5, false, 4);
+        assert_eq!(plan.expired_periods, 2);
+        let next = realigned_playback_sequence(plan.sequence, plan.expired_periods, 2);
+        assert_eq!(next, 103);
+        assert_eq!(
+            playback_plan(Some(next), 107, 5, false, 2).expired_periods,
+            0
+        );
     }
 
     #[test]
