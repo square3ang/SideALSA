@@ -140,3 +140,11 @@ snapshots, PRO workload output and counter snapshots are retained in each log
 directory. Unit tests cover publication/accounting, partial reads, forwarding,
 cursor wrap/rejection, full rings, prepare/recovery, dynamic slot counts and
 geometry preservation.
+
+## Hardware Restarts
+
+A hardware XRUN restart no longer restarts SHARED PCMs. Sequences continue across
+the restart, so SHARED clients keep their lifecycle and missed periods follow the
+normal expiry path. PRO still receives `CaptureDiscontinuity`. The ALSA plugin and
+`sidealsad` must be updated together: an older daemon would keep waiting for a
+client restart that the new plugin no longer performs.

@@ -474,8 +474,9 @@ fn full_ring_and_generation_faults_are_visible_without_skip() {
     assert_eq!(f.sync(0, 0, 4096), 0);
     assert!(f.publish(100));
     assert_eq!(f.read(1), (1, vec![100]));
+    // A hardware restart keeps the SHARED sequence, so it is not a PCM fault.
     f.region.set_hardware_generation(1);
-    assert_eq!(f.sync(1, 1, 4096), -libc::EPIPE);
+    assert_eq!(f.sync(1, 1, 4096), 0);
     f.prepare();
     assert_eq!(f.sync(0, 0, 4096), 0);
     f.region

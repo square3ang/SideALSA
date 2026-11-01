@@ -1028,6 +1028,11 @@ impl AudioStream {
             return Ok(());
         }
         self.hardware_generation = current;
+        // SHARED sequences continue across a hardware restart, so its clients need no PCM
+        // restart; missed periods are handled by the normal sequence expiry.
+        if matches!(self.mode, StreamMode::Shared(_)) {
+            return Ok(());
+        }
         self.capture_index = 0;
         self.playback_index = 0;
         self.last_sequence = None;
@@ -2935,7 +2940,7 @@ mod tests {
     }
 
     #[test]
-    fn hardware_generation_change_requests_stream_recovery() {
+    fn shared_stream_keeps_running_across_hardware_generation_change() {
         let server_region = SharedRegion::create(1, 0, 1).expect("region should create");
         server_region.set_hardware_generation(4);
         let client_fd = unsafe { libc::dup(server_region.fd()) };
@@ -2945,6 +2950,31 @@ mod tests {
             control,
             9,
             StreamMode::Shared(PortDirection::Capture),
+            server_region.info(),
+            owned_fds([client_fd, event_fd(), event_fd(), event_fd()]),
+        )
+        .expect("stream should create");
+        stream.started = true;
+        server_region.set_hardware_generation(5);
+
+        assert!(matches!(
+            stream.wait_period(Duration::ZERO),
+            Err(ClientError::Timeout)
+        ));
+        stream.closed = true;
+    }
+
+    #[test]
+    fn hardware_generation_change_requests_stream_recovery() {
+        let server_region = SharedRegion::create(1, 0, 1).expect("region should create");
+        server_region.set_hardware_generation(4);
+        let client_fd = unsafe { libc::dup(server_region.fd()) };
+        assert!(client_fd >= 0);
+        let (_peer, control) = UnixStream::pair().expect("socket pair should create");
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Pro,
             server_region.info(),
             owned_fds([client_fd, event_fd(), event_fd(), event_fd()]),
         )
@@ -2973,7 +3003,7 @@ mod tests {
         let mut stream = AudioStream::from_parts(
             control,
             9,
-            StreamMode::Shared(PortDirection::Capture),
+            StreamMode::Pro,
             info,
             owned_fds([client_fd, capture_fd, event_fd(), event_fd()]),
         )

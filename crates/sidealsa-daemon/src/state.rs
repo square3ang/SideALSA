@@ -1194,7 +1194,6 @@ struct SharedAudioPortBridge {
     endpoint: Arc<EndpointSlot>,
     active: Arc<AtomicU64>,
     lifecycle_generation: Arc<AtomicU64>,
-    lifecycle_hardware_generation: Arc<AtomicU64>,
     armed: Arc<AtomicU64>,
     outage: Arc<AtomicU64>,
     channels: Box<[usize]>,
@@ -1225,7 +1224,6 @@ impl SharedAudioPortBridge {
             endpoint: Arc::clone(&port.session.endpoint),
             active: Arc::clone(&port.session.active),
             lifecycle_generation: Arc::clone(&port.session.lifecycle_generation),
-            lifecycle_hardware_generation: Arc::clone(&port.session.lifecycle_hardware_generation),
             armed: Arc::clone(&port.session.armed),
             outage: Arc::clone(&port.session.outage),
             channels: port.channels.clone(),
@@ -1267,17 +1265,6 @@ impl SharedAudioPortBridge {
             return;
         }
         let generation = self.lifecycle_generation.load(Ordering::Acquire);
-        if self.lifecycle_hardware_generation.load(Ordering::Acquire) != hardware_generation {
-            self.last_valid_playback = None;
-            let _ = self
-                .armed
-                .compare_exchange(session_id, 0, Ordering::AcqRel, Ordering::Acquire);
-            let _ =
-                self.outage
-                    .compare_exchange(session_id, 0, Ordering::AcqRel, Ordering::Acquire);
-            endpoint.events.notify_playback();
-            return;
-        }
         if endpoint.region.establish_activation(sequence) {
             self.last_valid_playback = None;
             endpoint.events.notify_playback();
@@ -3826,7 +3813,7 @@ mod tests {
     }
 
     #[test]
-    fn hardware_generation_change_blocks_cache_until_new_lifecycle() {
+    fn hardware_generation_change_blocks_cache_but_not_shared_playback() {
         let profile_text = PROFILE.replace(
             "shared_latency_periods = 0",
             "shared_latency_periods = 0\n        shared_playback_repeat_on_underrun = true",
@@ -3855,40 +3842,50 @@ mod tests {
         playback.commit_playback(0, &mut output);
         assert_eq!(output, [10; 8]);
 
+        // The client keeps its lifecycle: no repeat crosses the restart, new blocks still play.
         playback.shared[0].observed_hardware_generation = Some(u64::MAX);
         state.shared[0]
             .session
             .lifecycle_hardware_generation
             .store(u64::MAX, Ordering::Release);
-        assert!(
-            state.shared[0]
-                .session
-                .current()
-                .region
-                .try_client_publish_playback(&mut producer_index, 1, &[99; 8])
-        );
         playback.process_playback(1, &mut output);
         playback.commit_playback(1, &mut output);
         assert_eq!(output, [0; 8]);
-        playback.process_playback(2, &mut output);
-        playback.commit_playback(2, &mut output);
-        assert_eq!(output, [0; 8]);
-        assert_eq!(timeline.snapshot().shared_underruns, 0);
-
-        assert!(state.stop(shared.session_id));
-        assert!(state.start(shared.session_id));
-        activate_session(&state, shared.session_id, 2);
-        producer_index = 0;
         assert!(
             state.shared[0]
                 .session
                 .current()
                 .region
-                .try_client_publish_playback(&mut producer_index, 3, &[20; 8])
+                .try_client_publish_playback(&mut producer_index, 2, &[99; 8])
         );
-        playback.process_playback(3, &mut output);
-        playback.commit_playback(3, &mut output);
-        assert_eq!(output, [20; 8]);
+        playback.process_playback(2, &mut output);
+        playback.commit_playback(2, &mut output);
+        assert_eq!(output, [99; 8]);
+    }
+
+    #[test]
+    fn shared_start_during_hardware_recovery_still_activates() {
+        let profile = Profile::from_toml(PROFILE).expect("profile should parse");
+        let timeline = Arc::new(HardwareTimeline::default());
+        let state = DaemonState::new(&profile, Arc::clone(&timeline)).expect("state should create");
+        let shared = state
+            .open_shared("line1")
+            .expect("port should exist")
+            .expect("shared port should open");
+        assert!(state.start(shared.session_id));
+        // The generation moved between START and the first cycle. A client waiting for
+        // activation has a frozen pointer, so nothing else would ever restart it.
+        state.shared[0]
+            .session
+            .lifecycle_hardware_generation
+            .store(u64::MAX, Ordering::Release);
+
+        let (_, mut playback) = state.bridges();
+        let mut output = [0; 8];
+        playback.process_playback(0, &mut output);
+        playback.commit_playback(0, &mut output);
+
+        assert!(state.shared[0].session.current().region.activation_ready());
     }
 
     #[test]
