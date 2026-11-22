@@ -1050,6 +1050,8 @@ impl DaemonState {
             },
             playback_epoch: Arc::clone(&self.playback_epoch),
             playback_commits: Arc::clone(&self.playback_commits),
+            defer_playback_notifications: false,
+            pending_pro_notify: false,
             shared: playback_shared,
             prepared_shared_sequence: None,
             last_valid_pro: vec![0; self.period_frames * self.playback_channels].into_boxed_slice(),
@@ -1102,6 +1104,8 @@ pub struct DaemonPlaybackBridge {
     pro_gate: ProPlaybackGate,
     playback_epoch: Arc<AtomicU64>,
     playback_commits: Arc<PlaybackCommitBarrier>,
+    defer_playback_notifications: bool,
+    pending_pro_notify: bool,
     shared: Box<[SharedAudioPortBridge]>,
     prepared_shared_sequence: Option<u64>,
     last_valid_pro: Box<[i32]>,
@@ -1167,6 +1171,7 @@ impl ProPlaybackGate {
         active: &AtomicU64,
         timeline: &HardwareTimeline,
         sequence: u64,
+        notify_immediately: bool,
     ) -> ProPlaybackGateState {
         let hardware_generation = timeline.generation();
         endpoint.region.set_hardware_generation(hardware_generation);
@@ -1181,7 +1186,9 @@ impl ProPlaybackGate {
                 .armed
                 .compare_exchange(session_id, 0, Ordering::AcqRel, Ordering::Acquire);
             self.warmup_blocks.store(0, Ordering::Release);
-            endpoint.events.notify_playback();
+            if notify_immediately {
+                endpoint.events.notify_playback();
+            }
         }
         ProPlaybackGateState {
             hardware_generation,
@@ -1208,6 +1215,7 @@ struct SharedAudioPortBridge {
     repeated_periods: u32,
     observed_hardware_generation: Option<u64>,
     prepared: Option<PreparedSharedPlayback>,
+    pending_notify: bool,
 }
 
 impl SharedAudioPortBridge {
@@ -1241,10 +1249,18 @@ impl SharedAudioPortBridge {
             repeated_periods: 0,
             observed_hardware_generation: None,
             prepared: None,
+            pending_notify: false,
         }
     }
 
-    fn prepare_playback(&mut self, sequence: u64, timeline: &HardwareTimeline) {
+    fn flush_pending_notify(&mut self) {
+        if self.pending_notify {
+            self.pending_notify = false;
+            self.endpoint.load().events.notify_playback();
+        }
+    }
+
+    fn prepare_playback(&mut self, sequence: u64, timeline: &HardwareTimeline, defer_notify: bool) {
         if self.prepared.take().is_some_and(|prepared| prepared.fresh) {
             self.last_valid_playback = None;
         }
@@ -1267,12 +1283,12 @@ impl SharedAudioPortBridge {
         let generation = self.lifecycle_generation.load(Ordering::Acquire);
         if endpoint.region.establish_activation(sequence) {
             self.last_valid_playback = None;
-            endpoint.events.notify_playback();
+            notify_or_defer(&mut self.pending_notify, &endpoint, defer_notify);
             return;
         }
         if endpoint.region.client_state() == SHARED_CLIENT_STARTING {
             self.last_valid_playback = None;
-            endpoint.events.notify_playback();
+            notify_or_defer(&mut self.pending_notify, &endpoint, defer_notify);
             return;
         }
         if endpoint.region.client_state() != SHARED_CLIENT_RUNNING {
@@ -1302,7 +1318,7 @@ impl SharedAudioPortBridge {
             let armed = self.armed.load(Ordering::Acquire) == session_id;
             let outage = self.outage.load(Ordering::Acquire) == session_id;
             if !armed && !outage {
-                endpoint.events.notify_playback();
+                notify_or_defer(&mut self.pending_notify, &endpoint, defer_notify);
                 return;
             }
             let sequence_lag = playback_sequence_lag(
@@ -1334,7 +1350,7 @@ impl SharedAudioPortBridge {
         } else {
             self.last_valid_playback = None;
         }
-        endpoint.events.notify_playback();
+        notify_or_defer(&mut self.pending_notify, &endpoint, defer_notify);
     }
 
     fn commit_prepared(
@@ -1346,13 +1362,17 @@ impl SharedAudioPortBridge {
         let Some(prepared) = self.prepared.take() else {
             return;
         };
-        let endpoint = self.endpoint.load();
         if prepared.sequence != sequence
-            || endpoint.session_id != prepared.identity.session_id
             || self.active.load(Ordering::SeqCst) != prepared.identity.session_id
             || self.lifecycle_generation.load(Ordering::Acquire)
                 != prepared.identity.lifecycle_generation
             || timeline.generation() != prepared.identity.hardware_generation
+        {
+            self.last_valid_playback = None;
+            return;
+        }
+        let endpoint = self.endpoint.load();
+        if endpoint.session_id != prepared.identity.session_id
             || endpoint.region.client_state() != SHARED_CLIENT_RUNNING
         {
             self.last_valid_playback = None;
@@ -1393,8 +1413,9 @@ impl SharedAudioPortBridge {
         sequence: u64,
         physical: &mut [i32],
         timeline: &HardwareTimeline,
+        defer_notify: bool,
     ) {
-        self.prepare_playback(sequence, timeline);
+        self.prepare_playback(sequence, timeline, defer_notify);
         self.commit_prepared(sequence, physical, timeline);
     }
 
@@ -1642,14 +1663,17 @@ impl ProPlaybackSource for DaemonPlaybackBridge {
 
     fn prepare_playback(&mut self, sequence: u64) {
         let endpoint = self.pro_endpoint.load();
-        endpoint.events.drain_playback_ready();
+        if self.pro_active.load(Ordering::Acquire) != 0 {
+            endpoint.events.drain_playback_ready();
+        }
         self.pro_gate
-            .synchronize(&endpoint, &self.pro_active, &self.timeline, sequence);
+            .synchronize(&endpoint, &self.pro_active, &self.timeline, sequence, true);
     }
 
     fn prepare_playback_mix(&mut self, sequence: u64) {
+        let defer = self.defer_playback_notifications;
         for port in &mut self.shared {
-            port.prepare_playback(sequence, &self.timeline);
+            port.prepare_playback(sequence, &self.timeline, defer);
         }
         self.prepared_shared_sequence = Some(sequence);
     }
@@ -1660,7 +1684,6 @@ impl ProPlaybackSource for DaemonPlaybackBridge {
             .enabled
             .load(Ordering::Relaxed)
             .then(|| cutoff_nanos.saturating_sub(monotonic_nanos()));
-        let wait_started = Instant::now();
         let endpoint = self.pro_endpoint.load();
         let session_id = self.pro_active.load(Ordering::SeqCst);
         let hardware_generation = self.timeline.generation();
@@ -1690,10 +1713,12 @@ impl ProPlaybackSource for DaemonPlaybackBridge {
                 .lifecycle_hardware_generation
                 .load(Ordering::Acquire)
                 != hardware_generation
+            || endpoint.region.has_ready_playback(sequence)
         {
             return;
         }
 
+        let wait_started = Instant::now();
         loop {
             if self.pro_active.load(Ordering::SeqCst) != session_id
                 || endpoint.region.client_state() == SHARED_CLIENT_IDLE
@@ -1748,9 +1773,20 @@ impl ProPlaybackSource for DaemonPlaybackBridge {
 
     fn begin_playback_commit(&mut self) {
         self.playback_commits.begin();
+        self.defer_playback_notifications = true;
     }
 
     fn end_playback_commit(&mut self) {
+        // Flush deferred client wakeups after the ALSA playback write completes,
+        // while the commit barrier still pins the endpoints from teardown.
+        self.defer_playback_notifications = false;
+        if self.pending_pro_notify {
+            self.pending_pro_notify = false;
+            self.pro_endpoint.load().events.notify_playback();
+        }
+        for port in &mut self.shared {
+            port.flush_pending_notify();
+        }
         self.playback_commits.end();
     }
 
@@ -1769,10 +1805,19 @@ impl ProPlaybackSource for DaemonPlaybackBridge {
                 port.commit_prepared(sequence, playback, &self.timeline);
             }
         } else {
+            let defer = self.defer_playback_notifications;
             for port in &mut self.shared {
-                port.process_playback(sequence, playback, &self.timeline);
+                port.process_playback(sequence, playback, &self.timeline, defer);
             }
         }
+    }
+}
+
+fn notify_or_defer(pending: &mut bool, endpoint: &SessionEndpoint, defer: bool) {
+    if defer {
+        *pending = true;
+    } else {
+        endpoint.events.notify_playback();
     }
 }
 
@@ -1791,10 +1836,16 @@ impl DaemonPlaybackBridge {
         };
         let wait_timing = self.pro_wait_timing.take();
         let endpoint = self.pro_endpoint.load();
-        let gate = self
-            .pro_gate
-            .synchronize(&endpoint, &self.pro_active, &self.timeline, sequence);
-        playback.fill(0);
+        let gate = self.pro_gate.synchronize(
+            &endpoint,
+            &self.pro_active,
+            &self.timeline,
+            sequence,
+            !self.defer_playback_notifications,
+        );
+        if gate.blocked && self.defer_playback_notifications {
+            self.pending_pro_notify = true;
+        }
         let core_deadline_miss = self.core_miss_pro_sequence.take() == Some(sequence);
         let session_id = self.pro_active.load(Ordering::SeqCst);
         let identity = ProPlaybackIdentity {
@@ -1811,7 +1862,6 @@ impl DaemonPlaybackBridge {
             && endpoint.region.activation_ready()
             && endpoint.region.client_state() != SHARED_CLIENT_IDLE
         {
-            endpoint.events.drain_playback_ready();
             let (outcome, published_nanos) = if self.pro_active.load(Ordering::SeqCst) == session_id
                 && endpoint.region.client_state() == SHARED_CLIENT_RUNNING
             {
@@ -1844,12 +1894,17 @@ impl DaemonPlaybackBridge {
                     == identity.lifecycle_generation
                 && self.timeline.generation() == gate.hardware_generation;
             if consumed && identity_is_current {
+                let sample_count = self.last_valid_pro.len();
+                if playback.len() > sample_count {
+                    playback[sample_count..].fill(0);
+                }
                 if let Some(elapsed) = capture_to_publish_nanos {
                     self.pro_diagnostics.record_accepted(elapsed);
                 }
                 self.timeline
                     .record_pro_playback_block(playback.iter().any(|sample| *sample != 0));
-                self.last_valid_pro.copy_from_slice(playback);
+                self.last_valid_pro
+                    .copy_from_slice(&playback[..sample_count]);
                 self.last_valid_pro_identity = Some(identity);
                 self.pro_repeated_periods = 0;
                 if self.pro_gate.armed.load(Ordering::Acquire) != session_id {
@@ -1897,19 +1952,33 @@ impl DaemonPlaybackBridge {
                     && self.pro_repeated_periods < MAX_REPEATED_PLAYBACK_PERIODS
                 {
                     self.pro_repeated_periods += 1;
-                    playback.copy_from_slice(&self.last_valid_pro);
+                    let sample_count = self.last_valid_pro.len();
+                    playback[..sample_count].copy_from_slice(&self.last_valid_pro);
+                    if playback.len() > sample_count {
+                        playback[sample_count..].fill(0);
+                    }
+                } else {
+                    playback.fill(0);
                 }
-            } else if endpoint.region.client_state() == SHARED_CLIENT_STARTING {
-                self.pro_gate.warmup_blocks.store(0, Ordering::Release);
-                self.last_valid_pro_identity = None;
+            } else {
+                playback.fill(0);
+                if endpoint.region.client_state() == SHARED_CLIENT_STARTING {
+                    self.pro_gate.warmup_blocks.store(0, Ordering::Release);
+                    self.last_valid_pro_identity = None;
+                }
             }
             // Publish the consumed watermark before waking the client so it never
             // observes the stale sequence after poll returns.
             endpoint
                 .region
                 .set_playback_sequence(sequence.wrapping_add(1));
-            endpoint.events.notify_playback();
+            notify_or_defer(
+                &mut self.pending_pro_notify,
+                &endpoint,
+                self.defer_playback_notifications,
+            );
         } else {
+            playback.fill(0);
             self.last_valid_pro_identity = None;
         }
         endpoint
@@ -2910,6 +2979,78 @@ mod tests {
                 .expect("stop should finish")
         );
         worker.join().expect("stop worker should not panic");
+    }
+
+    #[test]
+    fn playback_commit_defers_client_notifications_until_after_write() {
+        fn fd_readable(fd: std::os::fd::RawFd) -> bool {
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            unsafe { libc::poll(&mut pfd, 1, 0) > 0 && pfd.revents & libc::POLLIN != 0 }
+        }
+
+        let profile = Profile::from_toml(PROFILE).expect("profile should parse");
+        let timeline = Arc::new(HardwareTimeline::default());
+        let state = DaemonState::new(&profile, Arc::clone(&timeline)).expect("state should create");
+        let pro = open_pro(&state).0;
+        let shared = state
+            .open_shared("line1")
+            .expect("port should exist")
+            .expect("shared port should open");
+        assert!(state.start(pro));
+        assert!(state.start(shared.session_id));
+        activate_session(&state, pro, 10);
+        activate_session(&state, shared.session_id, 10);
+
+        let pro_fd = state.pro.current().events.playback_fd();
+        let shared_fd = state.shared[0].session.current().events.playback_fd();
+        state.pro.current().events.drain();
+        state.shared[0].session.current().events.drain();
+
+        let mut pro_index = 0;
+        assert!(state.pro.current().region.try_client_publish_playback(
+            &mut pro_index,
+            11,
+            &[42; 8]
+        ));
+        let mut shared_index = 0;
+        assert!(
+            state.shared[0]
+                .session
+                .current()
+                .region
+                .try_client_publish_playback(&mut shared_index, 11, &[10; 8])
+        );
+
+        let (_, mut playback) = state.bridges();
+        // Dirty buffer verifies active PRO hit overwrites cleanly without pre-zeroing.
+        let mut output = [999; 8];
+        playback.begin_playback_commit();
+        playback.process_playback_before(11, u64::MAX, &mut output);
+        playback.prepare_playback_mix(11);
+        playback.commit_playback(11, &mut output);
+        assert_eq!(output, [52; 8]);
+        assert!(!fd_readable(pro_fd), "PRO wakeup must wait for ALSA write");
+        assert!(
+            !fd_readable(shared_fd),
+            "SHARED wakeup must wait for ALSA write"
+        );
+
+        playback.end_playback_commit();
+        assert!(fd_readable(pro_fd), "PRO wakeup must flush on commit end");
+        assert!(
+            fd_readable(shared_fd),
+            "SHARED wakeup must flush on commit end"
+        );
+
+        // Inactive/miss path without repeat still zeroes a dirty output buffer.
+        assert!(state.stop(pro));
+        let mut dirty = [777; 8];
+        playback.process_playback(12, &mut dirty);
+        assert_eq!(dirty, [0; 8]);
     }
 
     #[test]

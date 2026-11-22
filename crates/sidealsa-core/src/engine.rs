@@ -1959,6 +1959,7 @@ fn linked_pro_cycle_loop(
     let mut periods_processed = 0_u64;
 
     let mut latency_guard = LatencyGuard::new(config.period, config.rate);
+    let mut pending_rebase = false;
     'cycles: loop {
         if control.stop.load(Ordering::Relaxed)
             || max_periods.is_some_and(|limit| periods_processed >= limit)
@@ -1966,7 +1967,7 @@ fn linked_pro_cycle_loop(
             control.done.store(true, Ordering::Release);
             return Ok(());
         }
-        let direct_readiness = if config.event_driven {
+        let (direct_readiness, initial_capture_avail) = if config.event_driven {
             match wait_for_linked_duplex_period(
                 playback_pcm,
                 capture_pcm,
@@ -1974,12 +1975,13 @@ fn linked_pro_cycle_loop(
                 config.buffer,
                 control,
             ) {
-                Ok(readiness) => Some(readiness),
+                Ok((readiness, capture_avail)) => (Some(readiness), Some(capture_avail)),
                 Err(error) if error.is_stopped() => {
                     control.done.store(true, Ordering::Release);
                     return Ok(());
                 }
                 Err(error) if error.is_recoverable() => {
+                    pending_rebase = false;
                     recover_linked_streams_during_cycle(
                         playback_pcm,
                         capture_pcm,
@@ -1996,16 +1998,17 @@ fn linked_pro_cycle_loop(
                 }
             }
         } else {
-            None
+            (None, None)
         };
         if let Some(readiness) = direct_readiness {
             latency_guard.ready(control.timeline.generation(), readiness.observed_nanos);
         }
-        let read = match read_capture_samples(
+        let read = match read_capture_samples_with_initial(
             capture_pcm,
             capture_scratch,
             config.capture_channels,
             config.capture_period_samples,
+            initial_capture_avail,
             Some(control),
         ) {
             Ok(read) => read,
@@ -2014,6 +2017,7 @@ fn linked_pro_cycle_loop(
                 return Ok(());
             }
             Err(error) if error.is_recoverable() => {
+                pending_rebase = false;
                 recover_linked_streams_during_cycle(
                     playback_pcm,
                     capture_pcm,
@@ -2041,13 +2045,29 @@ fn linked_pro_cycle_loop(
             continue;
         }
 
+        if config.event_driven && pending_rebase {
+            pending_rebase = false;
+            // Rebase before publishing this capture block to any clients.
+            match rebase_linked_streams(playback_pcm, capture_pcm, control, config, 0) {
+                Ok(()) => normalize_startup_loopback(playback_pcm, capture_pcm, config, control)?,
+                Err(error) if error.is_recoverable() => recover_linked_streams_during_cycle(
+                    playback_pcm,
+                    capture_pcm,
+                    capture_scratch,
+                    &error,
+                    config,
+                    control,
+                )?,
+                Err(error) => return Err(error),
+            }
+            continue 'cycles;
+        }
+
         let capture_read_nanos = monotonic_nanos();
-        // Observe both directions at the same phase, after capture and before
-        // client publication. alsa::Status uses fixed stack storage. Sampling
-        // at roughly 12 Hz keeps ioctl overhead out of most audio cycles;
-        // any elapsed work still consumes the existing absolute deadline.
-        let sample_status = !config.event_driven || latency_guard.sample_due(sequence);
-        let (capture_status, playback_status_at_capture) = if sample_status {
+        // In direct event-driven mode, defer the two SNDRV_PCM_IOCTL_STATUS_EXT
+        // ioctls until after write_playback_samples so they never sit on the
+        // capture-to-write XRUN critical path.
+        let (capture_status, playback_status_at_capture) = if !config.event_driven {
             (
                 pcm_status_with_audio_timestamp(capture_pcm).ok(),
                 pcm_status_with_audio_timestamp(playback_pcm).ok(),
@@ -2063,7 +2083,7 @@ fn linked_pro_cycle_loop(
                 .map(Status::get_delay)
                 .or_else(|| playback_pcm.delay().ok())
         };
-        if sample_status
+        if !config.event_driven
             && let Some(delay) = capture_status
                 .as_ref()
                 .map(Status::get_delay)
@@ -2075,20 +2095,6 @@ fn linked_pro_cycle_loop(
                 config.period as u64,
             );
         }
-        if config.event_driven
-            && let Some(status) = playback_status_at_capture.as_ref()
-        {
-            control.timeline.update_pcm_delay(
-                StreamDirection::Playback,
-                status.get_delay(),
-                config.period as u64,
-            );
-            control.timeline.update_playback_delay_breakdown(
-                status.get_delay(),
-                status.get_avail(),
-                config.buffer,
-            );
-        }
         if let (Some(playback_status), Some(capture_status)) =
             (playback_status_at_capture.as_ref(), capture_status.as_ref())
         {
@@ -2098,33 +2104,6 @@ fn linked_pro_cycle_loop(
                     playback_status,
                     capture_status,
                 ));
-            if config.event_driven
-                && latency_guard.sample(
-                    monotonic_nanos(),
-                    playback_status.get_delay(),
-                    capture_status.get_delay(),
-                )
-            {
-                // This is a real duplex rebase after an observed hardware-cycle
-                // stall AND sustained added buffering, not a client miss/XRUN.
-                // Do it before publishing this capture block to any clients.
-                match rebase_linked_streams(playback_pcm, capture_pcm, control, config, 0) {
-                    Ok(()) => {
-                        normalize_startup_loopback(playback_pcm, capture_pcm, config, control)?
-                    }
-                    // An XRUN while rebasing is still an ordinary recoverable hardware fault.
-                    Err(error) if error.is_recoverable() => recover_linked_streams_during_cycle(
-                        playback_pcm,
-                        capture_pcm,
-                        capture_scratch,
-                        &error,
-                        config,
-                        control,
-                    )?,
-                    Err(error) => return Err(error),
-                }
-                continue 'cycles;
-            }
         }
         capture_position = capture_position.wrapping_add(config.period as u64);
         control.timeline.update_capture_position(capture_position);
@@ -2312,7 +2291,7 @@ fn linked_pro_cycle_loop(
             );
         }
 
-        let write_started = Instant::now();
+        let write_started_nanos = monotonic_nanos();
         let write_result = write_playback_samples(
             playback_pcm,
             &playback_scratch[..write_samples],
@@ -2320,19 +2299,20 @@ fn linked_pro_cycle_loop(
             write_samples,
             Some(control),
         );
+        let write_finished_nanos = monotonic_nanos();
         control
             .timeline
-            .record_playback_write(duration_nanos(write_started.elapsed()));
+            .record_playback_write(write_finished_nanos.saturating_sub(write_started_nanos));
         match write_result {
             Ok(written) if written == write_frames => {
                 playback_position = playback_position.wrapping_add(write_frames as u64);
                 control.timeline.update_playback_position(playback_position);
                 if let Some(readiness) = direct_readiness {
-                    latency_guard.completed(readiness.observed_nanos, monotonic_nanos());
+                    latency_guard.completed(readiness.observed_nanos, write_finished_nanos);
                 }
                 control
                     .timeline
-                    .record_pro_playback_write(sequence, monotonic_nanos());
+                    .record_pro_playback_write(sequence, write_finished_nanos);
             }
             Ok(written) => {
                 control.done.store(true, Ordering::Release);
@@ -2343,6 +2323,7 @@ fn linked_pro_cycle_loop(
                 });
             }
             Err(error) if error.is_recoverable() => {
+                pending_rebase = false;
                 recover_with_commit_released(&mut playback_commit, control, || {
                     recover_linked_streams_during_cycle(
                         playback_pcm,
@@ -2373,6 +2354,56 @@ fn linked_pro_cycle_loop(
         {
             control.done.store(true, Ordering::Release);
             return Err(EngineError::WorkerPanic);
+        }
+        if config.event_driven && latency_guard.sample_due(sequence) {
+            let capture_status = pcm_status_with_audio_timestamp(capture_pcm).ok();
+            let playback_status = pcm_status_with_audio_timestamp(playback_pcm).ok();
+            if let Some(delay) = capture_status
+                .as_ref()
+                .map(Status::get_delay)
+                .or_else(|| capture_pcm.delay().ok())
+            {
+                control.timeline.update_pcm_delay(
+                    StreamDirection::Capture,
+                    delay,
+                    config.period as u64,
+                );
+            }
+            if let Some(status) = playback_status.as_ref() {
+                let (pre_write_delay, pre_write_avail) = pre_write_playback_status(
+                    status.get_delay(),
+                    status.get_avail(),
+                    write_frames,
+                    config.buffer,
+                );
+                control.timeline.update_pcm_delay(
+                    StreamDirection::Playback,
+                    pre_write_delay,
+                    config.period as u64,
+                );
+                control.timeline.update_playback_delay_breakdown(
+                    pre_write_delay,
+                    pre_write_avail,
+                    config.buffer,
+                );
+            }
+            if let (Some(playback_status), Some(capture_status)) =
+                (playback_status.as_ref(), capture_status.as_ref())
+            {
+                control
+                    .timeline
+                    .record_duplex_pointer_phase(duplex_pointer_phase_nanos(
+                        playback_status,
+                        capture_status,
+                    ));
+                if latency_guard.sample(
+                    write_finished_nanos,
+                    playback_status.get_delay(),
+                    capture_status.get_delay(),
+                ) {
+                    pending_rebase = true;
+                }
+            }
         }
         sequence = sequence.wrapping_add(1);
         periods_processed = periods_processed.wrapping_add(1);
@@ -3518,17 +3549,31 @@ fn read_capture_samples(
     sample_count: usize,
     control: Option<WorkerControl<'_>>,
 ) -> Result<alsa::pcm::Frames, EngineError> {
+    read_capture_samples_with_initial(pcm, scratch, channels, sample_count, None, control)
+}
+
+fn read_capture_samples_with_initial(
+    pcm: &PCM,
+    scratch: &mut [i32],
+    channels: usize,
+    sample_count: usize,
+    mut initial_available: Option<alsa::pcm::Frames>,
+    control: Option<WorkerControl<'_>>,
+) -> Result<alsa::pcm::Frames, EngineError> {
     let io = unsafe { pcm.io_unchecked::<i32>() };
     let mut remaining_frames = sample_count / channels;
     let required = remaining_frames as i64;
     let mut offset_samples = 0;
 
     while remaining_frames > 0 {
-        let available = alsa_call(
-            pcm.avail_update(),
-            "update capture availability",
-            StreamDirection::Capture,
-        )?;
+        let available = match initial_available.take() {
+            Some(available) => available,
+            None => alsa_call(
+                pcm.avail_update(),
+                "update capture availability",
+                StreamDirection::Capture,
+            )?,
+        };
         if available <= 0 {
             wait_for_transfer(pcm, StreamDirection::Capture, control)?;
             continue;
@@ -3624,7 +3669,7 @@ fn wait_for_linked_duplex_period(
     period: alsa::pcm::Frames,
     buffer: alsa::pcm::Frames,
     control: WorkerControl<'_>,
-) -> Result<DirectDuplexReadiness, EngineError> {
+) -> Result<(DirectDuplexReadiness, alsa::pcm::Frames), EngineError> {
     const MAX_POLL_DESCRIPTORS: usize = 32;
     const POLL_TIMEOUT_MS: i32 = 100;
 
@@ -3643,48 +3688,58 @@ fn wait_for_linked_duplex_period(
     }; MAX_POLL_DESCRIPTORS];
     let mut playback_ready = false;
     let mut capture_ready = false;
+    // Check mmap availability before polling so an already-writable playback ring
+    // does not force an immediate dummy poll() wakeup before sleeping on capture.
+    let mut polled = false;
     loop {
         control.ensure_running()?;
-        let mut used = 0;
-        if !playback_ready {
-            alsa_call(
-                playback_pcm.fill(&mut descriptors[used..used + playback_count]),
-                "fill playback poll descriptors",
-                StreamDirection::Playback,
-            )?;
-            used += playback_count;
-        }
-        if !capture_ready {
-            alsa_call(
-                capture_pcm.fill(&mut descriptors[used..used + capture_count]),
-                "fill capture poll descriptors",
-                StreamDirection::Capture,
-            )?;
-            used += capture_count;
-        }
-        for descriptor in &mut descriptors[..used] {
-            descriptor.events |= libc::POLLERR;
-            descriptor.revents = 0;
-        }
-        match poll::poll(&mut descriptors[..used], POLL_TIMEOUT_MS) {
-            Err(error) if error.errno() == libc::EINTR => continue,
-            result => {
+        if polled {
+            let mut used = 0;
+            if !playback_ready {
                 alsa_call(
-                    result,
-                    "poll linked duplex streams",
+                    playback_pcm.fill(&mut descriptors[used..used + playback_count]),
+                    "fill playback poll descriptors",
+                    StreamDirection::Playback,
+                )?;
+                used += playback_count;
+            }
+            if !capture_ready {
+                alsa_call(
+                    capture_pcm.fill(&mut descriptors[used..used + capture_count]),
+                    "fill capture poll descriptors",
                     StreamDirection::Capture,
                 )?;
+                used += capture_count;
+            }
+            for descriptor in &mut descriptors[..used] {
+                descriptor.events |= libc::POLLERR;
+                descriptor.revents = 0;
+            }
+            match poll::poll(&mut descriptors[..used], POLL_TIMEOUT_MS) {
+                Err(error) if error.errno() == libc::EINTR => continue,
+                result => {
+                    alsa_call(
+                        result,
+                        "poll linked duplex streams",
+                        StreamDirection::Capture,
+                    )?;
+                }
             }
         }
+        polled = true;
 
         let capture_result = capture_pcm.avail_update();
         // Query latency and preemption must consume, not extend, the queue budget.
         let observed_nanos = monotonic_nanos();
         let playback_result = playback_pcm.avail_update();
-        let playback_xrun = playback_pcm.state() == State::XRun
-            || matches!(&playback_result, Err(error) if error.errno() == libc::EPIPE);
-        let capture_xrun = capture_pcm.state() == State::XRun
-            || matches!(&capture_result, Err(error) if error.errno() == libc::EPIPE);
+        // avail_update() already syncs hw_ptr and returns -EPIPE on XRUN; only
+        // query snd_pcm_state() when an error or full-buffer boundary is seen.
+        let check_states = !matches!(playback_result, Ok(avail) if avail < buffer)
+            || !matches!(capture_result, Ok(avail) if avail < buffer);
+        let playback_xrun = matches!(&playback_result, Err(error) if error.errno() == libc::EPIPE)
+            || (check_states && playback_pcm.state() == State::XRun);
+        let capture_xrun = matches!(&capture_result, Err(error) if error.errno() == libc::EPIPE)
+            || (check_states && capture_pcm.state() == State::XRun);
         let (playback_available, capture_available) = if playback_xrun || capture_xrun {
             let source = playback_result
                 .err()
@@ -3713,10 +3768,13 @@ fn wait_for_linked_duplex_period(
         playback_ready = playback_available >= period;
         capture_ready = capture_available >= period;
         if playback_ready && capture_ready {
-            return Ok(DirectDuplexReadiness {
-                playback_queued_frames: buffer.saturating_sub(playback_available).max(0),
-                observed_nanos,
-            });
+            return Ok((
+                DirectDuplexReadiness {
+                    playback_queued_frames: buffer.saturating_sub(playback_available).max(0),
+                    observed_nanos,
+                },
+                capture_available,
+            ));
         }
     }
 }
@@ -3806,6 +3864,18 @@ fn pcm_status_with_audio_timestamp(pcm: &PCM) -> alsa::Result<Status> {
     StatusBuilder::new()
         .audio_htstamp_config(AudioTstampType::Default, false)
         .build(pcm)
+}
+
+fn pre_write_playback_status(
+    post_write_delay: i64,
+    post_write_avail: i64,
+    write_frames: i64,
+    buffer: i64,
+) -> (i64, i64) {
+    (
+        post_write_delay.saturating_sub(write_frames).max(0),
+        post_write_avail.saturating_add(write_frames).min(buffer),
+    )
 }
 
 fn duplex_pointer_phase_nanos(playback: &Status, capture: &Status) -> i64 {
@@ -5070,6 +5140,15 @@ mod tests {
             bounded_pro_handoff_target(1_000_000, 1_050_000, 500_000, 32, 64, 48_000),
             1_000_000
         );
+    }
+
+    #[test]
+    fn pre_write_playback_status_subtracts_written_period_and_clamps() {
+        assert_eq!(
+            super::pre_write_playback_status(128, 188, 64, 256),
+            (64, 252)
+        );
+        assert_eq!(super::pre_write_playback_status(40, 220, 64, 256), (0, 256));
     }
 
     #[test]
