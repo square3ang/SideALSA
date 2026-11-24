@@ -16,6 +16,7 @@ struct sidealsa_stream {
 	uint64_t expected, current, boundary, buffer, position;
 	ssize_t transfer_result;
 	int sync_result, sync_calls;
+	int nonblock_calls, nonblock_value, pump_calls;
 	uint64_t rewound, forwarded, reset_queued;
 	int reset_calls;
 };
@@ -38,9 +39,14 @@ ssize_t sidealsa_stream_transfer(sidealsa_stream_t *s,
 }
 uint64_t sidealsa_stream_position(const sidealsa_stream_t *s) { return s->position; }
 int sidealsa_stream_prepare(sidealsa_stream_t *s) { s->sync_result = 0; return 0; }
-int sidealsa_stream_set_nonblock(sidealsa_stream_t *s, int n) { (void)s; (void)n; return 0; }
+int sidealsa_stream_set_nonblock(sidealsa_stream_t *s, int n)
+{
+	s->nonblock_calls++;
+	s->nonblock_value = n;
+	return 0;
+}
 int sidealsa_stream_set_buffer_size(sidealsa_stream_t *s, size_t n) { (void)s; (void)n; return 0; }
-int sidealsa_stream_pump_pro_playback(sidealsa_stream_t *s) { (void)s; return 0; }
+int sidealsa_stream_pump_pro_playback(sidealsa_stream_t *s) { s->pump_calls++; return 0; }
 int sidealsa_stream_start(sidealsa_stream_t *s) { (void)s; return 0; }
 int sidealsa_stream_stop(sidealsa_stream_t *s) { (void)s; return 0; }
 int sidealsa_stream_drain(sidealsa_stream_t *s) { (void)s; return 0; }
@@ -154,6 +160,22 @@ int main(void)
 	assert(sidealsa_pointer(io) == 0);
 	assert(stream.reset_calls == 1 && stream.reset_queued == 60);
 	assert(pcm.playback_expected_appl_ptr == 0 && pcm.playback_reported_hw_ptr == 0);
+
+	/* Cached nonblock and pro_playback skip redundant FFI calls on hot paths. */
+	assert(stream.nonblock_calls == 0);
+	assert(stream.pump_calls == 0);
+	io->nonblock = 1;
+	assert(sidealsa_transfer(io, NULL, 0, 64) == 16);
+	assert(stream.nonblock_calls == 1 && stream.nonblock_value == 1);
+	assert(sidealsa_transfer(io, NULL, 0, 64) == 16);
+	assert(stream.nonblock_calls == 1);
+	pcm.pro_playback = 1;
+	io->state = SND_PCM_STATE_PREPARED;
+	assert(sidealsa_pointer(io) == 0);
+	assert(stream.pump_calls == 0);
+	io->state = SND_PCM_STATE_RUNNING;
+	assert(sidealsa_pointer(io) == 0);
+	assert(stream.pump_calls == 1);
 
 	static const struct { const char *text; int result; long periods; } limits[] = {
 		{ "max_periods 2", 0, 2 },

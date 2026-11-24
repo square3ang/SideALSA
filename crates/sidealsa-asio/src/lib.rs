@@ -201,22 +201,29 @@ impl PositionSnapshot {
     }
 
     fn publish(&self, samples: u64, stamp: u64) {
-        self.sequence.fetch_add(1, Ordering::SeqCst);
-        self.samples.store(samples, Ordering::SeqCst);
-        self.stamp.store(stamp, Ordering::SeqCst);
-        self.sequence.fetch_add(1, Ordering::SeqCst);
+        let sequence = self.sequence.load(Ordering::Relaxed);
+        self.sequence
+            .store(sequence.wrapping_add(1), Ordering::Relaxed);
+        // Synchronizes with the reader's Acquire fence after reading payload fields so
+        // an update to samples/stamp cannot be observed alongside an older even sequence.
+        std::sync::atomic::fence(Ordering::Release);
+        self.samples.store(samples, Ordering::Relaxed);
+        self.stamp.store(stamp, Ordering::Relaxed);
+        self.sequence
+            .store(sequence.wrapping_add(2), Ordering::Release);
     }
 
     fn load(&self) -> (u64, u64) {
         loop {
-            let before = self.sequence.load(Ordering::SeqCst);
+            let before = self.sequence.load(Ordering::Acquire);
             if before & 1 != 0 {
                 std::hint::spin_loop();
                 continue;
             }
-            let samples = self.samples.load(Ordering::SeqCst);
-            let stamp = self.stamp.load(Ordering::SeqCst);
-            let after = self.sequence.load(Ordering::SeqCst);
+            let samples = self.samples.load(Ordering::Relaxed);
+            let stamp = self.stamp.load(Ordering::Relaxed);
+            std::sync::atomic::fence(Ordering::Acquire);
+            let after = self.sequence.load(Ordering::Relaxed);
             if before == after {
                 return (samples, stamp);
             }
@@ -1551,7 +1558,7 @@ fn worker_loop(
         };
     }
     while !stop.is_requested() {
-        let _ = apply_gate_transition(
+        let pre_running = apply_gate_transition(
             gate,
             &mut run_generation,
             &mut buffer_index,
@@ -1559,13 +1566,13 @@ fn worker_loop(
             &mut last_active_sequence,
             &mut stopping_after,
         );
-        if !has_playback && !gate.command().1 {
+        if !has_playback && !pre_running {
             // Capture has no pending output to drain before acknowledging Stop.
             gate.acknowledge(run_generation, false);
         }
         let acquisition_generation = run_generation;
-        let spin_window = capture_spin.window(run_generation, gate.command().1);
-        let block_sequence = match recover_discontinuity!(wait_worker_event(
+        let spin_window = capture_spin.window(run_generation, pre_running);
+        let (block_sequence, control_checked) = match recover_discontinuity!(wait_worker_event(
             stream,
             capture,
             audio_fd,
@@ -1574,15 +1581,16 @@ fn worker_loop(
             gate,
             spin_window
         )) {
-            WorkerEvent::Cycle(sequence) => sequence,
+            WorkerEvent::Cycle {
+                sequence,
+                control_checked,
+            } => (sequence, control_checked),
             WorkerEvent::Gate => continue,
             WorkerEvent::Stop => break,
         };
         if capture_spin.half_window_nanos != 0 {
             capture_spin.observe(block_sequence, monotonic_nanos(), acquisition_generation);
         }
-        // Check once after acquisition, before dispatching the host callback.
-        check_daemon_control(control_fd)?;
         let running = apply_gate_transition(
             gate,
             &mut run_generation,
@@ -1603,12 +1611,18 @@ fn worker_loop(
             {
                 gate.acknowledge(run_generation, false);
             }
+            if !control_checked {
+                check_daemon_control(control_fd)?;
+            }
             continue;
         }
         if !acquired_block_is_current(acquisition_generation, run_generation) {
             if has_playback {
                 playback.fill(0);
                 let _ = recover_discontinuity!(stream.submit_playback(block_sequence, playback));
+            }
+            if !control_checked {
+                check_daemon_control(control_fd)?;
             }
             continue;
         }
@@ -1629,6 +1643,9 @@ fn worker_loop(
                     let _ =
                         recover_discontinuity!(stream.submit_playback(block_sequence, playback));
                 }
+                if !control_checked {
+                    check_daemon_control(control_fd)?;
+                }
                 continue;
             }
             CycleAdvance::Backward => {
@@ -1648,15 +1665,25 @@ fn worker_loop(
         buffer_index = next_buffer_index;
         previous_sequence = Some(block_sequence);
         if !capture.is_empty() {
-            copy_capture_to_host(capture, buffers, active, buffer_index, period_frames);
+            // Kernel selection proved its target features and buffer geometry before worker startup.
+            unsafe {
+                (sample_kernels.copy_capture_to_host)(
+                    capture,
+                    buffers,
+                    active,
+                    buffer_index,
+                    period_frames,
+                )
+            };
         }
         let stamp = monotonic_nanos();
         position.publish(samples, stamp);
         let callback_start = stamp;
         invoke_callback(callbacks, time_info, buffer_index, samples, stamp, rate)?;
         let callback_duration = monotonic_nanos().saturating_sub(callback_start);
-        stream.record_callback_timing(callback_duration, period_nanos);
-        // Kernel selection proved its target features and buffer geometry before worker startup.
+        // Submit playback before recording callback timing or polling control_fd so
+        // neither shared-memory stats nor a fallback poll steals from the playback deadline.
+        let mut submitted = true;
         if has_playback {
             unsafe {
                 (sample_kernels.copy_host_to_playback)(
@@ -1667,9 +1694,14 @@ fn worker_loop(
                     period_frames,
                 )
             };
-            if !recover_discontinuity!(stream.submit_playback(block_sequence, playback)) {
-                continue;
-            }
+            submitted = recover_discontinuity!(stream.submit_playback(block_sequence, playback));
+        }
+        stream.record_callback_timing(callback_duration, period_nanos);
+        if !control_checked {
+            check_daemon_control(control_fd)?;
+        }
+        if !submitted {
+            continue;
         }
         last_active_sequence = Some(block_sequence);
     }
@@ -1793,7 +1825,10 @@ fn advance_asio_cycle(
 }
 
 enum WorkerEvent {
-    Cycle(u64),
+    Cycle {
+        sequence: u64,
+        control_checked: bool,
+    },
     Gate,
     Stop,
 }
@@ -1898,24 +1933,35 @@ fn wait_worker_event(
             revents: 0,
         },
     ];
+    let is_playback_only = stream.pro_direction() == Some(PortDirection::Playback);
+    let mut polled_control = false;
+    let mut skip_acquire_before_spin = false;
     loop {
         if stop.is_requested() {
             return Ok(WorkerEvent::Stop);
         }
-        let acquired = if stream.pro_direction() == Some(PortDirection::Playback) {
-            match stream.wait_period(Duration::ZERO) {
-                Ok(sequence) => Ok(Some(sequence)),
-                Err(ClientError::Timeout) => Ok(None),
-                Err(error) => Err(error),
+        if !skip_acquire_before_spin {
+            let acquired = if is_playback_only {
+                match stream.wait_period(Duration::ZERO) {
+                    Ok(sequence) => Ok(Some(sequence)),
+                    Err(ClientError::Timeout) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            } else {
+                stream.try_capture_buffer(capture)
+            };
+            match acquired {
+                Ok(Some(sequence)) => {
+                    return Ok(WorkerEvent::Cycle {
+                        sequence,
+                        control_checked: polled_control,
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => return Err(error.into()),
             }
-        } else {
-            stream.try_capture_buffer(capture)
-        };
-        match acquired {
-            Ok(Some(sequence)) => return Ok(WorkerEvent::Cycle(sequence)),
-            Ok(None) => {}
-            Err(error) => return Err(error.into()),
         }
+        skip_acquire_before_spin = false;
         let mut early_timeout = None;
         if let Some((start, end, generation)) = spin_window {
             let now = monotonic_nanos();
@@ -1927,7 +1973,7 @@ fn wait_worker_event(
                 });
             } else if now < end {
                 if let Some(event) = spin_until_capture(end, generation, stop, gate, || {
-                    if stream.pro_direction() == Some(PortDirection::Playback) {
+                    if is_playback_only {
                         stream.has_ready_pro_playback()
                     } else {
                         stream.has_ready_capture()
@@ -1973,11 +2019,22 @@ fn wait_worker_event(
         if daemon_control_failed(control_fd, fds[3].revents)? {
             return Err(AsioError::DaemonDisconnected);
         }
+        polled_control = true;
         if fds[0].revents & libc::POLLIN != 0 {
             continue;
         }
         if fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
             return Err(AsioError::WorkerStopped("audio notification failed"));
+        }
+        // ppoll timed out with audio_fd unread: skip a redundant eventfd drain
+        // before entering the spin window unless data is already ready in SHM.
+        if result == 0 && early_timeout.is_some() {
+            let ready = if is_playback_only {
+                stream.has_ready_pro_playback()
+            } else {
+                stream.has_ready_capture()
+            };
+            skip_acquire_before_spin = !ready;
         }
     }
 }
@@ -2050,7 +2107,9 @@ fn daemon_control_failed(fd: RawFd, revents: libc::c_short) -> Result<bool, Asio
     }
 }
 
-fn copy_capture_to_host(
+const S32_TO_F32_SCALE: f32 = 1.0 / 2_147_483_648.0;
+
+fn copy_capture_to_host_scalar(
     capture: &[i32],
     buffers: &HostBuffers,
     active: &ActiveChannels,
@@ -2058,40 +2117,77 @@ fn copy_capture_to_host(
     period_frames: usize,
 ) {
     let channels = active.input.len();
+    let required = period_frames
+        .checked_mul(channels)
+        .expect("capture buffer size overflow");
+    assert!(capture.len() >= required);
     for (channel, is_active) in active.input.iter().copied().enumerate() {
         if !is_active {
             continue;
         }
-        let destination = buffers.input[channel].half_mut(index);
-        for frame in 0..period_frames {
-            destination[frame] = s32_to_f32(capture[frame * channels + channel]);
+        let destination = &mut buffers.input[channel].half_mut(index)[..period_frames];
+        let mut offset = channel;
+        for out in destination {
+            *out = s32_to_f32(capture[offset]);
+            offset += channels;
         }
     }
 }
 
+type CopyCaptureToHost = unsafe fn(&[i32], &HostBuffers, &ActiveChannels, usize, usize);
 type CopyHostToPlayback = unsafe fn(&HostBuffers, &ActiveChannels, usize, &mut [i32], usize);
 
 #[derive(Clone, Copy)]
 struct SampleKernels {
+    copy_capture_to_host: CopyCaptureToHost,
     copy_host_to_playback: CopyHostToPlayback,
 }
 
 impl SampleKernels {
     const fn scalar() -> Self {
         Self {
+            copy_capture_to_host: copy_capture_to_host_scalar,
             copy_host_to_playback: copy_host_to_playback_scalar,
         }
     }
 
     fn detect(active: &ActiveChannels) -> Self {
         #[cfg(target_arch = "x86_64")]
-        if active.output.len() == 8
-            && active.output.iter().all(|active| *active)
-            && std::arch::is_x86_feature_detected!("avx2")
-        {
-            unsafe { prewarm_avx2() };
+        if std::arch::is_x86_feature_detected!("avx2") {
+            let active_inputs = active.input.iter().filter(|active| **active).count();
+            let copy_capture_to_host: CopyCaptureToHost = if active_inputs == 0 {
+                copy_capture_to_host_scalar
+            } else if active.input.len() == 10 && active_inputs >= 4 {
+                copy_capture_to_host_10ch_avx2
+            } else if active.input.len() == 8 && active_inputs >= 4 {
+                copy_capture_to_host_8ch_avx2
+            } else if active.input.len() == 4 && active_inputs >= 2 {
+                copy_capture_to_host_4ch_avx2
+            } else if active.input.len() == 2 {
+                copy_capture_to_host_2ch_avx2
+            } else {
+                copy_capture_to_host_sparse_avx2
+            };
+            let all_outputs = active.output.iter().all(|active| *active);
+            let copy_host_to_playback: CopyHostToPlayback = match active.output.len() {
+                8 if all_outputs => copy_host_to_playback_avx2,
+                4 if all_outputs => copy_host_to_playback_4ch_avx2,
+                2 if all_outputs => copy_host_to_playback_2ch_avx2,
+                _ => copy_host_to_playback_scalar,
+            };
+            let uses_avx2 = !std::ptr::fn_addr_eq(
+                copy_capture_to_host,
+                copy_capture_to_host_scalar as CopyCaptureToHost,
+            ) || !std::ptr::fn_addr_eq(
+                copy_host_to_playback,
+                copy_host_to_playback_scalar as CopyHostToPlayback,
+            );
+            if uses_avx2 {
+                unsafe { prewarm_avx2() };
+            }
             return Self {
-                copy_host_to_playback: copy_host_to_playback_avx2,
+                copy_capture_to_host,
+                copy_host_to_playback,
             };
         }
         Self::scalar()
@@ -2105,17 +2201,353 @@ fn copy_host_to_playback_scalar(
     playback: &mut [i32],
     period_frames: usize,
 ) {
-    playback.fill(0);
     let channels = active.output.len();
+    let required = period_frames
+        .checked_mul(channels)
+        .expect("playback buffer size overflow");
+    assert!(playback.len() >= required);
+    if !active.output.iter().all(|is_active| *is_active) || playback.len() > required {
+        playback.fill(0);
+    }
     for (channel, is_active) in active.output.iter().copied().enumerate() {
         if !is_active {
             continue;
         }
-        let source = buffers.output[channel].half(index);
-        for frame in 0..period_frames {
-            playback[frame * channels + channel] = f32_to_s32(source[frame]);
+        let source = &buffers.output[channel].half(index)[..period_frames];
+        let mut offset = channel;
+        for &sample in source {
+            playback[offset] = f32_to_s32(sample);
+            offset += channels;
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn copy_capture_to_host_10ch_avx2(
+    capture: &[i32],
+    buffers: &HostBuffers,
+    active: &ActiveChannels,
+    index: usize,
+    period_frames: usize,
+) {
+    unsafe {
+        copy_capture_to_host_10ch_avx2_inner(capture, buffers, active, index, period_frames);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn copy_capture_to_host_10ch_avx2_inner(
+    capture: &[i32],
+    buffers: &HostBuffers,
+    active: &ActiveChannels,
+    index: usize,
+    period_frames: usize,
+) {
+    use std::arch::x86_64::*;
+
+    assert_eq!(active.input.len(), 10);
+    assert!(
+        capture.len()
+            >= period_frames
+                .checked_mul(10)
+                .expect("capture size overflow")
+    );
+    let mut dests: [Option<&mut [f32]>; 10] = std::array::from_fn(|channel| {
+        active.input[channel].then(|| {
+            let dst = buffers.input[channel].half_mut(index);
+            assert!(dst.len() >= period_frames);
+            dst
+        })
+    });
+    let low_active = dests[..8].iter().any(Option::is_some);
+    let high_active = dests[8].is_some() || dests[9].is_some();
+    let vector_frames = period_frames / 8 * 8;
+    let capture_ptr = capture.as_ptr();
+    for frame in (0..vector_frames).step_by(8) {
+        let base = unsafe { capture_ptr.add(frame * 10) };
+        if low_active {
+            let rows = std::array::from_fn(|lane| unsafe {
+                _mm256_loadu_si256(base.add(lane * 10).cast())
+            });
+            let channels = unsafe { transpose_8x8_i32(rows) };
+            for (channel, values) in channels.into_iter().enumerate() {
+                if let Some(dst) = dests[channel].as_deref_mut() {
+                    unsafe {
+                        _mm256_storeu_ps(dst.as_mut_ptr().add(frame), convert_s32x8_to_f32(values));
+                    }
+                }
+            }
+        }
+        if high_active {
+            let pairs: [i64; 8] = std::array::from_fn(|lane| unsafe {
+                ptr::read_unaligned(base.add(lane * 10 + 8).cast::<i64>())
+            });
+            let v0 = _mm256_setr_epi64x(pairs[0], pairs[1], pairs[2], pairs[3]);
+            let v1 = _mm256_setr_epi64x(pairs[4], pairs[5], pairs[6], pairs[7]);
+            let [ch8, ch9] = unsafe { deinterleave_2x8_i32(v0, v1) };
+            if let Some(dst) = dests[8].as_deref_mut() {
+                unsafe {
+                    _mm256_storeu_ps(dst.as_mut_ptr().add(frame), convert_s32x8_to_f32(ch8));
+                }
+            }
+            if let Some(dst) = dests[9].as_deref_mut() {
+                unsafe {
+                    _mm256_storeu_ps(dst.as_mut_ptr().add(frame), convert_s32x8_to_f32(ch9));
+                }
+            }
+        }
+    }
+    for frame in vector_frames..period_frames {
+        for (channel, dst) in dests.iter_mut().enumerate() {
+            if let Some(dst) = dst.as_deref_mut() {
+                dst[frame] = s32_to_f32(capture[frame * 10 + channel]);
+            }
+        }
+    }
+    _mm256_zeroupper();
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn copy_capture_to_host_8ch_avx2(
+    capture: &[i32],
+    buffers: &HostBuffers,
+    active: &ActiveChannels,
+    index: usize,
+    period_frames: usize,
+) {
+    unsafe {
+        copy_capture_to_host_8ch_avx2_inner(capture, buffers, active, index, period_frames);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn copy_capture_to_host_8ch_avx2_inner(
+    capture: &[i32],
+    buffers: &HostBuffers,
+    active: &ActiveChannels,
+    index: usize,
+    period_frames: usize,
+) {
+    use std::arch::x86_64::*;
+
+    assert_eq!(active.input.len(), 8);
+    assert!(capture.len() >= period_frames.checked_mul(8).expect("capture size overflow"));
+    let mut dests: [Option<&mut [f32]>; 8] = std::array::from_fn(|channel| {
+        active.input[channel].then(|| {
+            let dst = buffers.input[channel].half_mut(index);
+            assert!(dst.len() >= period_frames);
+            dst
+        })
+    });
+    let vector_frames = period_frames / 8 * 8;
+    let capture_ptr = capture.as_ptr();
+    for frame in (0..vector_frames).step_by(8) {
+        let base = unsafe { capture_ptr.add(frame * 8) };
+        let rows =
+            std::array::from_fn(|lane| unsafe { _mm256_loadu_si256(base.add(lane * 8).cast()) });
+        let channels = unsafe { transpose_8x8_i32(rows) };
+        for (channel, values) in channels.into_iter().enumerate() {
+            if let Some(dst) = dests[channel].as_deref_mut() {
+                unsafe {
+                    _mm256_storeu_ps(dst.as_mut_ptr().add(frame), convert_s32x8_to_f32(values));
+                }
+            }
+        }
+    }
+    for frame in vector_frames..period_frames {
+        for (channel, dst) in dests.iter_mut().enumerate() {
+            if let Some(dst) = dst.as_deref_mut() {
+                dst[frame] = s32_to_f32(capture[frame * 8 + channel]);
+            }
+        }
+    }
+    _mm256_zeroupper();
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn copy_capture_to_host_4ch_avx2(
+    capture: &[i32],
+    buffers: &HostBuffers,
+    active: &ActiveChannels,
+    index: usize,
+    period_frames: usize,
+) {
+    unsafe {
+        copy_capture_to_host_4ch_avx2_inner(capture, buffers, active, index, period_frames);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn copy_capture_to_host_4ch_avx2_inner(
+    capture: &[i32],
+    buffers: &HostBuffers,
+    active: &ActiveChannels,
+    index: usize,
+    period_frames: usize,
+) {
+    use std::arch::x86_64::*;
+
+    assert_eq!(active.input.len(), 4);
+    assert!(capture.len() >= period_frames.checked_mul(4).expect("capture size overflow"));
+    let mut dests: [Option<&mut [f32]>; 4] = std::array::from_fn(|channel| {
+        active.input[channel].then(|| {
+            let dst = buffers.input[channel].half_mut(index);
+            assert!(dst.len() >= period_frames);
+            dst
+        })
+    });
+    let vector_frames = period_frames / 8 * 8;
+    let capture_ptr = capture.as_ptr();
+    for frame in (0..vector_frames).step_by(8) {
+        let base = unsafe { capture_ptr.add(frame * 4) };
+        let v0 = unsafe { _mm256_loadu_si256(base.cast()) };
+        let v1 = unsafe { _mm256_loadu_si256(base.add(8).cast()) };
+        let v2 = unsafe { _mm256_loadu_si256(base.add(16).cast()) };
+        let v3 = unsafe { _mm256_loadu_si256(base.add(24).cast()) };
+        let channels = unsafe { deinterleave_4x8_i32([v0, v1, v2, v3]) };
+        for (channel, values) in channels.into_iter().enumerate() {
+            if let Some(dst) = dests[channel].as_deref_mut() {
+                unsafe {
+                    _mm256_storeu_ps(dst.as_mut_ptr().add(frame), convert_s32x8_to_f32(values));
+                }
+            }
+        }
+    }
+    for frame in vector_frames..period_frames {
+        for (channel, dst) in dests.iter_mut().enumerate() {
+            if let Some(dst) = dst.as_deref_mut() {
+                dst[frame] = s32_to_f32(capture[frame * 4 + channel]);
+            }
+        }
+    }
+    _mm256_zeroupper();
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn copy_capture_to_host_2ch_avx2(
+    capture: &[i32],
+    buffers: &HostBuffers,
+    active: &ActiveChannels,
+    index: usize,
+    period_frames: usize,
+) {
+    unsafe {
+        copy_capture_to_host_2ch_avx2_inner(capture, buffers, active, index, period_frames);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn copy_capture_to_host_2ch_avx2_inner(
+    capture: &[i32],
+    buffers: &HostBuffers,
+    active: &ActiveChannels,
+    index: usize,
+    period_frames: usize,
+) {
+    use std::arch::x86_64::*;
+
+    assert_eq!(active.input.len(), 2);
+    assert!(capture.len() >= period_frames.checked_mul(2).expect("capture size overflow"));
+    let mut dests: [Option<&mut [f32]>; 2] = std::array::from_fn(|channel| {
+        active.input[channel].then(|| {
+            let dst = buffers.input[channel].half_mut(index);
+            assert!(dst.len() >= period_frames);
+            dst
+        })
+    });
+    let vector_frames = period_frames / 8 * 8;
+    let capture_ptr = capture.as_ptr();
+    for frame in (0..vector_frames).step_by(8) {
+        let base = unsafe { capture_ptr.add(frame * 2) };
+        let v0 = unsafe { _mm256_loadu_si256(base.cast()) };
+        let v1 = unsafe { _mm256_loadu_si256(base.add(8).cast()) };
+        let [ch0, ch1] = unsafe { deinterleave_2x8_i32(v0, v1) };
+        if let Some(dst) = dests[0].as_deref_mut() {
+            unsafe {
+                _mm256_storeu_ps(dst.as_mut_ptr().add(frame), convert_s32x8_to_f32(ch0));
+            }
+        }
+        if let Some(dst) = dests[1].as_deref_mut() {
+            unsafe {
+                _mm256_storeu_ps(dst.as_mut_ptr().add(frame), convert_s32x8_to_f32(ch1));
+            }
+        }
+    }
+    for frame in vector_frames..period_frames {
+        for (channel, dst) in dests.iter_mut().enumerate() {
+            if let Some(dst) = dst.as_deref_mut() {
+                dst[frame] = s32_to_f32(capture[frame * 2 + channel]);
+            }
+        }
+    }
+    _mm256_zeroupper();
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn copy_capture_to_host_sparse_avx2(
+    capture: &[i32],
+    buffers: &HostBuffers,
+    active: &ActiveChannels,
+    index: usize,
+    period_frames: usize,
+) {
+    unsafe {
+        copy_capture_to_host_sparse_avx2_inner(capture, buffers, active, index, period_frames);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn copy_capture_to_host_sparse_avx2_inner(
+    capture: &[i32],
+    buffers: &HostBuffers,
+    active: &ActiveChannels,
+    index: usize,
+    period_frames: usize,
+) {
+    use std::arch::x86_64::*;
+
+    let channels = active.input.len();
+    assert!(
+        capture.len()
+            >= period_frames
+                .checked_mul(channels)
+                .expect("capture size overflow")
+    );
+    let vector_frames = period_frames / 8 * 8;
+    let capture_ptr = capture.as_ptr();
+    for (channel, is_active) in active.input.iter().copied().enumerate() {
+        if !is_active {
+            continue;
+        }
+        let dst = buffers.input[channel].half_mut(index);
+        assert!(dst.len() >= period_frames);
+        let dst_ptr = dst.as_mut_ptr();
+        for frame in (0..vector_frames).step_by(8) {
+            unsafe {
+                let p = capture_ptr.add(frame * channels + channel);
+                let values = _mm256_setr_epi32(
+                    *p,
+                    *p.add(channels),
+                    *p.add(channels * 2),
+                    *p.add(channels * 3),
+                    *p.add(channels * 4),
+                    *p.add(channels * 5),
+                    *p.add(channels * 6),
+                    *p.add(channels * 7),
+                );
+                _mm256_storeu_ps(dst_ptr.add(frame), convert_s32x8_to_f32(values));
+            }
+        }
+        for frame in vector_frames..period_frames {
+            dst[frame] = s32_to_f32(capture[frame * channels + channel]);
+        }
+    }
+    _mm256_zeroupper();
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2142,81 +2574,289 @@ unsafe fn copy_host_to_playback_avx2_inner(
 ) {
     use std::arch::x86_64::*;
 
-    debug_assert_eq!(active.output.len(), 8);
+    assert_eq!(active.output.len(), 8);
     debug_assert!(active.output.iter().all(|active| *active));
-    debug_assert!(playback.len() >= period_frames * 8);
+    assert!(
+        playback.len()
+            >= period_frames
+                .checked_mul(8)
+                .expect("playback size overflow")
+    );
+    let sources: [&[f32]; 8] = std::array::from_fn(|channel| {
+        let src = buffers.output[channel].half(index);
+        assert!(src.len() >= period_frames);
+        src
+    });
     let vector_frames = period_frames / 8 * 8;
+    let playback_ptr = playback.as_mut_ptr();
     for frame in (0..vector_frames).step_by(8) {
         let rows = std::array::from_fn(|channel| unsafe {
-            convert_f32x8_to_s32(buffers.output[channel].half(index).as_ptr().add(frame))
+            convert_f32x8_to_s32(sources[channel].as_ptr().add(frame))
         });
         let frames = unsafe { transpose_8x8_i32(rows) };
         for (lane, values) in frames.into_iter().enumerate() {
             unsafe {
-                _mm256_storeu_si256(playback.as_mut_ptr().add((frame + lane) * 8).cast(), values);
+                _mm256_storeu_si256(playback_ptr.add((frame + lane) * 8).cast(), values);
             }
         }
     }
     for frame in vector_frames..period_frames {
         for channel in 0..8 {
-            playback[frame * 8 + channel] = f32_to_s32(buffers.output[channel].half(index)[frame]);
+            playback[frame * 8 + channel] = f32_to_s32(sources[channel][frame]);
         }
     }
     _mm256_zeroupper();
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn convert_f32x8_to_s32(source: *const f32) -> std::arch::x86_64::__m256i {
-    use std::arch::x86_64::*;
-
+unsafe fn copy_host_to_playback_4ch_avx2(
+    buffers: &HostBuffers,
+    active: &ActiveChannels,
+    index: usize,
+    playback: &mut [i32],
+    period_frames: usize,
+) {
     unsafe {
-        let samples = _mm256_loadu_ps(source);
-        let zero = _mm256_setzero_ps();
-        let one = _mm256_set1_ps(1.0);
-        let negative_one = _mm256_set1_ps(-1.0);
-        let ordered = _mm256_cmp_ps(samples, samples, _CMP_ORD_Q);
-        let above_min = _mm256_cmp_ps(samples, negative_one, _CMP_GT_OQ);
-        let below_max = _mm256_cmp_ps(samples, one, _CMP_LT_OQ);
-        let interior = _mm256_and_ps(ordered, _mm256_and_ps(above_min, below_max));
-        let safe_samples = _mm256_blendv_ps(zero, samples, interior);
-
-        let low = _mm256_cvtps_pd(_mm256_castps256_ps128(safe_samples));
-        let high = _mm256_cvtps_pd(_mm256_extractf128_ps(safe_samples, 1));
-        let scale = _mm256_set1_pd(2_147_483_648.0);
-        let half = _mm256_set1_pd(0.5);
-        let negative_half = _mm256_set1_pd(-0.5);
-        let zero_pd = _mm256_setzero_pd();
-
-        let low_scaled = _mm256_mul_pd(low, scale);
-        let high_scaled = _mm256_mul_pd(high, scale);
-        let low_adjustment = _mm256_blendv_pd(
-            half,
-            negative_half,
-            _mm256_cmp_pd(low_scaled, zero_pd, _CMP_LT_OQ),
-        );
-        let high_adjustment = _mm256_blendv_pd(
-            half,
-            negative_half,
-            _mm256_cmp_pd(high_scaled, zero_pd, _CMP_LT_OQ),
-        );
-        let low_i32 = _mm256_cvttpd_epi32(_mm256_add_pd(low_scaled, low_adjustment));
-        let high_i32 = _mm256_cvttpd_epi32(_mm256_add_pd(high_scaled, high_adjustment));
-        let interior_i32 = _mm256_inserti128_si256(_mm256_castsi128_si256(low_i32), high_i32, 1);
-
-        let minimum_mask = _mm256_castps_si256(_mm256_cmp_ps(samples, negative_one, _CMP_LE_OQ));
-        let maximum_mask = _mm256_castps_si256(_mm256_cmp_ps(samples, one, _CMP_GE_OQ));
-        let nan_mask = _mm256_castps_si256(_mm256_cmp_ps(samples, samples, _CMP_UNORD_Q));
-        let with_minimum =
-            _mm256_blendv_epi8(interior_i32, _mm256_set1_epi32(i32::MIN), minimum_mask);
-        let with_maximum =
-            _mm256_blendv_epi8(with_minimum, _mm256_set1_epi32(i32::MAX), maximum_mask);
-        _mm256_blendv_epi8(with_maximum, _mm256_setzero_si256(), nan_mask)
+        copy_host_to_playback_4ch_avx2_inner(buffers, active, index, playback, period_frames);
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+unsafe fn copy_host_to_playback_4ch_avx2_inner(
+    buffers: &HostBuffers,
+    active: &ActiveChannels,
+    index: usize,
+    playback: &mut [i32],
+    period_frames: usize,
+) {
+    use std::arch::x86_64::*;
+
+    assert_eq!(active.output.len(), 4);
+    debug_assert!(active.output.iter().all(|active| *active));
+    assert!(
+        playback.len()
+            >= period_frames
+                .checked_mul(4)
+                .expect("playback size overflow")
+    );
+    let sources: [&[f32]; 4] = std::array::from_fn(|channel| {
+        let src = buffers.output[channel].half(index);
+        assert!(src.len() >= period_frames);
+        src
+    });
+    let vector_frames = period_frames / 8 * 8;
+    let playback_ptr = playback.as_mut_ptr();
+    for frame in (0..vector_frames).step_by(8) {
+        let rows = std::array::from_fn(|channel| unsafe {
+            convert_f32x8_to_s32(sources[channel].as_ptr().add(frame))
+        });
+        let interleaved = unsafe { interleave_4x8_i32(rows) };
+        for (chunk, values) in interleaved.into_iter().enumerate() {
+            unsafe {
+                _mm256_storeu_si256(playback_ptr.add(frame * 4 + chunk * 8).cast(), values);
+            }
+        }
+    }
+    for frame in vector_frames..period_frames {
+        for channel in 0..4 {
+            playback[frame * 4 + channel] = f32_to_s32(sources[channel][frame]);
+        }
+    }
+    _mm256_zeroupper();
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn copy_host_to_playback_2ch_avx2(
+    buffers: &HostBuffers,
+    active: &ActiveChannels,
+    index: usize,
+    playback: &mut [i32],
+    period_frames: usize,
+) {
+    unsafe {
+        copy_host_to_playback_2ch_avx2_inner(buffers, active, index, playback, period_frames);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn copy_host_to_playback_2ch_avx2_inner(
+    buffers: &HostBuffers,
+    active: &ActiveChannels,
+    index: usize,
+    playback: &mut [i32],
+    period_frames: usize,
+) {
+    use std::arch::x86_64::*;
+
+    assert_eq!(active.output.len(), 2);
+    debug_assert!(active.output.iter().all(|active| *active));
+    assert!(
+        playback.len()
+            >= period_frames
+                .checked_mul(2)
+                .expect("playback size overflow")
+    );
+    let src0 = buffers.output[0].half(index);
+    let src1 = buffers.output[1].half(index);
+    assert!(src0.len() >= period_frames && src1.len() >= period_frames);
+    let vector_frames = period_frames / 8 * 8;
+    let playback_ptr = playback.as_mut_ptr();
+    for frame in (0..vector_frames).step_by(8) {
+        unsafe {
+            let ch0 = convert_f32x8_to_s32(src0.as_ptr().add(frame));
+            let ch1 = convert_f32x8_to_s32(src1.as_ptr().add(frame));
+            let [v0, v1] = interleave_2x8_i32(ch0, ch1);
+            _mm256_storeu_si256(playback_ptr.add(frame * 2).cast(), v0);
+            _mm256_storeu_si256(playback_ptr.add(frame * 2 + 8).cast(), v1);
+        }
+    }
+    for frame in vector_frames..period_frames {
+        playback[frame * 2] = f32_to_s32(src0[frame]);
+        playback[frame * 2 + 1] = f32_to_s32(src1[frame]);
+    }
+    _mm256_zeroupper();
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn convert_s32x8_to_f32(samples: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+
+    _mm256_mul_ps(
+        _mm256_cvtepi32_ps(samples),
+        _mm256_set1_ps(S32_TO_F32_SCALE),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn convert_f32x8_to_s32(source: *const f32) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let raw = _mm256_loadu_ps(source);
+        // Flush subnormals to +0.0 via integer ops so VST reverb/IIR denormals never
+        // trigger ~150-cycle x86 FP assists; |x| < 2^-126 always converts to 0.
+        let abs_bits = _mm256_and_si256(_mm256_castps_si256(raw), _mm256_set1_epi32(0x7fff_ffff));
+        let non_subnormal = _mm256_cmpgt_epi32(abs_bits, _mm256_set1_epi32(0x007f_ffff));
+        let samples = _mm256_and_ps(raw, _mm256_castsi256_ps(non_subnormal));
+
+        // Clamp into [-1.0, 1.0 - 2^-24] so vcvttps2dq never overflows or raises MXCSR
+        // invalid-operation even on NaN or +/-inf (vminps returns operand 2 on NaN).
+        let one = _mm256_set1_ps(1.0);
+        let max_interior = _mm256_set1_ps(f32::from_bits(0x3f7f_ffff));
+        let negative_one = _mm256_set1_ps(-1.0);
+        let scale = _mm256_set1_ps(2_147_483_648.0);
+        let sign_mask = _mm256_set1_ps(-0.0);
+        // 0.5 - 2^-25 rounds exact half-integers away from zero in f32 without rounding
+        // 0.5 - 2^-25 up to 1.0, matching f64 round-away-from-zero for every f32 bit pattern.
+        let half_below = _mm256_set1_ps(f32::from_bits(0x3eff_ffff));
+
+        let clamped = _mm256_max_ps(_mm256_min_ps(samples, max_interior), negative_one);
+        let scaled = _mm256_mul_ps(clamped, scale);
+        let adjustment = _mm256_or_ps(_mm256_and_ps(clamped, sign_mask), half_below);
+        let interior_i32 = _mm256_cvttps_epi32(_mm256_add_ps(scaled, adjustment));
+
+        let ordered = _mm256_castps_si256(_mm256_cmp_ps(samples, samples, _CMP_ORD_Q));
+        let maximum_mask = _mm256_castps_si256(_mm256_cmp_ps(samples, one, _CMP_GE_OQ));
+        let without_nan = _mm256_and_si256(interior_i32, ordered);
+        _mm256_blendv_epi8(without_nan, _mm256_set1_epi32(i32::MAX), maximum_mask)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn deinterleave_2x8_i32(
+    v0: std::arch::x86_64::__m256i,
+    v1: std::arch::x86_64::__m256i,
+) -> [std::arch::x86_64::__m256i; 2] {
+    use std::arch::x86_64::*;
+
+    let f0 = _mm256_castsi256_ps(v0);
+    let f1 = _mm256_castsi256_ps(v1);
+    let even = _mm256_castps_si256(_mm256_shuffle_ps(f0, f1, 0x88));
+    let odd = _mm256_castps_si256(_mm256_shuffle_ps(f0, f1, 0xdd));
+    [
+        _mm256_permute4x64_epi64(even, 0xd8),
+        _mm256_permute4x64_epi64(odd, 0xd8),
+    ]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn interleave_2x8_i32(
+    ch0: std::arch::x86_64::__m256i,
+    ch1: std::arch::x86_64::__m256i,
+) -> [std::arch::x86_64::__m256i; 2] {
+    use std::arch::x86_64::*;
+
+    let lo = _mm256_unpacklo_epi32(ch0, ch1);
+    let hi = _mm256_unpackhi_epi32(ch0, ch1);
+    [
+        _mm256_permute2x128_si256(lo, hi, 0x20),
+        _mm256_permute2x128_si256(lo, hi, 0x31),
+    ]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn deinterleave_4x8_i32(
+    rows: [std::arch::x86_64::__m256i; 4],
+) -> [std::arch::x86_64::__m256i; 4] {
+    use std::arch::x86_64::*;
+
+    let [v0, v1, v2, v3] = rows;
+    let p0 = _mm256_permute2x128_si256(v0, v2, 0x20);
+    let p1 = _mm256_permute2x128_si256(v0, v2, 0x31);
+    let p2 = _mm256_permute2x128_si256(v1, v3, 0x20);
+    let p3 = _mm256_permute2x128_si256(v1, v3, 0x31);
+    let a0 = _mm256_unpacklo_epi32(p0, p1);
+    let a1 = _mm256_unpackhi_epi32(p0, p1);
+    let a2 = _mm256_unpacklo_epi32(p2, p3);
+    let a3 = _mm256_unpackhi_epi32(p2, p3);
+    [
+        _mm256_unpacklo_epi64(a0, a2),
+        _mm256_unpackhi_epi64(a0, a2),
+        _mm256_unpacklo_epi64(a1, a3),
+        _mm256_unpackhi_epi64(a1, a3),
+    ]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn interleave_4x8_i32(
+    channels: [std::arch::x86_64::__m256i; 4],
+) -> [std::arch::x86_64::__m256i; 4] {
+    use std::arch::x86_64::*;
+
+    let [c0, c1, c2, c3] = channels;
+    let a0 = _mm256_unpacklo_epi32(c0, c1);
+    let a1 = _mm256_unpackhi_epi32(c0, c1);
+    let a2 = _mm256_unpacklo_epi32(c2, c3);
+    let a3 = _mm256_unpackhi_epi32(c2, c3);
+    let p0 = _mm256_unpacklo_epi64(a0, a2);
+    let p1 = _mm256_unpackhi_epi64(a0, a2);
+    let p2 = _mm256_unpacklo_epi64(a1, a3);
+    let p3 = _mm256_unpackhi_epi64(a1, a3);
+    [
+        _mm256_permute2x128_si256(p0, p1, 0x20),
+        _mm256_permute2x128_si256(p2, p3, 0x20),
+        _mm256_permute2x128_si256(p0, p1, 0x31),
+        _mm256_permute2x128_si256(p2, p3, 0x31),
+    ]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn transpose_8x8_i32(
     rows: [std::arch::x86_64::__m256i; 8],
 ) -> [std::arch::x86_64::__m256i; 8] {
@@ -2260,12 +2900,14 @@ unsafe fn prewarm_avx2() {
 
     let source = [0.0_f32; 8];
     let mut destination = [0_i32; 8];
+    let mut back = [0.0_f32; 8];
     unsafe {
         let converted = convert_f32x8_to_s32(source.as_ptr());
         _mm256_storeu_si256(destination.as_mut_ptr().cast(), converted);
+        _mm256_storeu_ps(back.as_mut_ptr(), convert_s32x8_to_f32(converted));
         _mm256_zeroupper();
     }
-    std::hint::black_box(destination);
+    std::hint::black_box((destination, back));
 }
 
 fn invoke_callback(
@@ -2313,7 +2955,7 @@ fn notify_worker_failure(callbacks: AsioCallbacks, failure: WorkerFailure) {
 }
 
 fn s32_to_f32(sample: i32) -> f32 {
-    sample as f32 / 2_147_483_648.0
+    (sample as f32) * S32_TO_F32_SCALE
 }
 
 fn f32_to_s32(sample: f32) -> i32 {
@@ -3647,23 +4289,60 @@ mod tests {
         if !std::arch::is_x86_feature_detected!("avx2") {
             return;
         }
-        let channels = 8;
-        for period in [64, 65] {
-            let buffers = populated_output_buffers(period, channels);
-            let active = ActiveChannels {
-                input: Box::new([]),
-                output: vec![true; channels].into_boxed_slice(),
-            };
-            for index in 0..2 {
-                let mut scalar = vec![0_i32; period * channels];
-                let mut simd = vec![0_i32; period * channels];
-                copy_host_to_playback_scalar(&buffers, &active, index, &mut scalar, period);
-                unsafe { copy_host_to_playback_avx2(&buffers, &active, index, &mut simd, period) };
-                assert_eq!(simd, scalar);
+        for channels in [2, 4, 8] {
+            for period in [7, 64, 65] {
+                let buffers = populated_output_buffers(period, channels);
+                let active = ActiveChannels {
+                    input: Box::new([]),
+                    output: vec![true; channels].into_boxed_slice(),
+                };
+                let kernels = SampleKernels::detect(&active);
+                assert!(!std::ptr::fn_addr_eq(
+                    kernels.copy_host_to_playback,
+                    copy_host_to_playback_scalar as CopyHostToPlayback,
+                ));
+                for index in 0..2 {
+                    let mut scalar = vec![0_i32; period * channels];
+                    let mut simd = vec![0_i32; period * channels];
+                    copy_host_to_playback_scalar(&buffers, &active, index, &mut scalar, period);
+                    unsafe {
+                        (kernels.copy_host_to_playback)(&buffers, &active, index, &mut simd, period)
+                    };
+                    assert_eq!(
+                        simd, scalar,
+                        "channels={channels} period={period} index={index}"
+                    );
+                }
             }
         }
 
-        let source = conversion_test_samples(65_536);
+        // Cover critical boundary bit patterns around +/-0.5*2^-31, +/-1.0, subnormals, inf, NaN.
+        let mut source = conversion_test_samples(65_536);
+        for boundary in [
+            0x2f7f_fffe_u32,
+            0x2f7f_ffff,
+            0x2f80_0000,
+            0x2f80_0001,
+            0x2fc0_0000,
+            0x3000_0000,
+            0x3020_0000,
+            0x3b7f_ffff,
+            0x3b80_0000,
+            0x3bff_ffff,
+            0x3c00_0000,
+            0x3f7f_fffe,
+            0x3f7f_ffff,
+            0x3f80_0000,
+            0x3f80_0001,
+            0x7fc0_0001,
+            0x7f80_0001,
+        ] {
+            source.push(f32::from_bits(boundary));
+            source.push(f32::from_bits(boundary | 0x8000_0000));
+        }
+        while !source.len().is_multiple_of(8) {
+            source.push(0.0);
+        }
         let (chunks, remainder) = source.as_chunks::<8>();
         assert!(remainder.is_empty());
         for chunk in chunks {
@@ -3675,9 +4354,270 @@ mod tests {
                 _mm256_zeroupper();
             }
             for (sample, converted) in chunk.iter().copied().zip(simd) {
-                assert_eq!(converted, f32_to_s32_reference(sample));
+                assert_eq!(
+                    converted,
+                    f32_to_s32_reference(sample),
+                    "bits={:#010x}",
+                    sample.to_bits()
+                );
             }
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_capture_conversion_matches_scalar_for_all_shapes_and_subsets() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let edge_samples = [
+            i32::MIN,
+            i32::MIN + 1,
+            -1_073_741_824,
+            -1,
+            0,
+            1,
+            1_073_741_824,
+            i32::MAX - 1,
+            i32::MAX,
+        ];
+        for (channels, mask) in [
+            (2, vec![true, true]),
+            (2, vec![false, true]),
+            (4, vec![true, true, true, true]),
+            (4, vec![true, false, true, false]),
+            (8, vec![true; 8]),
+            (8, vec![true, true, false, false, true, false, false, true]),
+            (
+                8,
+                vec![true, false, false, false, false, false, false, false],
+            ),
+            (10, vec![true; 10]),
+            (
+                10,
+                vec![
+                    true, true, false, false, false, false, false, false, true, true,
+                ],
+            ),
+            (
+                10,
+                vec![
+                    true, true, false, false, false, false, false, false, false, false,
+                ],
+            ),
+            (6, vec![true, false, true, true, false, true]),
+        ] {
+            for period in [7, 64, 65] {
+                let mut capture = vec![0_i32; period * channels];
+                let mut state = 0x1234_5678_u32;
+                for (i, sample) in capture.iter_mut().enumerate() {
+                    if i < edge_samples.len() {
+                        *sample = edge_samples[i];
+                    } else {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        *sample = state as i32;
+                    }
+                }
+                let active = ActiveChannels {
+                    input: mask.clone().into_boxed_slice(),
+                    output: Box::new([]),
+                };
+                let kernels = SampleKernels::detect(&active);
+                assert!(!std::ptr::fn_addr_eq(
+                    kernels.copy_capture_to_host,
+                    copy_capture_to_host_scalar as CopyCaptureToHost,
+                ));
+                for index in 0..2 {
+                    let scalar_buffers = HostBuffers::new(channels, 0, period).unwrap();
+                    let simd_buffers = HostBuffers::new(channels, 0, period).unwrap();
+                    // Pre-fill inactive channels with sentinel values to prove they stay untouched.
+                    for ch in 0..channels {
+                        scalar_buffers.input[ch].half_mut(index).fill(-7.25);
+                        simd_buffers.input[ch].half_mut(index).fill(-7.25);
+                    }
+                    copy_capture_to_host_scalar(&capture, &scalar_buffers, &active, index, period);
+                    unsafe {
+                        (kernels.copy_capture_to_host)(
+                            &capture,
+                            &simd_buffers,
+                            &active,
+                            index,
+                            period,
+                        )
+                    };
+                    for ch in 0..channels {
+                        let a: Vec<u32> = scalar_buffers.input[ch]
+                            .half(index)
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect();
+                        let b: Vec<u32> = simd_buffers.input[ch]
+                            .half(index)
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect();
+                        assert_eq!(
+                            b, a,
+                            "ch={ch} channels={channels} period={period} index={index}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "exhaustive 2^32 f32 -> s32 AVX2 verification"]
+    fn exhaustive_f32_to_s32_avx2_matches_reference() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut chunk = [0.0_f32; 8];
+        let mut simd = [0_i32; 8];
+        let mut bits = 0_u64;
+        while bits <= u64::from(u32::MAX) {
+            for (lane, slot) in chunk.iter_mut().enumerate() {
+                *slot = f32::from_bits((bits + lane as u64) as u32);
+            }
+            unsafe {
+                use std::arch::x86_64::*;
+                let converted = convert_f32x8_to_s32(chunk.as_ptr());
+                _mm256_storeu_si256(simd.as_mut_ptr().cast(), converted);
+                _mm256_zeroupper();
+            }
+            for (sample, actual) in chunk.into_iter().zip(simd) {
+                assert_eq!(
+                    actual,
+                    f32_to_s32_reference(sample),
+                    "mismatch at bits={:#010x}",
+                    sample.to_bits()
+                );
+            }
+            bits += 8;
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "release-mode conversion microbenchmark"]
+    fn benchmark_asio_capture_conversion() {
+        use std::{hint::black_box, time::Instant};
+
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            eprintln!("AVX2 unavailable");
+            return;
+        }
+        let period = 64;
+        let iterations = 100_000_u128;
+        for (label, channels, mask) in [
+            ("10ch full", 10, vec![true; 10]),
+            (
+                "10ch 2-active",
+                10,
+                vec![
+                    true, true, false, false, false, false, false, false, false, false,
+                ],
+            ),
+            ("8ch full", 8, vec![true; 8]),
+            ("2ch full", 2, vec![true; 2]),
+        ] {
+            let capture: Vec<i32> = (0..period * channels)
+                .map(|i| (i as i32).wrapping_mul(1_234_567))
+                .collect();
+            let buffers = HostBuffers::new(channels, 0, period).unwrap();
+            let active = ActiveChannels {
+                input: mask.into_boxed_slice(),
+                output: Box::new([]),
+            };
+            let kernels = SampleKernels::detect(&active);
+
+            let measure = |kernel: CopyCaptureToHost| {
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    unsafe {
+                        black_box(kernel)(
+                            black_box(&capture),
+                            black_box(&buffers),
+                            black_box(&active),
+                            0,
+                            period,
+                        );
+                    }
+                }
+                black_box(buffers.input[0].half(0)[0]);
+                start.elapsed().as_nanos() / iterations
+            };
+            let scalar = measure(copy_capture_to_host_scalar);
+            let avx2 = measure(kernels.copy_capture_to_host);
+            eprintln!(
+                "ASIO Q64 {label} capture: scalar={scalar} ns, avx2={avx2} ns, speedup={:.2}x",
+                scalar as f64 / avx2.max(1) as f64,
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "release-mode seqlock microbenchmark"]
+    fn benchmark_position_snapshot_seqlock() {
+        use std::{hint::black_box, time::Instant};
+
+        let iterations = 2_000_000_u128;
+
+        let seqcst_seq = AtomicU64::new(0);
+        let seqcst_samples = AtomicU64::new(0);
+        let seqcst_stamp = AtomicU64::new(0);
+        let start = Instant::now();
+        for i in 0..iterations as u64 {
+            seqcst_seq.fetch_add(1, Ordering::SeqCst);
+            seqcst_samples.store(black_box(i * 64), Ordering::SeqCst);
+            seqcst_stamp.store(black_box(i * 1_333_333), Ordering::SeqCst);
+            seqcst_seq.fetch_add(1, Ordering::SeqCst);
+            let before = seqcst_seq.load(Ordering::SeqCst);
+            let s = seqcst_samples.load(Ordering::SeqCst);
+            let t = seqcst_stamp.load(Ordering::SeqCst);
+            let after = seqcst_seq.load(Ordering::SeqCst);
+            black_box((before == after, s, t));
+        }
+        let seqcst_ns = start.elapsed().as_nanos() as f64 / iterations as f64;
+
+        let snapshot = PositionSnapshot::new();
+        let start = Instant::now();
+        for i in 0..iterations as u64 {
+            snapshot.publish(black_box(i * 64), black_box(i * 1_333_333));
+            black_box(snapshot.load());
+        }
+        let acqrel_ns = start.elapsed().as_nanos() as f64 / iterations as f64;
+        eprintln!(
+            "ASIO PositionSnapshot publish+load: seqcst={seqcst_ns:.2} ns/op, acqrel={acqrel_ns:.2} ns/op, speedup={:.2}x",
+            seqcst_ns / acqrel_ns.max(0.01)
+        );
+    }
+
+    #[test]
+    fn position_snapshot_seqlock_is_tear_free_under_concurrent_reads() {
+        let snapshot = Arc::new(PositionSnapshot::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let reader_snapshot = Arc::clone(&snapshot);
+        let reader_done = Arc::clone(&done);
+        let reader = thread::spawn(move || {
+            let mut reads = 0_u64;
+            while !reader_done.load(Ordering::Relaxed) {
+                let (samples, stamp) = reader_snapshot.load();
+                assert_eq!(stamp, samples.wrapping_mul(17));
+                reads += 1;
+            }
+            reads
+        });
+        for i in 1..=200_000_u64 {
+            snapshot.publish(i, i.wrapping_mul(17));
+        }
+        done.store(true, Ordering::Relaxed);
+        let reads = reader.join().unwrap();
+        assert!(reads > 0);
+        assert_eq!(snapshot.load(), (200_000, 200_000 * 17));
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -3722,9 +4662,50 @@ mod tests {
         let avx2 = measure(copy_host_to_playback_avx2);
         eprintln!(
             "ASIO Q64 8ch playback: reference={reference} ns, scalar={scalar} ns, avx2={avx2} ns, avx2/reference={:.2}x, avx2/scalar={:.2}x",
-            reference as f64 / avx2 as f64,
-            scalar as f64 / avx2 as f64,
+            reference as f64 / avx2.max(1) as f64,
+            scalar as f64 / avx2.max(1) as f64,
         );
+        for (label, ch, kernel) in [
+            (
+                "4ch",
+                4,
+                copy_host_to_playback_4ch_avx2 as CopyHostToPlayback,
+            ),
+            (
+                "2ch",
+                2,
+                copy_host_to_playback_2ch_avx2 as CopyHostToPlayback,
+            ),
+        ] {
+            let buffers = populated_output_buffers(period, ch);
+            let active = ActiveChannels {
+                input: Box::new([]),
+                output: vec![true; ch].into_boxed_slice(),
+            };
+            let measure_ch = |k: CopyHostToPlayback| {
+                let mut playback = vec![0_i32; period * ch];
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    unsafe {
+                        black_box(k)(
+                            black_box(&buffers),
+                            black_box(&active),
+                            0,
+                            black_box(&mut playback),
+                            period,
+                        )
+                    };
+                }
+                black_box(playback);
+                start.elapsed().as_nanos() / iterations
+            };
+            let s = measure_ch(copy_host_to_playback_scalar);
+            let a = measure_ch(kernel);
+            eprintln!(
+                "ASIO Q64 {label} playback: scalar={s} ns, avx2={a} ns, speedup={:.2}x",
+                s as f64 / a.max(1) as f64,
+            );
+        }
     }
 
     #[test]

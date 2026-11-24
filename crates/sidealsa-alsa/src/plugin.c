@@ -58,6 +58,8 @@ typedef struct {
 	snd_pcm_uframes_t playback_expected_appl_ptr;
 	snd_pcm_uframes_t playback_reported_hw_ptr;
 	int buffered_capture;
+	int nonblock;
+	int pro_playback;
 	/*
 	 * libasound calls drain, prepare and sw_params without the PCM lock, so a
 	 * blocking drain could otherwise race pointer/transfer from another thread.
@@ -79,8 +81,14 @@ static void sidealsa_set_error_state(snd_pcm_ioplug_t *io, long result)
 static int sidealsa_sync_nonblock(snd_pcm_ioplug_t *io)
 {
 	sidealsa_pcm_t *pcm = io->private_data;
-	int result = sidealsa_stream_set_nonblock(pcm->stream, io->nonblock);
+	int nonblock = !!io->nonblock;
 
+	if (nonblock == pcm->nonblock)
+		return 0;
+	int result = sidealsa_stream_set_nonblock(pcm->stream, nonblock);
+
+	if (result >= 0)
+		pcm->nonblock = nonblock;
 	sidealsa_set_error_state(io, result);
 	return result;
 }
@@ -226,7 +234,8 @@ static snd_pcm_sframes_t sidealsa_pointer_locked(snd_pcm_ioplug_t *io)
 {
 	sidealsa_pcm_t *pcm = io->private_data;
 	int result = sidealsa_playback_sync(io);
-	if (result >= 0)
+	if (result >= 0 && pcm->pro_playback &&
+	    (io->state == SND_PCM_STATE_RUNNING || io->state == SND_PCM_STATE_DRAINING))
 		result = sidealsa_stream_pump_pro_playback(pcm->stream);
 	if (result >= 0)
 		result = sidealsa_capture_sync(io);
@@ -493,6 +502,8 @@ int sidealsa_plugin_open(snd_pcm_t **pcmp, const char *name,
 		buffer_size = (unsigned int)max_periods * period_size;
 	pcm->buffer_size = buffer_size;
 	pcm->buffered_capture = sidealsa_stream_is_buffered_capture(pcm->stream);
+	pcm->nonblock = !!(mode & SND_PCM_NONBLOCK);
+	pcm->pro_playback = sidealsa_mode == 0 && direction == 0;
 
 	pcm->io.version = SND_PCM_IOPLUG_VERSION;
 	pcm->io.name = "SideALSA PCM";

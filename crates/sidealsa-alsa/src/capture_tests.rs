@@ -620,3 +620,70 @@ fn running_reset_hides_audio_already_owned_by_the_daemon() {
     f.region.set_playback_sequence(13);
     assert_eq!(f.adapter.position(), 64);
 }
+
+#[test]
+fn playback_ring_fifo_wraps_across_multiple_submitted_periods() {
+    let mut f = Fixture::new_mode(false, MODE_PRO, STREAM_PLAYBACK, true);
+    assert_eq!(unsafe { sidealsa_stream_stop(&mut f.adapter) }, 0);
+    assert_eq!(unsafe { sidealsa_stream_prepare(&mut f.adapter) }, 0);
+    assert_eq!(
+        unsafe { sidealsa_stream_set_buffer_size(&mut f.adapter, 128) },
+        0
+    );
+    f.adapter.start().unwrap();
+    f.region.reset_activation();
+    assert!(f.region.establish_activation(10));
+    f.region.set_cycle_sequence(11);
+    f.region.set_playback_sequence(11);
+
+    // Queue 96 frames (1.5 periods): period 0 submits immediately, leaving 32 frames at head=64.
+    let first: [i32; 96] = std::array::from_fn(|i| i as i32 + 1);
+    assert_eq!(
+        f.adapter
+            .transfer_playback(&playback_area(&first), 0, 96)
+            .unwrap(),
+        96
+    );
+    assert_eq!(f.adapter.playback_fifo_head, 64);
+    assert_eq!(f.adapter.playback_fifo_frames, 32);
+
+    let mut out0 = [0; 64];
+    assert!(f.region.try_consume_playback(11, &mut out0));
+    assert_eq!(out0, first[..64]);
+
+    // Queue 64 more frames (wraps across end of 128-frame ring) and advance cycle to submit.
+    f.region.set_cycle_sequence(12);
+    f.region.set_playback_sequence(12);
+    let second: [i32; 64] = std::array::from_fn(|i| 1000 + i as i32);
+    assert_eq!(
+        f.adapter
+            .transfer_playback(&playback_area(&second), 0, 64)
+            .unwrap(),
+        64
+    );
+    assert_eq!(f.adapter.playback_fifo_head, 0);
+    assert_eq!(f.adapter.playback_fifo_frames, 32);
+
+    let mut out1 = [0; 64];
+    assert!(f.region.try_consume_playback(12, &mut out1));
+    assert_eq!(&out1[..32], &first[64..96]);
+    assert_eq!(&out1[32..], &second[..32]);
+
+    // Forward 32 frames of silence to complete the wrapped third period and submit.
+    assert_eq!(
+        unsafe { sidealsa_stream_playback_forward(&mut f.adapter, 32) },
+        0
+    );
+    f.region.set_cycle_sequence(13);
+    f.region.set_playback_sequence(13);
+    assert_eq!(
+        unsafe { sidealsa_stream_pump_pro_playback(&mut f.adapter) },
+        0
+    );
+    let mut out2 = [0; 64];
+    assert!(f.region.try_consume_playback(13, &mut out2));
+    assert_eq!(&out2[..32], &second[32..64]);
+    assert_eq!(&out2[32..], &[0; 32]);
+    assert_eq!(f.adapter.playback_fifo_frames, 0);
+    assert_eq!(f.adapter.playback_fifo_head, 0);
+}

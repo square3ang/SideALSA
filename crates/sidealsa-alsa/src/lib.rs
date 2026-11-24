@@ -62,6 +62,7 @@ pub struct SideAlsaStream {
     buffer_frames: usize,
     scratch: Vec<i32>,
     playback_fifo: Vec<i32>,
+    playback_fifo_head: usize,
     playback_fifo_frames: usize,
     capture_frames: usize,
     capture_offset: usize,
@@ -205,6 +206,7 @@ pub unsafe extern "C" fn sidealsa_stream_open(
             buffer_frames,
             scratch: vec![0; if playback { 0 } else { scratch_len }],
             playback_fifo: vec![0; fifo_len],
+            playback_fifo_head: 0,
             playback_fifo_frames: 0,
             capture_frames: 0,
             capture_offset: 0,
@@ -314,6 +316,7 @@ pub unsafe extern "C" fn sidealsa_stream_set_buffer_size(
             return Err(libc::EINVAL);
         }
         stream.buffer_frames = frames;
+        stream.playback_fifo_head = 0;
         Ok(())
     })
 }
@@ -465,6 +468,9 @@ pub unsafe extern "C" fn sidealsa_stream_capture_sync(
             } else {
                 boundary - expected + current
             };
+            if skip == 0 {
+                return Ok(());
+            }
             if skip > buffer
                 || skip > stream.buffer_frames as u64
                 || skip > stream.capture_frames as u64 + stream.stream.capture_frames_ready()
@@ -597,6 +603,7 @@ impl SideAlsaStream {
     }
 
     fn reset_transfer_state(&mut self) {
+        self.playback_fifo_head = 0;
         self.playback_fifo_frames = 0;
         self.capture_frames = 0;
         self.capture_offset = 0;
@@ -617,7 +624,9 @@ impl SideAlsaStream {
         let before = self.playback_fifo_frames;
         pad_final_playback_period(
             &mut self.playback_fifo,
+            self.playback_fifo_head,
             &mut self.playback_fifo_frames,
+            self.buffer_frames,
             self.period_frames,
             self.channels,
         )?;
@@ -641,6 +650,9 @@ impl SideAlsaStream {
         match usize::try_from(frames) {
             Ok(frames) if frames <= rewindable => {
                 self.playback_fifo_frames -= frames;
+                if self.playback_fifo_frames == 0 {
+                    self.playback_fifo_head = 0;
+                }
                 Ok(())
             }
             _ => {
@@ -661,8 +673,14 @@ impl SideAlsaStream {
             .checked_add(frames)
             .filter(|queued| *queued <= self.buffer_frames)
             .ok_or(libc::EPIPE)?;
-        let start = self.playback_fifo_frames * self.channels;
-        self.playback_fifo[start..queued * self.channels].fill(0);
+        zero_fill_fifo_tail(
+            &mut self.playback_fifo,
+            self.playback_fifo_head,
+            self.playback_fifo_frames,
+            self.buffer_frames,
+            frames,
+            self.channels,
+        )?;
         self.playback_fifo_frames = queued;
         Ok(())
     }
@@ -674,6 +692,7 @@ impl SideAlsaStream {
             return Err(libc::EINVAL);
         }
         let submitted = queued_frames.saturating_sub(self.playback_fifo_frames as u64);
+        self.playback_fifo_head = 0;
         self.playback_fifo_frames = 0;
         self.playback_fifo_locked_frames = 0;
         if self.running {
@@ -727,6 +746,7 @@ impl SideAlsaStream {
             let source_offset = offset.checked_add(consumed).ok_or(libc::EOVERFLOW)?;
             let chunk = copy_into_fifo(
                 &mut self.playback_fifo,
+                self.playback_fifo_head,
                 &mut self.playback_fifo_frames,
                 self.buffer_frames,
                 areas,
@@ -757,6 +777,7 @@ impl SideAlsaStream {
     ) -> Result<isize, c_int> {
         let accepted = copy_into_fifo(
             &mut self.playback_fifo,
+            self.playback_fifo_head,
             &mut self.playback_fifo_frames,
             self.buffer_frames,
             areas,
@@ -909,9 +930,16 @@ impl SideAlsaStream {
                 .period_frames
                 .checked_mul(self.channels)
                 .ok_or(libc::EOVERFLOW)?;
+            debug_assert!(self.playback_fifo_head + self.period_frames <= self.buffer_frames);
+            let start = self
+                .playback_fifo_head
+                .checked_mul(self.channels)
+                .ok_or(libc::EOVERFLOW)?;
+            let end = start.checked_add(samples).ok_or(libc::EOVERFLOW)?;
+            let block = self.playback_fifo.get(start..end).ok_or(libc::EOVERFLOW)?;
             if !self
                 .stream
-                .submit_playback(sequence, &self.playback_fifo[..samples])
+                .submit_playback(sequence, block)
                 .map_err(client_error_code)?
             {
                 self.playback_cycle_sequence = None;
@@ -947,6 +975,7 @@ impl SideAlsaStream {
     }
 
     fn clear_playback_fifo(&mut self) {
+        self.playback_fifo_head = 0;
         self.playback_fifo_frames = 0;
         self.playback_fifo_locked_frames = 0;
         self.next_playback_sequence = None;
@@ -960,11 +989,11 @@ impl SideAlsaStream {
             .playback_fifo_locked_frames
             .saturating_sub(periods.saturating_mul(self.period_frames));
         discard_playback_fifo_periods(
-            &mut self.playback_fifo,
+            &mut self.playback_fifo_head,
             &mut self.playback_fifo_frames,
+            self.buffer_frames,
             periods,
             self.period_frames,
-            self.channels,
         )
     }
 
@@ -1050,7 +1079,9 @@ impl SideAlsaStream {
     }
 
     fn acquire_shared_capture(&mut self) -> Result<(), c_int> {
-        self.validate_capture()?;
+        if let Some(error) = self.capture_error {
+            return Err(error);
+        }
         if self
             .stream
             .try_capture_buffer(&mut self.scratch)
@@ -1077,7 +1108,6 @@ impl SideAlsaStream {
                 return Err(libc::EPIPE);
             }
             while copied < frames {
-                self.validate_capture()?;
                 if self.capture_frames == 0 {
                     if !self.nonblock {
                         self.wait_period()?;
@@ -1303,9 +1333,58 @@ fn sequence_forward_distance(origin: u64, current: u64) -> Option<u64> {
     }
 }
 
+fn fifo_tail_frame(
+    head_frame: usize,
+    queued_frames: usize,
+    capacity_frames: usize,
+) -> Result<usize, c_int> {
+    if capacity_frames == 0 || head_frame >= capacity_frames || queued_frames >= capacity_frames {
+        return Err(libc::EOVERFLOW);
+    }
+    let sum = head_frame
+        .checked_add(queued_frames)
+        .ok_or(libc::EOVERFLOW)?;
+    Ok(if sum >= capacity_frames {
+        sum - capacity_frames
+    } else {
+        sum
+    })
+}
+
+fn zero_fill_fifo_tail(
+    fifo: &mut [i32],
+    head_frame: usize,
+    queued_frames: usize,
+    capacity_frames: usize,
+    frames: usize,
+    channels: usize,
+) -> Result<(), c_int> {
+    if frames == 0 {
+        return Ok(());
+    }
+    let tail = fifo_tail_frame(head_frame, queued_frames, capacity_frames)?;
+    let first_frames = frames.min(capacity_frames - tail);
+    let second_frames = frames - first_frames;
+    let first_start = tail.checked_mul(channels).ok_or(libc::EOVERFLOW)?;
+    let first_end = first_start
+        .checked_add(first_frames.checked_mul(channels).ok_or(libc::EOVERFLOW)?)
+        .ok_or(libc::EOVERFLOW)?;
+    let second_end = second_frames.checked_mul(channels).ok_or(libc::EOVERFLOW)?;
+    if first_end > fifo.len() || second_end > fifo.len() {
+        return Err(libc::EOVERFLOW);
+    }
+    fifo[first_start..first_end].fill(0);
+    if second_end > 0 {
+        fifo[..second_end].fill(0);
+    }
+    Ok(())
+}
+
 fn pad_final_playback_period(
     fifo: &mut [i32],
+    head_frame: usize,
     queued_frames: &mut usize,
+    capacity_frames: usize,
     period_frames: usize,
     channels: usize,
 ) -> Result<(), c_int> {
@@ -1313,39 +1392,58 @@ fn pad_final_playback_period(
     if remainder == 0 {
         return Ok(());
     }
+    let pad_frames = period_frames - remainder;
     let padded_frames = queued_frames
-        .checked_add(period_frames - remainder)
+        .checked_add(pad_frames)
+        .filter(|padded| *padded <= capacity_frames)
         .ok_or(libc::EOVERFLOW)?;
-    let start = queued_frames.checked_mul(channels).ok_or(libc::EOVERFLOW)?;
-    let end = padded_frames.checked_mul(channels).ok_or(libc::EOVERFLOW)?;
-    if end > fifo.len() {
-        return Err(libc::EOVERFLOW);
-    }
-    fifo[start..end].fill(0);
+    zero_fill_fifo_tail(
+        fifo,
+        head_frame,
+        *queued_frames,
+        capacity_frames,
+        pad_frames,
+        channels,
+    )?;
     *queued_frames = padded_frames;
     Ok(())
 }
 
 fn discard_playback_fifo_periods(
-    fifo: &mut [i32],
+    head_frame: &mut usize,
     queued_frames: &mut usize,
+    capacity_frames: usize,
     periods: usize,
     period_frames: usize,
-    channels: usize,
 ) -> Result<(), c_int> {
     let frames = periods.saturating_mul(period_frames).min(*queued_frames);
-    let samples = frames.checked_mul(channels).ok_or(libc::EOVERFLOW)?;
     let remaining_frames = *queued_frames - frames;
-    let remaining_samples = remaining_frames
-        .checked_mul(channels)
-        .ok_or(libc::EOVERFLOW)?;
-    fifo.copy_within(samples..samples + remaining_samples, 0);
+    if remaining_frames == 0 {
+        *head_frame = 0;
+    } else {
+        if capacity_frames == 0 {
+            return Err(libc::EOVERFLOW);
+        }
+        let next = head_frame.checked_add(frames).ok_or(libc::EOVERFLOW)?;
+        *head_frame = if next < capacity_frames {
+            next
+        } else {
+            let wrapped = next - capacity_frames;
+            if wrapped < capacity_frames {
+                wrapped
+            } else {
+                next % capacity_frames
+            }
+        };
+    }
     *queued_frames = remaining_frames;
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn copy_into_fifo(
     fifo: &mut [i32],
+    head_frame: usize,
     queued_frames: &mut usize,
     capacity_frames: usize,
     areas: *const SideAlsaChannelArea,
@@ -1358,18 +1456,35 @@ fn copy_into_fifo(
     if accepted == 0 {
         return Ok(0);
     }
-    let destination_start = queued_frames.checked_mul(channels).ok_or(libc::EOVERFLOW)?;
-    let destination_end = destination_start
-        .checked_add(accepted.checked_mul(channels).ok_or(libc::EOVERFLOW)?)
+    let tail = fifo_tail_frame(head_frame, *queued_frames, capacity_frames)?;
+    let first_frames = accepted.min(capacity_frames - tail);
+    let second_frames = accepted - first_frames;
+    let first_start = tail.checked_mul(channels).ok_or(libc::EOVERFLOW)?;
+    let first_end = first_start
+        .checked_add(first_frames.checked_mul(channels).ok_or(libc::EOVERFLOW)?)
         .ok_or(libc::EOVERFLOW)?;
+    let second_end = second_frames.checked_mul(channels).ok_or(libc::EOVERFLOW)?;
+    if first_end > fifo.len() || second_end > fifo.len() {
+        return Err(libc::EOVERFLOW);
+    }
     unsafe {
         copy_from_area(
             areas,
             offset,
-            accepted,
+            first_frames,
             channels,
-            &mut fifo[destination_start..destination_end],
+            &mut fifo[first_start..first_end],
         )?;
+        if second_frames > 0 {
+            let second_offset = offset.checked_add(first_frames).ok_or(libc::EOVERFLOW)?;
+            copy_from_area(
+                areas,
+                second_offset,
+                second_frames,
+                channels,
+                &mut fifo[..second_end],
+            )?;
+        }
     }
     *queued_frames += accepted;
     Ok(accepted)
@@ -1473,15 +1588,14 @@ unsafe fn copy_from_area(
     destination: &mut [i32],
 ) -> Result<(), c_int> {
     let area = unsafe { &*areas };
-    validate_area(area, channels)?;
+    let (first, step, frame_bytes) = validate_area(area, channels)?;
     let base = area.addr.cast::<u8>();
-    let first = usize::try_from(area.first / 8).map_err(|_| libc::EINVAL)?;
-    let step = usize::try_from(area.step / 8).map_err(|_| libc::EINVAL)?;
     let sample_count = frames.checked_mul(channels).ok_or(libc::EOVERFLOW)?;
     let destination = destination.get_mut(..sample_count).ok_or(libc::EINVAL)?;
-    if cfg!(target_endian = "little")
-        && step == channels.checked_mul(size_of_i32()).ok_or(libc::EOVERFLOW)?
-    {
+    if frames == 0 {
+        return Ok(());
+    }
+    if cfg!(target_endian = "little") && step == frame_bytes {
         let byte_offset = first
             .checked_add(offset.checked_mul(step).ok_or(libc::EOVERFLOW)?)
             .ok_or(libc::EOVERFLOW)?;
@@ -1510,21 +1624,40 @@ unsafe fn copy_from_area_scalar(
     channels: usize,
     destination: &mut [i32],
 ) -> Result<(), c_int> {
+    let sample_count = frames.checked_mul(channels).ok_or(libc::EOVERFLOW)?;
+    let destination = destination.get_mut(..sample_count).ok_or(libc::EINVAL)?;
+    if frames == 0 {
+        return Ok(());
+    }
+    let frame_bytes = channels.checked_mul(size_of_i32()).ok_or(libc::EOVERFLOW)?;
+    let start_offset = first
+        .checked_add(offset.checked_mul(step).ok_or(libc::EOVERFLOW)?)
+        .ok_or(libc::EOVERFLOW)?;
+    let last_frame_offset = (frames - 1).checked_mul(step).ok_or(libc::EOVERFLOW)?;
+    let _ = start_offset
+        .checked_add(last_frame_offset)
+        .and_then(|value| value.checked_add(frame_bytes))
+        .ok_or(libc::EOVERFLOW)?;
+    let mut source = unsafe { base.add(start_offset) };
+    if cfg!(target_endian = "little") {
+        let mut dest = destination.as_mut_ptr().cast::<u8>();
+        for _ in 0..frames {
+            unsafe {
+                ptr::copy_nonoverlapping(source, dest, frame_bytes);
+                source = source.add(step);
+                dest = dest.add(frame_bytes);
+            }
+        }
+        return Ok(());
+    }
     for frame in 0..frames {
         for channel in 0..channels {
-            let byte_offset = first
-                .checked_add(
-                    offset
-                        .checked_add(frame)
-                        .and_then(|value| value.checked_mul(step))
-                        .ok_or(libc::EOVERFLOW)?,
-                )
-                .and_then(|value| value.checked_add(channel.checked_mul(size_of_i32())?))
-                .ok_or(libc::EOVERFLOW)?;
-            let source = unsafe { base.add(byte_offset) };
-            let bytes = unsafe { ptr::read_unaligned(source.cast::<[u8; 4]>()) };
+            let bytes = unsafe {
+                ptr::read_unaligned(source.add(channel * size_of_i32()).cast::<[u8; 4]>())
+            };
             destination[frame * channels + channel] = i32::from_le_bytes(bytes);
         }
+        source = unsafe { source.add(step) };
     }
     Ok(())
 }
@@ -1537,15 +1670,14 @@ unsafe fn copy_to_area(
     source: &[i32],
 ) -> Result<(), c_int> {
     let area = unsafe { &*areas };
-    validate_area(area, channels)?;
+    let (first, step, frame_bytes) = validate_area(area, channels)?;
     let base = area.addr.cast::<u8>();
-    let first = usize::try_from(area.first / 8).map_err(|_| libc::EINVAL)?;
-    let step = usize::try_from(area.step / 8).map_err(|_| libc::EINVAL)?;
     let sample_count = frames.checked_mul(channels).ok_or(libc::EOVERFLOW)?;
     let source = source.get(..sample_count).ok_or(libc::EINVAL)?;
-    if cfg!(target_endian = "little")
-        && step == channels.checked_mul(size_of_i32()).ok_or(libc::EOVERFLOW)?
-    {
+    if frames == 0 {
+        return Ok(());
+    }
+    if cfg!(target_endian = "little") && step == frame_bytes {
         let byte_offset = first
             .checked_add(offset.checked_mul(step).ok_or(libc::EOVERFLOW)?)
             .ok_or(libc::EOVERFLOW)?;
@@ -1570,35 +1702,61 @@ unsafe fn copy_to_area_scalar(
     channels: usize,
     source: &[i32],
 ) -> Result<(), c_int> {
+    let sample_count = frames.checked_mul(channels).ok_or(libc::EOVERFLOW)?;
+    let source = source.get(..sample_count).ok_or(libc::EINVAL)?;
+    if frames == 0 {
+        return Ok(());
+    }
+    let frame_bytes = channels.checked_mul(size_of_i32()).ok_or(libc::EOVERFLOW)?;
+    let start_offset = first
+        .checked_add(offset.checked_mul(step).ok_or(libc::EOVERFLOW)?)
+        .ok_or(libc::EOVERFLOW)?;
+    let last_frame_offset = (frames - 1).checked_mul(step).ok_or(libc::EOVERFLOW)?;
+    let _ = start_offset
+        .checked_add(last_frame_offset)
+        .and_then(|value| value.checked_add(frame_bytes))
+        .ok_or(libc::EOVERFLOW)?;
+    let mut destination = unsafe { base.add(start_offset) };
+    if cfg!(target_endian = "little") {
+        let mut src = source.as_ptr().cast::<u8>();
+        for _ in 0..frames {
+            unsafe {
+                ptr::copy_nonoverlapping(src, destination, frame_bytes);
+                src = src.add(frame_bytes);
+                destination = destination.add(step);
+            }
+        }
+        return Ok(());
+    }
     for frame in 0..frames {
         for channel in 0..channels {
-            let byte_offset = first
-                .checked_add(
-                    offset
-                        .checked_add(frame)
-                        .and_then(|value| value.checked_mul(step))
-                        .ok_or(libc::EOVERFLOW)?,
-                )
-                .and_then(|value| value.checked_add(channel.checked_mul(size_of_i32())?))
-                .ok_or(libc::EOVERFLOW)?;
-            let destination = unsafe { base.add(byte_offset) };
             let bytes = source[frame * channels + channel].to_le_bytes();
-            unsafe { ptr::write_unaligned(destination.cast::<[u8; 4]>(), bytes) };
+            unsafe {
+                ptr::write_unaligned(
+                    destination.add(channel * size_of_i32()).cast::<[u8; 4]>(),
+                    bytes,
+                )
+            };
         }
+        destination = unsafe { destination.add(step) };
     }
     Ok(())
 }
 
-fn validate_area(area: &SideAlsaChannelArea, channels: usize) -> Result<(), c_int> {
-    if area.addr.is_null()
-        || !area.first.is_multiple_of(8)
-        || !area.step.is_multiple_of(8)
-        || usize::try_from(area.step / 8).map_err(|_| libc::EINVAL)?
-            < channels.checked_mul(size_of_i32()).ok_or(libc::EOVERFLOW)?
-    {
+fn validate_area(
+    area: &SideAlsaChannelArea,
+    channels: usize,
+) -> Result<(usize, usize, usize), c_int> {
+    if area.addr.is_null() || !area.first.is_multiple_of(8) || !area.step.is_multiple_of(8) {
+        return Err(libc::EINVAL);
+    }
+    let first = usize::try_from(area.first / 8).map_err(|_| libc::EINVAL)?;
+    let step = usize::try_from(area.step / 8).map_err(|_| libc::EINVAL)?;
+    let frame_bytes = channels.checked_mul(size_of_i32()).ok_or(libc::EOVERFLOW)?;
+    if step < frame_bytes {
         Err(libc::EINVAL)
     } else {
-        Ok(())
+        Ok((first, step, frame_bytes))
     }
 }
 
@@ -1928,16 +2086,141 @@ mod tests {
         };
         let mut fifo = [0_i32; 8];
         let mut queued = 0;
-        let accepted = copy_into_fifo(&mut fifo, &mut queued, 4, &area, 0, 3, 2)
+        let accepted = copy_into_fifo(&mut fifo, 0, &mut queued, 4, &area, 0, 3, 2)
             .expect("prepared frames should copy");
 
         assert_eq!(accepted, 3);
         assert_eq!(queued, 3);
         assert_eq!(&fifo[..6], &source[..6]);
         assert_eq!(
-            copy_into_fifo(&mut fifo, &mut queued, 3, &area, 3, 1, 2)
+            copy_into_fifo(&mut fifo, 0, &mut queued, 3, &area, 3, 1, 2)
                 .expect("full FIFO should accept no additional frames"),
             0
+        );
+    }
+
+    #[test]
+    fn playback_fifo_ring_wraps_copies_discards_forward_and_padding() {
+        let channels = 2;
+        let period = 4;
+        let capacity = 8;
+        let mut fifo = vec![0_i32; capacity * channels];
+        let mut head = 0_usize;
+        let mut queued = 0_usize;
+
+        let first = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let area = SideAlsaChannelArea {
+            addr: first.as_ptr().cast_mut().cast(),
+            first: 0,
+            step: (channels * 32) as c_uint,
+        };
+        assert_eq!(
+            copy_into_fifo(
+                &mut fifo,
+                head,
+                &mut queued,
+                capacity,
+                &area,
+                0,
+                6,
+                channels
+            )
+            .unwrap(),
+            6
+        );
+        discard_playback_fifo_periods(&mut head, &mut queued, capacity, 1, period).unwrap();
+        assert_eq!((head, queued), (4, 2));
+
+        let wrap = [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24];
+        let wrap_area = SideAlsaChannelArea {
+            addr: wrap.as_ptr().cast_mut().cast(),
+            first: 0,
+            step: (channels * 32) as c_uint,
+        };
+        assert_eq!(
+            copy_into_fifo(
+                &mut fifo,
+                head,
+                &mut queued,
+                capacity,
+                &wrap_area,
+                0,
+                5,
+                channels
+            )
+            .unwrap(),
+            5
+        );
+        assert_eq!((head, queued), (4, 7));
+        assert_eq!(
+            &fifo[head * channels..(head + period) * channels],
+            &[9, 10, 11, 12, 13, 14, 15, 16]
+        );
+
+        pad_final_playback_period(&mut fifo, head, &mut queued, capacity, period, channels)
+            .unwrap();
+        assert_eq!((head, queued), (4, 8));
+        discard_playback_fifo_periods(&mut head, &mut queued, capacity, 1, period).unwrap();
+        assert_eq!((head, queued), (0, 4));
+        assert_eq!(
+            &fifo[head * channels..(head + period) * channels],
+            &[17, 18, 19, 20, 21, 22, 0, 0]
+        );
+
+        discard_playback_fifo_periods(&mut head, &mut queued, capacity, 1, period).unwrap();
+        assert_eq!((head, queued), (0, 0));
+
+        // Wrap-around zero-fill via forward_playback helper.
+        head = 4;
+        queued = 2;
+        fifo.fill(-1);
+        zero_fill_fifo_tail(&mut fifo, head, queued, capacity, 4, channels).unwrap();
+        assert_eq!(&fifo[12..16], &[0; 4]);
+        assert_eq!(&fifo[0..4], &[0; 4]);
+        assert_eq!(&fifo[4..12], &[-1; 8]);
+    }
+
+    #[test]
+    #[ignore = "release-mode playback FIFO ring vs linear-shift microbenchmark"]
+    fn benchmark_playback_fifo_flush() {
+        use std::{hint::black_box, time::Instant};
+
+        let channels = 8;
+        let period = 64;
+        let capacity = 512;
+        let iterations = 500_000_u128;
+
+        let mut linear_fifo = vec![0_i32; capacity * channels];
+        let mut linear_queued = capacity;
+        let start = Instant::now();
+        for i in 0..iterations {
+            if linear_queued < period * 2 {
+                linear_queued = capacity;
+            }
+            let samples = period * channels;
+            let remaining = (linear_queued - period) * channels;
+            linear_fifo.copy_within(samples..samples + remaining, 0);
+            linear_queued -= period;
+            black_box(linear_fifo[0].wrapping_add(i as i32));
+        }
+        let linear_ns = start.elapsed().as_nanos() / iterations;
+
+        let mut ring_fifo = vec![0_i32; capacity * channels];
+        let mut ring_head = 0_usize;
+        let mut ring_queued = capacity;
+        let start = Instant::now();
+        for i in 0..iterations {
+            if ring_queued < period * 2 {
+                ring_queued = capacity;
+            }
+            discard_playback_fifo_periods(&mut ring_head, &mut ring_queued, capacity, 1, period)
+                .unwrap();
+            black_box(ring_fifo[ring_head * channels].wrapping_add(i as i32));
+        }
+        black_box(&mut ring_fifo);
+        let ring_ns = start.elapsed().as_nanos() / iterations;
+        eprintln!(
+            "ALSA Q64 8ch FIFO discard (512f buffer): linear_shift={linear_ns} ns, ring_advance={ring_ns} ns"
         );
     }
 
@@ -2001,18 +2284,19 @@ mod tests {
             }
         );
 
-        let mut fifo = [10, 11, 20, 21, 30, 31];
+        let fifo = [10, 11, 20, 21, 30, 31];
+        let mut head = 0;
         let mut queued_frames = 6;
-        discard_playback_fifo_periods(&mut fifo, &mut queued_frames, 2, 2, 1)
+        discard_playback_fifo_periods(&mut head, &mut queued_frames, 6, 2, 2)
             .expect("expired periods should be discarded");
         assert_eq!(queued_frames, 2);
-        assert_eq!(&fifo[..2], &[30, 31]);
+        assert_eq!(&fifo[head..head + queued_frames], &[30, 31]);
 
-        let mut exhausted_fifo = [10, 11];
+        let mut exhausted_head = 0;
         let mut exhausted_frames = 2;
-        discard_playback_fifo_periods(&mut exhausted_fifo, &mut exhausted_frames, 3, 2, 1)
+        discard_playback_fifo_periods(&mut exhausted_head, &mut exhausted_frames, 2, 3, 2)
             .expect("expiry beyond the queue should discard the whole queue");
-        assert_eq!(exhausted_frames, 0);
+        assert_eq!((exhausted_head, exhausted_frames), (0, 0));
 
         assert_eq!(
             expired_playback_action(false, 1, 3),
@@ -2031,11 +2315,13 @@ mod tests {
         assert_eq!(realigned_playback_sequence(104, 1, 1), 104);
         assert_eq!(realigned_playback_sequence(1, 3, 1), u64::MAX);
 
-        let mut partial_fifo = [10, 11, 20, 21, 30];
+        let partial_fifo = [10, 11, 20, 21, 30];
+        let mut partial_head = 0;
         let mut partial_frames = 5;
-        discard_playback_fifo_periods(&mut partial_fifo, &mut partial_frames, 2, 2, 1)
+        discard_playback_fifo_periods(&mut partial_head, &mut partial_frames, 5, 2, 2)
             .expect("complete expired periods should leave a partial period queued");
         assert_eq!(partial_frames, 1);
+        assert_eq!(partial_fifo[partial_head], 30);
     }
 
     #[test]
@@ -2104,7 +2390,7 @@ mod tests {
         let mut fifo = [-1_i32; 16];
         let mut queued_frames = 6;
 
-        pad_final_playback_period(&mut fifo, &mut queued_frames, 4, 2)
+        pad_final_playback_period(&mut fifo, 0, &mut queued_frames, 8, 4, 2)
             .expect("final playback period should fit");
 
         assert_eq!(queued_frames, 8);
