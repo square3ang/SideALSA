@@ -342,7 +342,9 @@ pub fn write_request<W: Write>(writer: &mut W, request: &Request) -> Result<(), 
 }
 
 pub fn read_request<R: Read>(reader: &mut R) -> Result<Request, ProtocolError> {
-    decode_request(&read_frame(reader)?)
+    read_frame_payload(reader, |code, payload| {
+        decode_request_payload(RequestCode::try_from(code)?, payload)
+    })
 }
 
 pub fn write_response<W: Write>(writer: &mut W, response: &Response) -> Result<(), ProtocolError> {
@@ -351,17 +353,23 @@ pub fn write_response<W: Write>(writer: &mut W, response: &Response) -> Result<(
 }
 
 pub fn read_response<R: Read>(reader: &mut R) -> Result<Response, ProtocolError> {
-    decode_response(&read_frame(reader)?)
+    read_frame_payload(reader, |code, payload| {
+        decode_response_payload(ResponseCode::try_from(code)?, payload)
+    })
 }
 
 pub fn encode_request(request: &Request) -> Result<Vec<u8>, ProtocolError> {
-    let (code, payload) = encode_request_payload(request)?;
-    Ok(encode_frame(code as u16, &payload)?.into_iter().collect())
+    let (code, capacity) = request_header_and_capacity(request);
+    let mut frame = begin_frame(code as u16, capacity);
+    encode_request_payload(&mut frame, request)?;
+    finish_frame(frame)
 }
 
 pub fn encode_response(response: &Response) -> Result<Vec<u8>, ProtocolError> {
-    let (code, payload) = encode_response_payload(response)?;
-    encode_frame(code as u16, &payload)
+    let (code, capacity) = response_header_and_capacity(response);
+    let mut frame = begin_frame(code as u16, capacity);
+    encode_response_payload(&mut frame, response)?;
+    finish_frame(frame)
 }
 
 pub fn decode_request(frame: &[u8]) -> Result<Request, ProtocolError> {
@@ -374,21 +382,34 @@ pub fn decode_response(frame: &[u8]) -> Result<Response, ProtocolError> {
     decode_response_payload(ResponseCode::try_from(code)?, payload)
 }
 
-fn encode_frame(code: u16, payload: &[u8]) -> Result<Vec<u8>, ProtocolError> {
-    if payload.len() > MAX_FRAME_PAYLOAD {
-        return Err(ProtocolError::FrameTooLarge(payload.len()));
-    }
-    let mut frame = Vec::with_capacity(12 + payload.len());
+const FRAME_HEADER_LEN: usize = 12;
+
+fn begin_frame(code: u16, payload_capacity: usize) -> Vec<u8> {
+    let capacity = FRAME_HEADER_LEN.saturating_add(payload_capacity.min(MAX_FRAME_PAYLOAD));
+    let mut frame = Vec::with_capacity(capacity);
     frame.extend_from_slice(&PROTOCOL_MAGIC);
     frame.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
     frame.extend_from_slice(&code.to_le_bytes());
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(payload);
+    frame.extend_from_slice(&0_u32.to_le_bytes());
+    frame
+}
+
+fn finish_frame(mut frame: Vec<u8>) -> Result<Vec<u8>, ProtocolError> {
+    let payload_len = frame.len() - FRAME_HEADER_LEN;
+    if payload_len > MAX_FRAME_PAYLOAD {
+        return Err(ProtocolError::FrameTooLarge(payload_len));
+    }
+    frame[8..12].copy_from_slice(&(payload_len as u32).to_le_bytes());
     Ok(frame)
 }
 
-fn read_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, ProtocolError> {
-    let mut header = [0_u8; 12];
+fn read_frame_payload<R: Read, T>(
+    reader: &mut R,
+    decode: impl FnOnce(u16, &[u8]) -> Result<T, ProtocolError>,
+) -> Result<T, ProtocolError> {
+    const STACK_PAYLOAD_LIMIT: usize = 64;
+
+    let mut header = [0_u8; FRAME_HEADER_LEN];
     reader.read_exact(&mut header)?;
     if header[..4] != PROTOCOL_MAGIC {
         return Err(ProtocolError::InvalidMagic);
@@ -397,19 +418,26 @@ fn read_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, ProtocolError> {
     if version != PROTOCOL_VERSION {
         return Err(ProtocolError::UnsupportedVersion(version));
     }
+    let code = u16::from_le_bytes([header[6], header[7]]);
     let payload_len = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
     if payload_len > MAX_FRAME_PAYLOAD {
         return Err(ProtocolError::FrameTooLarge(payload_len));
     }
-    let mut frame = Vec::with_capacity(12 + payload_len);
-    frame.extend_from_slice(&header);
-    frame.resize(12 + payload_len, 0);
-    reader.read_exact(&mut frame[12..])?;
-    Ok(frame)
+    if payload_len == 0 {
+        return decode(code, &[]);
+    }
+    if payload_len <= STACK_PAYLOAD_LIMIT {
+        let mut payload = [0_u8; STACK_PAYLOAD_LIMIT];
+        reader.read_exact(&mut payload[..payload_len])?;
+        return decode(code, &payload[..payload_len]);
+    }
+    let mut payload = vec![0_u8; payload_len];
+    reader.read_exact(&mut payload)?;
+    decode(code, &payload)
 }
 
 fn decode_frame(frame: &[u8]) -> Result<(u16, &[u8]), ProtocolError> {
-    if frame.len() < 12 {
+    if frame.len() < FRAME_HEADER_LEN {
         return Err(ProtocolError::MalformedPayload);
     }
     if frame[..4] != PROTOCOL_MAGIC {
@@ -424,53 +452,46 @@ fn decode_frame(frame: &[u8]) -> Result<(u16, &[u8]), ProtocolError> {
     if payload_len > MAX_FRAME_PAYLOAD {
         return Err(ProtocolError::FrameTooLarge(payload_len));
     }
-    if frame.len() != 12 + payload_len {
+    if frame.len() != FRAME_HEADER_LEN + payload_len {
         return Err(ProtocolError::MalformedPayload);
     }
-    Ok((code, &frame[12..]))
+    Ok((code, &frame[FRAME_HEADER_LEN..]))
 }
 
-fn encode_request_payload(request: &Request) -> Result<(RequestCode, Vec<u8>), ProtocolError> {
-    let mut payload = Vec::new();
-    let code = match request {
-        Request::Hello { version } => {
-            put_u16(&mut payload, *version);
-            RequestCode::Hello
-        }
-        Request::GetInfo => RequestCode::GetInfo,
-        Request::OpenPro => RequestCode::OpenPro,
+fn request_header_and_capacity(request: &Request) -> (RequestCode, usize) {
+    match request {
+        Request::Hello { .. } => (RequestCode::Hello, 2),
+        Request::GetInfo => (RequestCode::GetInfo, 0),
+        Request::OpenPro => (RequestCode::OpenPro, 0),
+        Request::OpenProDirection { .. } => (RequestCode::OpenProDirection, 17),
+        Request::OpenShared { port_id } => (RequestCode::OpenShared, 2 + port_id.len()),
+        Request::Start { .. } => (RequestCode::Start, 8),
+        Request::StartProAligned { .. } => (RequestCode::StartProAligned, 8),
+        Request::Stop { .. } => (RequestCode::Stop, 8),
+        Request::Close { .. } => (RequestCode::Close, 8),
+        Request::GetStats => (RequestCode::GetStats, 0),
+    }
+}
+
+fn encode_request_payload(payload: &mut Vec<u8>, request: &Request) -> Result<(), ProtocolError> {
+    match request {
+        Request::Hello { version } => put_u16(payload, *version),
+        Request::GetInfo | Request::OpenPro | Request::GetStats => {}
         Request::OpenProDirection {
             direction,
             group_token,
         } => {
-            put_u8(&mut payload, *direction as u8);
-            put_u64(&mut payload, group_token[0]);
-            put_u64(&mut payload, group_token[1]);
-            RequestCode::OpenProDirection
+            put_u8(payload, *direction as u8);
+            put_u64(payload, group_token[0]);
+            put_u64(payload, group_token[1]);
         }
-        Request::OpenShared { port_id } => {
-            put_string(&mut payload, port_id)?;
-            RequestCode::OpenShared
-        }
-        Request::Start { session_id } => {
-            put_u64(&mut payload, *session_id);
-            RequestCode::Start
-        }
-        Request::StartProAligned { session_id } => {
-            put_u64(&mut payload, *session_id);
-            RequestCode::StartProAligned
-        }
-        Request::Stop { session_id } => {
-            put_u64(&mut payload, *session_id);
-            RequestCode::Stop
-        }
-        Request::Close { session_id } => {
-            put_u64(&mut payload, *session_id);
-            RequestCode::Close
-        }
-        Request::GetStats => RequestCode::GetStats,
-    };
-    Ok((code, payload))
+        Request::OpenShared { port_id } => put_string(payload, port_id)?,
+        Request::Start { session_id }
+        | Request::StartProAligned { session_id }
+        | Request::Stop { session_id }
+        | Request::Close { session_id } => put_u64(payload, *session_id),
+    }
+    Ok(())
 }
 
 fn decode_request_payload(code: RequestCode, payload: &[u8]) -> Result<Request, ProtocolError> {
@@ -506,57 +527,92 @@ fn decode_request_payload(code: RequestCode, payload: &[u8]) -> Result<Request, 
     Ok(request)
 }
 
-fn encode_response_payload(response: &Response) -> Result<(ResponseCode, Vec<u8>), ProtocolError> {
-    let mut payload = Vec::new();
-    let code = match response {
+fn ports_encoded_len(ports: &[PortInfo]) -> usize {
+    ports.iter().fold(2_usize, |acc, port| {
+        acc.saturating_add(2)
+            .saturating_add(port.id.len())
+            .saturating_add(2)
+            .saturating_add(port.name.len())
+            .saturating_add(2)
+            .saturating_add(port.channels.len().saturating_mul(4))
+    })
+}
+
+fn response_header_and_capacity(response: &Response) -> (ResponseCode, usize) {
+    const SHARED_INFO_LEN: usize = 8 + 4 * 4 + 3 * 8;
+    const STATS_FIXED_LEN: usize = 50 * 8 + 2;
+    const SHARED_PORT_STATS_FIXED_LEN: usize = 2 + 8 * 8;
+
+    match response {
+        Response::OpenProDirection { .. } => (ResponseCode::OpenProDirection, 9 + SHARED_INFO_LEN),
+        Response::Hello { .. } => (ResponseCode::Hello, 6),
+        Response::Info(info) => (
+            ResponseCode::Info,
+            2_usize
+                .saturating_add(info.name.len())
+                .saturating_add(8 + 11 * 4)
+                .saturating_add(ports_encoded_len(&info.playback_ports))
+                .saturating_add(ports_encoded_len(&info.capture_ports)),
+        ),
+        Response::OpenPro { .. } => (ResponseCode::OpenPro, 8 + SHARED_INFO_LEN),
+        Response::OpenShared { .. } => (ResponseCode::OpenShared, 9 + SHARED_INFO_LEN),
+        Response::Ack => (ResponseCode::Ack, 0),
+        Response::Busy => (ResponseCode::Busy, 0),
+        Response::Unsupported => (ResponseCode::Unsupported, 0),
+        Response::Stats(stats) => (
+            ResponseCode::Stats,
+            stats
+                .shared_playback_ports
+                .iter()
+                .fold(STATS_FIXED_LEN, |acc, port| {
+                    acc.saturating_add(SHARED_PORT_STATS_FIXED_LEN)
+                        .saturating_add(port.port_id.len())
+                }),
+        ),
+        Response::Error { message, .. } => (ResponseCode::Error, 4 + message.len()),
+    }
+}
+
+fn encode_response_payload(
+    payload: &mut Vec<u8>,
+    response: &Response,
+) -> Result<(), ProtocolError> {
+    match response {
         Response::OpenProDirection {
             session_id,
             direction,
             shared,
         } => {
-            put_u64(&mut payload, *session_id);
-            put_u8(&mut payload, *direction as u8);
-            encode_shared_info(&mut payload, shared);
-            ResponseCode::OpenProDirection
+            put_u64(payload, *session_id);
+            put_u8(payload, *direction as u8);
+            encode_shared_info(payload, shared);
         }
         Response::Hello { version, features } => {
-            put_u16(&mut payload, *version);
-            put_u32(&mut payload, *features);
-            ResponseCode::Hello
+            put_u16(payload, *version);
+            put_u32(payload, *features);
         }
-        Response::Info(info) => {
-            encode_info(&mut payload, info)?;
-            ResponseCode::Info
-        }
+        Response::Info(info) => encode_info(payload, info)?,
         Response::OpenPro { session_id, shared } => {
-            put_u64(&mut payload, *session_id);
-            encode_shared_info(&mut payload, shared);
-            ResponseCode::OpenPro
+            put_u64(payload, *session_id);
+            encode_shared_info(payload, shared);
         }
         Response::OpenShared {
             session_id,
             direction,
             shared,
         } => {
-            put_u64(&mut payload, *session_id);
-            put_u8(&mut payload, *direction as u8);
-            encode_shared_info(&mut payload, shared);
-            ResponseCode::OpenShared
+            put_u64(payload, *session_id);
+            put_u8(payload, *direction as u8);
+            encode_shared_info(payload, shared);
         }
-        Response::Ack => ResponseCode::Ack,
-        Response::Busy => ResponseCode::Busy,
-        Response::Unsupported => ResponseCode::Unsupported,
-        Response::Stats(stats) => {
-            encode_stats(&mut payload, stats)?;
-            ResponseCode::Stats
-        }
+        Response::Ack | Response::Busy | Response::Unsupported => {}
+        Response::Stats(stats) => encode_stats(payload, stats)?,
         Response::Error { code, message } => {
-            put_u16(&mut payload, *code as u16);
-            put_string(&mut payload, message)?;
-            ResponseCode::Error
+            put_u16(payload, *code as u16);
+            put_string(payload, message)?;
         }
-    };
-    Ok((code, payload))
+    }
+    Ok(())
 }
 
 fn decode_response_payload(code: ResponseCode, payload: &[u8]) -> Result<Response, ProtocolError> {
@@ -650,12 +706,12 @@ fn encode_ports(payload: &mut Vec<u8>, ports: &[PortInfo]) -> Result<(), Protoco
 
 fn decode_ports(decoder: &mut Decoder<'_>) -> Result<Vec<PortInfo>, ProtocolError> {
     let count = decoder.u16()? as usize;
-    let mut ports = Vec::with_capacity(count);
+    let mut ports = Vec::with_capacity(count.min(decoder.remaining() / 6));
     for _ in 0..count {
         let id = decoder.string()?;
         let name = decoder.string()?;
         let channel_count = decoder.u16()? as usize;
-        let mut channels = Vec::with_capacity(channel_count);
+        let mut channels = Vec::with_capacity(channel_count.min(decoder.remaining() / 4));
         for _ in 0..channel_count {
             channels.push(decoder.u32()?);
         }
@@ -819,7 +875,9 @@ fn decode_stats(decoder: &mut Decoder<'_>) -> Result<Stats, ProtocolError> {
         shared_playback_ports: Vec::new(),
     };
     let port_count = decoder.u16()? as usize;
-    stats.shared_playback_ports.reserve(port_count);
+    stats
+        .shared_playback_ports
+        .reserve(port_count.min(decoder.remaining() / 66));
     for _ in 0..port_count {
         stats.shared_playback_ports.push(SharedPlaybackPortStats {
             port_id: decoder.string()?,
@@ -902,6 +960,10 @@ impl<'a> Decoder<'a> {
         Ok(u64::from_le_bytes(self.take()?))
     }
 
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.position
+    }
+
     fn string(&mut self) -> Result<String, ProtocolError> {
         let length = self.u16()? as usize;
         let end = self
@@ -913,7 +975,9 @@ impl<'a> Decoder<'a> {
             .get(self.position..end)
             .ok_or(ProtocolError::MalformedPayload)?;
         self.position = end;
-        String::from_utf8(bytes.to_vec()).map_err(|_| ProtocolError::MalformedPayload)
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| ProtocolError::MalformedPayload)
     }
 
     fn finish(&self) -> Result<(), ProtocolError> {
@@ -1081,6 +1145,7 @@ impl SharedRegionLayout {
         })
     }
 
+    #[inline]
     pub fn info(&self) -> SharedRegionInfo {
         SharedRegionInfo {
             size: self.size as u64,
@@ -1094,26 +1159,32 @@ impl SharedRegionLayout {
         }
     }
 
+    #[inline]
     pub fn size(&self) -> usize {
         self.size
     }
 
+    #[inline]
     pub fn slot_stride(&self) -> usize {
         self.slot_stride
     }
 
+    #[inline]
     pub fn capture_offset(&self) -> usize {
         self.capture_offset
     }
 
+    #[inline]
     pub fn playback_offset(&self) -> usize {
         self.playback_offset
     }
 
+    #[inline]
     pub fn slot_count(&self) -> usize {
         self.slot_count as usize
     }
 
+    #[inline]
     pub fn slot_offset(&self, ring_offset: usize, index: usize) -> Option<usize> {
         if index >= self.slot_count as usize {
             return None;
@@ -1139,6 +1210,7 @@ pub fn shared_slot_header_alignment() -> usize {
 
 /// Orders wrapping sequence numbers by forward distance; values exactly half
 /// the u64 range apart have no order.
+#[inline]
 pub fn sequence_order(candidate: u64, reference: u64) -> Option<Ordering> {
     const HALF_RANGE: u64 = 1_u64 << 63;
 
@@ -1154,12 +1226,15 @@ pub fn sequence_order(candidate: u64, reference: u64) -> Option<Ordering> {
     }
 }
 
+#[inline]
 pub fn sequence_is_after(candidate: u64, reference: u64) -> bool {
-    sequence_order(candidate, reference) == Some(Ordering::Greater)
+    let distance = candidate.wrapping_sub(reference);
+    distance != 0 && distance < (1_u64 << 63)
 }
 
+#[inline]
 pub fn sequence_is_before(candidate: u64, reference: u64) -> bool {
-    sequence_order(candidate, reference) == Some(Ordering::Less)
+    candidate.wrapping_sub(reference) > (1_u64 << 63)
 }
 
 #[cfg(test)]
@@ -1351,5 +1426,80 @@ mod tests {
             decode_request(truncated),
             Err(ProtocolError::MalformedPayload)
         ));
+    }
+
+    #[test]
+    fn sequence_predicates_match_sequence_order_on_boundaries() {
+        let half = 1_u64 << 63;
+        let samples = [0, 1, 2, half - 1, half, half + 1, u64::MAX - 1, u64::MAX];
+        for candidate in samples {
+            for reference in samples {
+                assert_eq!(
+                    sequence_is_after(candidate, reference),
+                    sequence_order(candidate, reference) == Some(Ordering::Greater)
+                );
+                assert_eq!(
+                    sequence_is_before(candidate, reference),
+                    sequence_order(candidate, reference) == Some(Ordering::Less)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stream_helpers_cover_empty_stack_and_heap_payloads_and_reject_bad_utf8() {
+        for response in [
+            Response::Ack,
+            Response::Hello {
+                version: PROTOCOL_VERSION,
+                features: FEATURE_PRO | FEATURE_SHARED,
+            },
+            Response::Error {
+                code: ErrorCode::InvalidRequest,
+                message: "x".repeat(128),
+            },
+        ] {
+            let mut wire = Vec::new();
+            write_response(&mut wire, &response).expect("response should write");
+            let decoded = read_response(&mut Cursor::new(wire)).expect("response should read");
+            assert_eq!(decoded, response);
+        }
+
+        // Invalid UTF-8 in OpenShared port_id must fail cleanly before allocation.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&PROTOCOL_MAGIC);
+        bad.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+        bad.extend_from_slice(&(RequestCode::OpenShared as u16).to_le_bytes());
+        bad.extend_from_slice(&4_u32.to_le_bytes());
+        bad.extend_from_slice(&2_u16.to_le_bytes());
+        bad.extend_from_slice(&[0xff, 0xfe]);
+        assert!(matches!(
+            read_request(&mut Cursor::new(bad)),
+            Err(ProtocolError::MalformedPayload)
+        ));
+    }
+
+    #[test]
+    #[ignore = "release-mode protocol Stats roundtrip microbenchmark"]
+    fn benchmark_protocol_stats_roundtrip() {
+        const ITERATIONS: u64 = 50_000;
+        let response = Response::Stats(Box::new(Stats {
+            shared_playback_ports: (0..4)
+                .map(|i| SharedPlaybackPortStats {
+                    port_id: format!("line{}", i + 1),
+                    underruns: i,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }));
+        let started = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            let bytes = encode_response(&response).unwrap();
+            let decoded = read_response(&mut Cursor::new(bytes.as_slice())).unwrap();
+            std::hint::black_box(decoded);
+        }
+        let ns = started.elapsed().as_nanos() / u128::from(ITERATIONS);
+        println!("stats_roundtrip_ns={ns}");
     }
 }

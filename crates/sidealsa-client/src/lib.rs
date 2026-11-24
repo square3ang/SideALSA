@@ -11,7 +11,7 @@ use std::{
     path::Path,
     sync::{
         OnceLock,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU8, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -24,6 +24,59 @@ use sidealsa_protocol::{
 use thiserror::Error;
 
 const EVENTFD_IO_ATTEMPTS: usize = 2;
+
+const ATFORK_UNINIT: u8 = 0;
+const ATFORK_REGISTERING: u8 = 1;
+const ATFORK_READY: u8 = 2;
+const ATFORK_FAILED: u8 = 3;
+
+static CACHED_PID: AtomicU32 = AtomicU32::new(0);
+static ATFORK_STATE: AtomicU8 = AtomicU8::new(ATFORK_UNINIT);
+
+extern "C" fn reset_cached_pid_after_fork() {
+    CACHED_PID.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+fn current_pid() -> u32 {
+    let pid = CACHED_PID.load(Ordering::Relaxed);
+    if pid != 0 {
+        return pid;
+    }
+    refresh_cached_pid()
+}
+
+#[cold]
+fn refresh_cached_pid() -> u32 {
+    let pid = std::process::id();
+    match ATFORK_STATE.load(Ordering::Acquire) {
+        ATFORK_READY => {
+            CACHED_PID.store(pid, Ordering::Relaxed);
+        }
+        ATFORK_UNINIT
+            if ATFORK_STATE
+                .compare_exchange(
+                    ATFORK_UNINIT,
+                    ATFORK_REGISTERING,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_ok() =>
+        {
+            let registered =
+                unsafe { libc::pthread_atfork(None, None, Some(reset_cached_pid_after_fork)) };
+            if registered == 0 {
+                ATFORK_STATE.store(ATFORK_READY, Ordering::Release);
+                let fresh = std::process::id();
+                CACHED_PID.store(fresh, Ordering::Relaxed);
+                return fresh;
+            }
+            ATFORK_STATE.store(ATFORK_FAILED, Ordering::Release);
+        }
+        _ => {}
+    }
+    pid
+}
 
 struct ProTokenState {
     owner_pid: AtomicU32,
@@ -202,7 +255,7 @@ impl SideAlsaClient {
     }
 
     fn connect_inner(path: &Path, timeout: Option<Duration>) -> Result<Self, ClientError> {
-        let creator_pid = std::process::id();
+        let creator_pid = current_pid();
         let mut control = UnixStream::connect(path)?;
         // Only root (system daemon) or this user (dev daemon) may serve audio to us.
         let peer_uid = socket_peer_credentials(&control)?.uid;
@@ -395,7 +448,7 @@ impl AudioStream {
             mode,
             pro_direction: None,
             aligned_start_supported: false,
-            creator_pid: std::process::id(),
+            creator_pid: current_pid(),
             info,
             region,
             capture_event: EventFd::from_owned(capture_event),
@@ -422,31 +475,38 @@ impl AudioStream {
     }
 
     /// A forked child shares the parent's control socket and must never act on its session.
+    #[inline]
     fn inherited(&self) -> bool {
-        self.creator_pid != std::process::id()
+        self.creator_pid != current_pid()
     }
 
+    #[inline]
     fn buffered_capture(&self) -> bool {
         self.mode == StreamMode::Shared(PortDirection::Capture)
             || self.pro_direction == Some(PortDirection::Capture)
     }
 
+    #[inline]
     pub fn info(&self) -> SharedRegionInfo {
         self.info
     }
 
+    #[inline]
     pub fn cycle_sequence(&self) -> u64 {
         self.region.cycle_sequence()
     }
 
+    #[inline]
     pub fn playback_sequence(&self) -> u64 {
         self.region.playback_sequence()
     }
 
+    #[inline]
     pub fn hardware_generation(&self) -> u64 {
         self.region.hardware_generation()
     }
 
+    #[inline]
     pub fn activation_sequence(&self) -> Option<u64> {
         self.region
             .activation_ready()
@@ -477,6 +537,7 @@ impl AudioStream {
         self.region.record_client_realtime_failure();
     }
 
+    #[inline]
     pub fn record_callback_timing(&self, duration_nanos: u64, period_nanos: u64) {
         if self.inherited() {
             return;
@@ -631,32 +692,40 @@ impl AudioStream {
         if self.info.playback_channels == 0 {
             return Err(ClientError::MissingDirection("playback"));
         }
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .unwrap_or_else(Instant::now);
+        let mut deadline = None;
+        let mut drained = false;
         loop {
             self.refresh_generation();
             self.check_hardware_generation()?;
             self.check_capture_discontinuity()?;
-            if self.info.capture_channels > 0 {
-                self.capture_event.drain();
-            } else {
-                self.playback_event.drain();
+            if !drained {
+                if self.info.capture_channels > 0 {
+                    self.capture_event.drain();
+                } else {
+                    self.playback_event.drain();
+                }
             }
             let generation = self.lifecycle_generation;
             let sequence = self.region.cycle_sequence();
             // Free unused input even when startup cannot accept this cycle;
             // otherwise a full capture ring can suppress all subsequent wakes.
-            if self.info.capture_channels > 0 {
+            let playback_sequence = if self.info.capture_channels > 0 {
+                let playback_sequence = self.region.playback_sequence();
                 self.region
-                    .discard_capture_through(sequence, self.region.playback_sequence());
-            }
-            if self
-                .activation_sequence()
-                .is_some_and(|start| sequence_is_before(start, sequence))
-                && self.last_sequence != Some(sequence)
+                    .discard_capture_through(sequence, playback_sequence);
+                Some(playback_sequence)
+            } else {
+                None
+            };
+            if self.last_sequence != Some(sequence)
+                && self
+                    .activation_sequence()
+                    .is_some_and(|start| sequence_is_before(start, sequence))
                 && (self.last_sequence.is_some()
-                    || !sequence_is_before(sequence, self.region.playback_sequence()))
+                    || !sequence_is_before(
+                        sequence,
+                        playback_sequence.unwrap_or_else(|| self.region.playback_sequence()),
+                    ))
             {
                 self.check_hardware_generation()?;
                 if self.region.lifecycle_generation() != generation {
@@ -670,85 +739,101 @@ impl AudioStream {
             } else {
                 &self.playback_event
             };
-            let wait = event.wait_until(self.control.as_raw_fd(), deadline);
+            let wait = event.wait_until(self.control.as_raw_fd(), timeout, &mut deadline);
             if matches!(&wait, Err(ClientError::Closed)) {
                 self.poison_control();
             }
-            wait?;
+            let wait = wait?;
+            drained = wait == EventWait::Notified;
         }
     }
 
     pub fn wait_period(&mut self, timeout: Duration) -> Result<u64, ClientError> {
         self.ensure_started()?;
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .unwrap_or_else(Instant::now);
+        let mut deadline = None;
+        let mut drained = false;
         loop {
             self.refresh_generation();
             self.check_hardware_generation()?;
             self.check_capture_discontinuity()?;
             if self.pro_direction == Some(PortDirection::Playback) {
-                self.playback_event.drain();
+                if !drained {
+                    self.playback_event.drain();
+                }
                 let generation = self.lifecycle_generation;
-                if self.has_ready_pro_playback() {
-                    let sequence = self.region.cycle_sequence();
+                let sequence = self.region.cycle_sequence();
+                if self.last_sequence != Some(sequence)
+                    && self
+                        .activation_sequence()
+                        .is_some_and(|start| sequence_is_before(start, sequence))
+                    && !sequence_is_before(sequence, self.region.playback_sequence())
+                {
                     self.check_hardware_generation()?;
-                    if self.region.lifecycle_generation() != generation
-                        || self.last_sequence == Some(sequence)
-                        || !self
-                            .activation_sequence()
-                            .is_some_and(|start| sequence_is_before(start, sequence))
-                        || sequence_is_before(sequence, self.region.playback_sequence())
-                    {
+                    if self.region.lifecycle_generation() != generation {
                         continue;
                     }
                     self.last_sequence = Some(sequence);
                     return Ok(sequence);
                 }
-                let wait = self
-                    .playback_event
-                    .wait_until(self.control.as_raw_fd(), deadline);
+                let wait = self.playback_event.wait_until(
+                    self.control.as_raw_fd(),
+                    timeout,
+                    &mut deadline,
+                );
                 if matches!(&wait, Err(ClientError::Closed)) {
                     self.poison_control();
                 }
-                wait?;
+                let wait = wait?;
+                drained = wait == EventWait::Notified;
                 continue;
             }
             if self.info.capture_channels > 0 {
-                let ready_sequence = match self.mode {
+                let (ready_sequence, has_more) = match self.mode {
                     StreamMode::Pro if !self.buffered_capture() => self
                         .region
-                        .oldest_valid_client_capture_sequence(self.region.playback_sequence()),
-                    _ => self.region.next_client_capture_sequence(self.capture_index),
+                        .oldest_valid_client_capture_sequence_with_remaining(
+                            self.region.playback_sequence(),
+                        ),
+                    _ => self
+                        .region
+                        .next_client_capture_sequence_with_remaining(self.capture_index),
                 };
                 if let Some(sequence) = ready_sequence
                     && self.last_sequence != Some(sequence)
                 {
-                    self.capture_event.drain();
-                    if self.region.has_multiple_ready_capture_slots() {
-                        self.capture_event.notify()?;
+                    if drained {
+                        if has_more {
+                            self.capture_event.notify()?;
+                        }
+                    } else {
+                        self.capture_event.drain();
+                        if self.region.has_multiple_ready_capture_slots() {
+                            self.capture_event.notify()?;
+                        }
                     }
                     self.last_sequence = Some(sequence);
                     return Ok(sequence);
                 }
-                let wait = self
-                    .capture_event
-                    .wait_until(self.control.as_raw_fd(), deadline);
+                let wait =
+                    self.capture_event
+                        .wait_until(self.control.as_raw_fd(), timeout, &mut deadline);
                 if matches!(&wait, Err(ClientError::Closed)) {
                     self.poison_control();
                 }
-                if wait? == EventWait::Spurious {
-                    continue;
-                }
+                let wait = wait?;
+                drained = wait == EventWait::Notified;
+                continue;
             } else if self.info.playback_channels > 0 {
                 if self.mode == StreamMode::Shared(PortDirection::Playback) {
                     // Timer-driven clients may observe the new hardware cycle
                     // before its eventfd notification. Do not hold a ready batch
                     // for another graph quantum merely because the hint is late.
-                    self.playback_event.drain();
+                    if !drained {
+                        self.playback_event.drain();
+                    }
                     let generation = self.lifecycle_generation;
                     let sequence = self.region.cycle_sequence();
-                    if self.region.activation_ready() && self.last_sequence != Some(sequence) {
+                    if self.last_sequence != Some(sequence) && self.region.activation_ready() {
                         self.check_hardware_generation()?;
                         if self.region.lifecycle_generation() != generation {
                             continue;
@@ -757,13 +842,17 @@ impl AudioStream {
                         return Ok(sequence);
                     }
                 }
-                let wait = self
-                    .playback_event
-                    .wait_until(self.control.as_raw_fd(), deadline);
+                let wait = self.playback_event.wait_until(
+                    self.control.as_raw_fd(),
+                    timeout,
+                    &mut deadline,
+                );
                 if matches!(&wait, Err(ClientError::Closed)) {
                     self.poison_control();
                 }
-                if wait? == EventWait::Spurious {
+                let wait = wait?;
+                drained = wait == EventWait::Notified;
+                if wait == EventWait::Spurious {
                     continue;
                 }
             } else {
@@ -772,9 +861,6 @@ impl AudioStream {
             self.refresh_generation();
             self.check_hardware_generation()?;
             self.check_capture_discontinuity()?;
-            if self.info.capture_channels > 0 {
-                continue;
-            }
             let sequence = self.region.cycle_sequence();
             if self.last_sequence == Some(sequence) {
                 continue;
@@ -786,13 +872,15 @@ impl AudioStream {
 
     /// Shared-memory readiness hint only; no notification I/O. Acquisition must
     /// still use the normal generation/expiry checks and monitor daemon control.
+    #[inline]
     pub fn has_ready_capture(&self) -> bool {
         if self.inherited() || !self.started || self.closed || self.info.capture_channels == 0 {
             return false;
         }
         let minimum = (self.mode == StreamMode::Pro && !self.buffered_capture())
             .then(|| self.region.playback_sequence());
-        self.region.has_ready_capture_since(minimum)
+        self.region
+            .has_ready_capture_since(self.capture_index, minimum)
     }
 
     /// Nonblocking shared-memory hint for directional PRO playback's strict
@@ -800,6 +888,7 @@ impl AudioStream {
     /// cycle at the time of observation. No eventfd I/O; callers must still use
     /// wait_period for acquisition and generation checks, and monitor control_fd
     /// for daemon disconnects.
+    #[inline]
     pub fn has_ready_pro_playback(&self) -> bool {
         if self.inherited()
             || !self.started
@@ -809,14 +898,16 @@ impl AudioStream {
             return false;
         }
         let sequence = self.region.cycle_sequence();
-        self.activation_sequence()
-            .is_some_and(|start| sequence_is_before(start, sequence))
-            && self.last_sequence != Some(sequence)
+        self.last_sequence != Some(sequence)
+            && self
+                .activation_sequence()
+                .is_some_and(|start| sequence_is_before(start, sequence))
             && !sequence_is_before(sequence, self.region.playback_sequence())
     }
 
     /// Complete capture frames currently published in shared memory, excluding
     /// any caller-owned scratch buffer. This is not a generation/expiry check.
+    #[inline]
     pub fn capture_frames_ready(&self) -> u64 {
         if self.inherited() || self.info.capture_channels == 0 {
             return 0;
@@ -856,14 +947,8 @@ impl AudioStream {
     pub fn try_capture_buffer(&mut self, samples: &mut [i32]) -> Result<Option<u64>, ClientError> {
         self.ensure_started()?;
         self.capture_event.drain();
-        let sequence = self.capture_buffer(samples)?;
-        let next = match self.mode {
-            StreamMode::Pro if !self.buffered_capture() => self
-                .region
-                .oldest_valid_client_capture_sequence(self.region.playback_sequence()),
-            _ => self.region.next_client_capture_sequence(self.capture_index),
-        };
-        if next.is_some() {
+        let (sequence, has_more) = self.capture_buffer_checked(samples)?;
+        if has_more {
             self.capture_event.notify()?;
         }
         Ok(sequence)
@@ -871,37 +956,45 @@ impl AudioStream {
 
     pub fn capture_buffer(&mut self, samples: &mut [i32]) -> Result<Option<u64>, ClientError> {
         self.ensure_started()?;
+        Ok(self.capture_buffer_checked(samples)?.0)
+    }
+
+    fn capture_buffer_checked(
+        &mut self,
+        samples: &mut [i32],
+    ) -> Result<(Option<u64>, bool), ClientError> {
         self.refresh_generation();
         self.check_hardware_generation()?;
         self.check_capture_discontinuity()?;
         if self.info.capture_channels == 0 {
             return Err(ClientError::MissingDirection("capture"));
         }
-        let sequence = match self.mode {
+        let (sequence, has_more) = match self.mode {
             StreamMode::Pro if !self.buffered_capture() => loop {
                 let minimum_sequence = self.region.playback_sequence();
-                let sequence = self.region.try_client_read_valid_capture(
-                    &mut self.capture_index,
-                    minimum_sequence,
-                    samples,
-                );
+                let (sequence, has_more) =
+                    self.region.try_client_read_valid_capture_with_remaining(
+                        &mut self.capture_index,
+                        minimum_sequence,
+                        samples,
+                    );
                 let Some(sequence) = sequence else {
-                    break None;
+                    break (None, has_more);
                 };
                 if sequence_is_before(sequence, self.region.playback_sequence()) {
                     self.region.record_client_expired_capture_block();
                     continue;
                 }
-                break Some(sequence);
+                break (Some(sequence), has_more);
             },
             _ => self
                 .region
-                .try_client_read_capture(&mut self.capture_index, samples),
+                .try_client_read_capture_with_remaining(&mut self.capture_index, samples),
         };
         if sequence.is_some() {
             self.last_sequence = sequence;
         }
-        Ok(sequence)
+        Ok((sequence, has_more))
     }
 
     pub fn capture_buffer_for_sequence(
@@ -909,8 +1002,9 @@ impl AudioStream {
         expected_sequence: u64,
         samples: &mut [i32],
     ) -> Result<Option<u64>, ClientError> {
+        self.ensure_started()?;
         loop {
-            let Some(sequence) = self.capture_buffer(samples)? else {
+            let Some(sequence) = self.capture_buffer_checked(samples)?.0 else {
                 return Ok(None);
             };
             if !sequence_is_before(sequence, expected_sequence) {
@@ -926,11 +1020,19 @@ impl AudioStream {
             StreamMode::Pro => sequence,
             StreamMode::Shared(_) => sequence.wrapping_add(1),
         };
-        self.submit_playback(sequence, samples)
+        self.submit_playback_checked(sequence, samples)
     }
 
     pub fn submit_playback(&mut self, sequence: u64, samples: &[i32]) -> Result<bool, ClientError> {
         self.ensure_started()?;
+        self.submit_playback_checked(sequence, samples)
+    }
+
+    fn submit_playback_checked(
+        &mut self,
+        sequence: u64,
+        samples: &[i32],
+    ) -> Result<bool, ClientError> {
         if self.info.playback_channels == 0 {
             return Err(ClientError::MissingDirection("playback"));
         }
@@ -943,6 +1045,7 @@ impl AudioStream {
         Ok(published)
     }
 
+    #[inline]
     fn ensure_open(&self) -> Result<(), ClientError> {
         if self.inherited() {
             return Err(ClientError::ForkedProcess);
@@ -954,6 +1057,7 @@ impl AudioStream {
         }
     }
 
+    #[inline]
     fn ensure_started(&self) -> Result<(), ClientError> {
         self.ensure_open()?;
         if self.started {
@@ -1045,7 +1149,7 @@ impl AudioStream {
 
 impl Drop for AudioStream {
     fn drop(&mut self) {
-        if self.inherited() {
+        if self.creator_pid != std::process::id() {
             return;
         }
         if !self.closed {
@@ -1079,7 +1183,12 @@ impl EventFd {
         self.fd.as_raw_fd()
     }
 
-    fn wait_until(&self, control_fd: RawFd, deadline: Instant) -> Result<EventWait, ClientError> {
+    fn wait_until(
+        &self,
+        control_fd: RawFd,
+        timeout: Duration,
+        deadline: &mut Option<Instant>,
+    ) -> Result<EventWait, ClientError> {
         let mut pollfds = [
             libc::pollfd {
                 fd: self.as_raw_fd(),
@@ -1092,9 +1201,25 @@ impl EventFd {
                 revents: 0,
             },
         ];
+        let mut initial_remaining = if timeout.is_zero() {
+            Some(Duration::ZERO)
+        } else if deadline.is_none() {
+            *deadline = Some(
+                Instant::now()
+                    .checked_add(timeout)
+                    .unwrap_or_else(Instant::now),
+            );
+            Some(timeout)
+        } else {
+            None
+        };
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let timeout = if remaining.is_zero() {
+            let remaining = initial_remaining.take().unwrap_or_else(|| {
+                deadline.map_or(Duration::ZERO, |limit| {
+                    limit.saturating_duration_since(Instant::now())
+                })
+            });
+            let poll_timeout = if remaining.is_zero() {
                 0
             } else {
                 remaining
@@ -1106,8 +1231,13 @@ impl EventFd {
             };
             pollfds[0].revents = 0;
             pollfds[1].revents = 0;
-            let result =
-                unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout) };
+            let result = unsafe {
+                libc::poll(
+                    pollfds.as_mut_ptr(),
+                    pollfds.len() as libc::nfds_t,
+                    poll_timeout,
+                )
+            };
             if result > 0 {
                 if control_is_closed(control_fd, pollfds[1].revents)? {
                     return Err(ClientError::Closed);
@@ -3095,6 +3225,127 @@ mod tests {
 
         stream.closed = true;
         server.join().expect("server should not panic");
+    }
+
+    #[test]
+    fn pid_cache_invalidates_across_real_fork() {
+        const CHILD_ENV: &str = "SIDEALSA_TEST_FORK_PID_CACHE";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::pid_cache_invalidates_across_real_fork",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("isolated child process should run");
+            assert!(status.success(), "fork pid cache child test failed");
+            return;
+        }
+
+        let parent_pid = current_pid();
+        assert_eq!(parent_pid, std::process::id());
+        let (mut stream, _region, _peer) = directional_stream(PortDirection::Capture);
+        stream.started = true;
+        assert!(!stream.inherited());
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork should succeed");
+        if child == 0 {
+            let ok = current_pid() == std::process::id()
+                && current_pid() != parent_pid
+                && stream.inherited()
+                && matches!(
+                    stream.wait_period(Duration::ZERO),
+                    Err(ClientError::ForkedProcess)
+                );
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        stream.closed = true;
+    }
+
+    #[test]
+    fn try_capture_buffer_short_slice_preserves_notification() {
+        let server_region = SharedRegion::create(2, 0, 2).expect("region should create");
+        let client_fd = unsafe { libc::dup(server_region.fd()) };
+        assert!(client_fd >= 0);
+        let (_peer, control) = UnixStream::pair().expect("socket pair should create");
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Pro,
+            server_region.info(),
+            owned_fds([client_fd, event_fd(), event_fd(), event_fd()]),
+        )
+        .expect("stream should create");
+        stream.started = true;
+        let mut producer_index = 0;
+        assert!(server_region.try_publish_capture(&mut producer_index, 1, &[1, 2, 3, 4]));
+        stream.capture_event.notify().unwrap();
+
+        let mut short = [0; 2];
+        assert_eq!(stream.try_capture_buffer(&mut short).unwrap(), None);
+        let mut descriptor = libc::pollfd {
+            fd: stream.capture_event.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 1);
+        let mut full = [0; 4];
+        assert_eq!(stream.try_capture_buffer(&mut full).unwrap(), Some(1));
+        assert_eq!(full, [1, 2, 3, 4]);
+        stream.closed = true;
+    }
+
+    #[test]
+    fn blocking_capture_wait_rearms_when_multiple_slots_ready() {
+        let server_region = SharedRegion::create(1, 0, 1).expect("region should create");
+        let client_fd = unsafe { libc::dup(server_region.fd()) };
+        assert!(client_fd >= 0);
+        let capture_fd = event_fd();
+        let observed_capture_fd = unsafe { libc::dup(capture_fd) };
+        assert!(observed_capture_fd >= 0);
+        let (_peer, control) = UnixStream::pair().expect("socket pair should create");
+        let mut stream = AudioStream::from_parts(
+            control,
+            9,
+            StreamMode::Shared(PortDirection::Capture),
+            server_region.info(),
+            owned_fds([client_fd, capture_fd, event_fd(), event_fd()]),
+        )
+        .expect("stream should create");
+        stream.started = true;
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let seq = stream.wait_period(Duration::from_secs(1)).unwrap();
+            (stream, seq)
+        });
+        ready_rx.recv().unwrap();
+        thread::sleep(Duration::from_millis(10));
+        let mut producer_index = 0;
+        assert!(server_region.try_publish_capture(&mut producer_index, 10, &[10]));
+        assert!(server_region.try_publish_capture(&mut producer_index, 11, &[11]));
+        signal_event(observed_capture_fd);
+
+        let (mut stream, seq) = waiter.join().unwrap();
+        assert_eq!(seq, 10);
+        let mut descriptor = libc::pollfd {
+            fd: observed_capture_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 1);
+        let mut sample = [0];
+        assert_eq!(stream.capture_buffer(&mut sample).unwrap(), Some(10));
+        assert_eq!(stream.wait_period(Duration::ZERO).unwrap(), 11);
+        unsafe { libc::close(observed_capture_fd) };
+        stream.closed = true;
     }
 
     fn owned_fds(fds: [RawFd; 4]) -> Vec<OwnedFd> {
