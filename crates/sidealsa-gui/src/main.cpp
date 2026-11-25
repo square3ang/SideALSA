@@ -30,11 +30,51 @@
 #include <QWheelEvent>
 #include <QWidget>
 
+#include <algorithm>
+#include <array>
 #include <limits>
 
 namespace {
 
 constexpr int kClientRefreshRequiredErrorExitCode = 2;
+constexpr std::array<int, 6> kStandardBuffers = {32, 64, 128, 256, 512, 1024};
+
+uint parseDisplayRate(const QString &text)
+{
+    bool ok = false;
+    const uint rate = text.trimmed().toUInt(&ok);
+    return (ok && rate > 0) ? rate : 48000U;
+}
+
+int periodMicros(int frames, uint rate)
+{
+    if (frames <= 0 || rate == 0)
+        return 0;
+    return static_cast<int>((static_cast<quint64>(frames) * 1000000ULL) / rate);
+}
+
+int syconAutoHandoffMicros(int frames, uint rate)
+{
+    if (frames <= 0 || rate == 0)
+        return 0;
+    const int reserve = std::min((frames + 15) / 16, static_cast<int>((rate + 11999U) / 12000U));
+    const int usable = std::max(0, frames - reserve);
+    return static_cast<int>((static_cast<quint64>(usable) * 1000000ULL) / rate);
+}
+
+int syconSafeHandoffMicros(int frames, uint rate)
+{
+    if (frames <= 0 || rate == 0)
+        return 2000;
+    const quint64 scaled = (static_cast<quint64>(frames) * 1500000ULL + rate - 1) / rate;
+    return static_cast<int>(std::clamp<quint64>(scaled, 1000ULL, 100000ULL));
+}
+
+QString formatBufferChoice(int frames, uint rate)
+{
+    const double ms = (rate > 0) ? (static_cast<double>(frames) * 1000.0 / rate) : 0.0;
+    return QStringLiteral("%1 frames (%2 ms)").arg(frames).arg(ms, 0, 'f', 2);
+}
 
 QString optionalNumber(const QSpinBox *box)
 {
@@ -148,8 +188,8 @@ public:
           helperPath_(helperPath())
     {
         setWindowTitle(QStringLiteral("SideALSA Control"));
-        resize(860, 700);
-        setMinimumSize(680, 580);
+        resize(580, 420);
+        setMinimumSize(500, 380);
         buildUi();
         loadProfile();
     }
@@ -199,29 +239,25 @@ private:
         heroLayout->setContentsMargins(22, 18, 22, 18);
         heroLayout->setColumnStretch(0, 1);
 
-        auto *eyebrow = new QLabel(QStringLiteral("PROFESSIONAL AUDIO ENGINE"));
+        auto *eyebrow = new QLabel(QStringLiteral("SIDEALSA AUDIO"));
         eyebrow->setObjectName(QStringLiteral("eyebrow"));
         auto *title = new QLabel(QStringLiteral("SideALSA Control"));
         title->setObjectName(QStringLiteral("title"));
-        auto *subtitle = new QLabel(
-            QStringLiteral("Tune the hardware timeline. Changes are validated, persisted, and applied immediately."));
-        subtitle->setObjectName(QStringLiteral("subtitle"));
-        subtitle->setWordWrap(true);
+        subtitleLabel_ = new QLabel(
+            QStringLiteral("Choose buffer size and stability mode. Changes apply cleanly without restarting PipeWire."));
+        subtitleLabel_->setObjectName(QStringLiteral("subtitle"));
+        subtitleLabel_->setWordWrap(true);
         statusBadge_ = new QLabel(QStringLiteral("Checking daemon"));
         statusBadge_->setObjectName(QStringLiteral("statusBadge"));
         statusBadge_->setProperty("state", "idle");
         statusBadge_->setAlignment(Qt::AlignCenter);
-        statusBadge_->setMinimumWidth(138);
+        statusBadge_->setMinimumWidth(132);
 
         heroLayout->addWidget(eyebrow, 0, 0);
         heroLayout->addWidget(statusBadge_, 0, 1, 2, 1, Qt::AlignRight | Qt::AlignTop);
         heroLayout->addWidget(title, 1, 0);
-        heroLayout->addWidget(subtitle, 2, 0, 1, 2);
+        heroLayout->addWidget(subtitleLabel_, 2, 0, 1, 2);
         root->addWidget(hero);
-
-        settingsTabs_ = new QTabWidget;
-        settingsTabs_->setObjectName(QStringLiteral("settingsTabs"));
-        settingsTabs_->setDocumentMode(true);
 
         rate_ = new ChoiceBox;
         rate_->setObjectName(QStringLiteral("rate"));
@@ -233,7 +269,42 @@ private:
                          QStringLiteral("176400"), QStringLiteral("192000")});
         rate_->lineEdit()->setValidator(
             new QRegularExpressionValidator(QRegularExpression(QStringLiteral("[1-9][0-9]{0,9}")), rate_));
-        rate_->setToolTip(QStringLiteral("Physical playback and capture sample rate"));
+        rate_->setToolTip(QStringLiteral("Physical playback and capture sample rate (Hz)"));
+
+        simpleBufferSize_ = new ChoiceBox;
+        simpleBufferSize_->setObjectName(QStringLiteral("simpleBufferSize"));
+        configureField(simpleBufferSize_);
+        populateSimpleBuffers(48000U, 64);
+
+        safeMode_ = new QCheckBox(QStringLiteral("Safe mode (extra headroom for DSP spikes)"));
+        safeMode_->setToolTip(
+            QStringLiteral("Adds a small output buffer margin to absorb occasional DAW/Wine spikes. "
+                           "Disable for minimum latency."));
+        modeHint_ = new QLabel;
+        modeHint_->setObjectName(QStringLiteral("sectionCopy"));
+        modeHint_->setWordWrap(true);
+
+        simpleCard_ = new QFrame;
+        simpleCard_->setObjectName(QStringLiteral("simpleCard"));
+        auto *simpleForm = new QFormLayout(simpleCard_);
+        simpleForm->setContentsMargins(20, 18, 20, 18);
+        simpleForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+        simpleForm->setHorizontalSpacing(22);
+        simpleForm->setVerticalSpacing(12);
+        simpleForm->addRow(QStringLiteral("Sample rate"), rate_);
+        simpleForm->addRow(QStringLiteral("Buffer size"), simpleBufferSize_);
+        simpleForm->addRow(QString(), safeMode_);
+        simpleForm->addRow(QString(), modeHint_);
+        root->addWidget(simpleCard_);
+
+        advancedToggle_ = new QCheckBox(QStringLiteral("Show advanced settings"));
+        advancedToggle_->setObjectName(QStringLiteral("advancedToggle"));
+        root->addWidget(advancedToggle_);
+
+        settingsTabs_ = new QTabWidget;
+        settingsTabs_->setObjectName(QStringLiteral("settingsTabs"));
+        settingsTabs_->setDocumentMode(true);
+        settingsTabs_->setVisible(false);
 
         constexpr int maximumInteger = std::numeric_limits<int>::max();
         periodSize_ = numberBox(1, maximumInteger, QStringLiteral(" frames"));
@@ -247,7 +318,6 @@ private:
         clockForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
         clockForm->setHorizontalSpacing(24);
         clockForm->setVerticalSpacing(11);
-        clockForm->addRow(QStringLiteral("Sample rate"), rate_);
         clockForm->addRow(QStringLiteral("Client period"), periodSize_);
         clockForm->addRow(QStringLiteral("Physical period"), hardwarePeriodSize_);
         clockForm->addRow(QStringLiteral("Hardware buffer"), bufferSize_);
@@ -255,8 +325,8 @@ private:
         clockForm->addRow(QStringLiteral("Playback queue"), playbackQueuePeriods_);
         settingsTabs_->addTab(
             settingsPage(
-                QStringLiteral("Clock & buffers"),
-                QStringLiteral("The sample rate and ALSA queue geometry. Auto uses the profile-derived value."),
+                QStringLiteral("Buffers"),
+                QStringLiteral("Raw period and ring geometry. Auto derives values from Buffer size."),
                 clockForm),
             QStringLiteral("&Buffers"));
 
@@ -288,7 +358,7 @@ private:
         proHandoffUs_ = numberBox(0, maximumInteger, QStringLiteral(" us"));
         proHandoffUs_->setToolTip(QStringLiteral("Fixed handoff ceiling. Ignored in direct zero-lead mode when Automatic PRO handoff is enabled."));
         proHandoffAuto_ = new QCheckBox(QStringLiteral("Automatic PRO handoff (scales with buffer period)"));
-        proHandoffAuto_->setToolTip(QStringLiteral("Direct zero-lead mode: one logical period minus write reserve, also bounded by the actual hardware queue. Q64/48k keeps its 1 ms ceiling. No extra buffering. Other modes use the manual budget."));
+        proHandoffAuto_->setToolTip(QStringLiteral("Direct zero-lead mode: one logical period minus write reserve. ALSA Q64/48k uses 1.00 ms; Sycon Q64/48k uses 1.25 ms. Disable for manual headroom (Safe mode)."));
         proRealtimePriority_ = optionalNumberBox(99);
         sharedLatencyPeriods_ = numberBox(0, 7, QStringLiteral(" periods"));
         sharedPlaybackRepeatOnUnderrun_ =
@@ -350,10 +420,35 @@ private:
 
         connect(reloadButton_, &QPushButton::clicked, this, [this] { reloadProfile(); });
         connect(applyButton_, &QPushButton::clicked, this, [this] { applyProfile(); });
+        connect(advancedToggle_, &QCheckBox::toggled, this, [this](bool show) {
+            settingsTabs_->setVisible(show);
+            if (show) {
+                resize(std::max(width(), 780), std::max(height(), 680));
+            } else {
+                resize(580, 420);
+            }
+        });
+        connect(simpleBufferSize_, qOverload<int>(&QComboBox::currentIndexChanged), this,
+                [this](int index) {
+                    if (loadingWidgets_ || syncingSimple_ || index < 0)
+                        return;
+                    const int period = simpleBufferSize_->itemData(index).toInt();
+                    if (period > 0)
+                        applySimpleBufferSize(period);
+                });
+        connect(safeMode_, &QCheckBox::toggled, this, [this](bool checked) {
+            if (loadingWidgets_ || syncingSimple_)
+                return;
+            applySimpleSafeMode(checked);
+        });
 
         const auto watchSpinBox = [this](QSpinBox *box) {
-            connect(box, qOverload<int>(&QSpinBox::valueChanged), this,
-                    [this] { markEdited(); });
+            connect(box, qOverload<int>(&QSpinBox::valueChanged), this, [this] {
+                if (loadingWidgets_ || syncingSimple_)
+                    return;
+                syncSimpleFromAdvanced();
+                markEdited();
+            });
         };
         for (QSpinBox *box : {periodSize_, hardwarePeriodSize_, bufferSize_, sharedBufferSize_,
                               playbackQueuePeriods_, linkedGuardFrames_, linkedPhaseAttempts_,
@@ -361,8 +456,11 @@ private:
                               sharedLatencyPeriods_, realtimePriority_}) {
             watchSpinBox(box);
         }
-        connect(rate_, &QComboBox::currentTextChanged, this,
-                [this] { markEdited(); });
+        connect(rate_, &QComboBox::currentTextChanged, this, [this] {
+            if (loadingWidgets_ || syncingSimple_)
+                return;
+            onRateChanged();
+        });
         connect(duplexLink_, qOverload<int>(&QComboBox::currentIndexChanged), this,
                 [this] { markEdited(); });
         connect(playbackTimerScheduling_, &QCheckBox::toggled, this,
@@ -370,12 +468,17 @@ private:
         connect(sharedPlaybackRepeatOnUnderrun_, &QCheckBox::toggled, this,
                 [this] { markEdited(); });
         connect(realtime_, &QCheckBox::toggled, this, [this] { markEdited(); });
-        connect(proHandoffAuto_, &QCheckBox::toggled, this, [this] { markEdited(); });
+        connect(proHandoffAuto_, &QCheckBox::toggled, this, [this] {
+            if (loadingWidgets_ || syncingSimple_)
+                return;
+            syncSimpleFromAdvanced();
+            markEdited();
+        });
 
         setCentralWidget(central);
         setStyleSheet(QStringLiteral(R"(
             QMainWindow { background: palette(window); }
-            QFrame#hero {
+            QFrame#hero, QFrame#simpleCard {
                 background: palette(base);
                 border: 1px solid palette(mid);
                 border-radius: 12px;
@@ -480,10 +583,146 @@ private:
     void setBusy(bool busy)
     {
         busy_ = busy;
+        simpleCard_->setEnabled(!busy);
+        advancedToggle_->setEnabled(!busy);
         settingsTabs_->setEnabled(!busy);
         updateApplyState();
         if (busy)
             setStatus(QStringLiteral("Applying"), "warning");
+    }
+
+    void populateSimpleBuffers(uint rate, int currentPeriod)
+    {
+        simpleBufferSize_->clear();
+        bool found = false;
+        for (int frames : kStandardBuffers) {
+            simpleBufferSize_->addItem(formatBufferChoice(frames, rate), frames);
+            if (frames == currentPeriod)
+                found = true;
+        }
+        if (currentPeriod > 0 && !found) {
+            simpleBufferSize_->addItem(
+                formatBufferChoice(currentPeriod, rate) + QStringLiteral(" (custom)"),
+                currentPeriod);
+        }
+        const int idx = simpleBufferSize_->findData(currentPeriod);
+        if (idx >= 0)
+            simpleBufferSize_->setCurrentIndex(idx);
+    }
+
+    void onRateChanged()
+    {
+        syncingSimple_ = true;
+        const uint rate = parseDisplayRate(rate_->currentText());
+        const int period = periodSize_->value();
+        populateSimpleBuffers(rate, period);
+        if (safeMode_->isChecked()) {
+            if (isSycon_) {
+                proHandoffUs_->setValue(syconSafeHandoffMicros(period, rate));
+            } else {
+                proHandoffUs_->setValue(periodMicros(period, rate));
+            }
+        }
+        updateModeHint();
+        syncingSimple_ = false;
+        markEdited();
+    }
+
+    void applySimpleBufferSize(int period)
+    {
+        syncingSimple_ = true;
+        periodSize_->setValue(period);
+        // Derive a valid ALSA/Sycon ring geometry automatically.
+        hardwarePeriodSize_->setValue(0);
+        bufferSize_->setValue(period * 4);
+        sharedBufferSize_->setValue(0);
+        syncingSimple_ = false;
+        applySimpleSafeMode(safeMode_->isChecked());
+    }
+
+    void applySimpleSafeMode(bool safe)
+    {
+        syncingSimple_ = true;
+        const uint rate = parseDisplayRate(rate_->currentText());
+        const int period = periodSize_->value();
+        if (isSycon_) {
+            proLatencyPeriods_->setValue(0);
+            if (safe) {
+                proHandoffAuto_->setChecked(false);
+                proHandoffUs_->setValue(syconSafeHandoffMicros(period, rate));
+            } else {
+                proHandoffAuto_->setChecked(true);
+            }
+        } else {
+            linkedGuardFrames_->setValue(0);
+            if (safe) {
+                proLatencyPeriods_->setValue(1);
+                proHandoffAuto_->setChecked(false);
+                proHandoffUs_->setValue(periodMicros(period, rate));
+                linkedPhaseAttempts_->setValue(0);
+            } else {
+                proLatencyPeriods_->setValue(0);
+                proHandoffAuto_->setChecked(true);
+            }
+        }
+        updateModeHint();
+        syncingSimple_ = false;
+        markEdited();
+    }
+
+    void syncSimpleFromAdvanced()
+    {
+        const bool prev = syncingSimple_;
+        syncingSimple_ = true;
+        const uint rate = parseDisplayRate(rate_->currentText());
+        const int period = periodSize_->value();
+        populateSimpleBuffers(rate, period);
+        const bool safe = isSycon_
+            ? (!proHandoffAuto_->isChecked()
+               && proHandoffUs_->value() > syconAutoHandoffMicros(period, rate))
+            : (proLatencyPeriods_->value() > 0);
+        safeMode_->setChecked(safe);
+        updateModeHint();
+        syncingSimple_ = prev;
+    }
+
+    void updateModeHint()
+    {
+        const uint rate = parseDisplayRate(rate_->currentText());
+        const int period = periodSize_->value();
+        const QString backendText = isSycon_ ? QStringLiteral("Sycon UAC2") : QStringLiteral("ALSA");
+        if (isSycon_) {
+            if (proHandoffAuto_->isChecked()) {
+                const double ms = syconAutoHandoffMicros(period, rate) / 1000.0;
+                modeHint_->setText(
+                    QStringLiteral("%1 · Low latency · %2 ms DSP budget")
+                        .arg(backendText)
+                        .arg(ms, 0, 'f', 2));
+            } else {
+                const double handoffMs = proHandoffUs_->value() / 1000.0;
+                const double extraMs =
+                    std::max(0, proHandoffUs_->value() - syconAutoHandoffMicros(period, rate))
+                    / 1000.0;
+                const bool standardSafe = proHandoffUs_->value() == syconSafeHandoffMicros(period, rate);
+                modeHint_->setText(
+                    QStringLiteral("%1 · %2 · %3 ms headroom (+%4 ms)")
+                        .arg(backendText,
+                             standardSafe ? QStringLiteral("Safe mode")
+                                          : QStringLiteral("Custom headroom"))
+                        .arg(handoffMs, 0, 'f', 2)
+                        .arg(extraMs, 0, 'f', 2));
+            }
+        } else {
+            if (proLatencyPeriods_->value() == 0) {
+                modeHint_->setText(
+                    QStringLiteral("%1 · Low latency · direct zero-lead PRO").arg(backendText));
+            } else {
+                modeHint_->setText(
+                    QStringLiteral("%1 · Safe mode · +%2 period PRO buffer")
+                        .arg(backendText)
+                        .arg(proLatencyPeriods_->value()));
+            }
+        }
     }
 
     bool hasUnsavedChanges() const
@@ -608,13 +847,17 @@ private:
         const bool matches = textBool(values.value(QStringLiteral("daemon_profile_matches")));
         if (daemonStatus == QStringLiteral("active") && matches) {
             setStatus(QStringLiteral("Daemon online"), "ok");
+            const QString backendName =
+                isSycon_ ? QStringLiteral("Sycon UAC2") : QStringLiteral("ALSA");
+            const QString modeName =
+                safeMode_->isChecked() ? QStringLiteral("Safe mode") : QStringLiteral("Low latency");
             detailLabel_->setText(
-                QStringLiteral("PID %1  |  %2 Hz  |  Q%3/%4  |  B%5\n%6")
-                    .arg(values.value(QStringLiteral("daemon_pid")),
+                QStringLiteral("%1  |  PID %2  |  %3 Hz  |  %4 frames  |  %5")
+                    .arg(backendName,
+                         values.value(QStringLiteral("daemon_pid")),
                          values.value(QStringLiteral("daemon_rate")),
                          values.value(QStringLiteral("daemon_period_size")),
-                         values.value(QStringLiteral("daemon_hardware_period_size")),
-                         values.value(QStringLiteral("daemon_buffer_size")), profilePath_));
+                         modeName));
         } else if (daemonStatus == QStringLiteral("active")) {
             restartRequired_ = true;
             setStatus(QStringLiteral("Restart required"), "warning");
@@ -636,6 +879,8 @@ private:
 
     bool loadWidgets(const QHash<QString, QString> &values)
     {
+        if (values.contains(QStringLiteral("backend")))
+            isSycon_ = values.value(QStringLiteral("backend")) == QStringLiteral("sycon");
         bool rateOk = false;
         const uint rate = values.value(QStringLiteral("rate")).toUInt(&rateOk);
         if (!rateOk || rate == 0)
@@ -671,6 +916,8 @@ private:
             textBool(values.value(QStringLiteral("shared_playback_repeat_on_underrun"))));
         realtime_->setChecked(textBool(values.value(QStringLiteral("realtime"))));
         valid &= setNumber(realtimePriority_, values.value(QStringLiteral("realtime_priority")));
+        if (valid)
+            syncSimpleFromAdvanced();
         return valid;
     }
 
@@ -819,12 +1066,20 @@ private:
     bool profileLoaded_ = false;
     bool restartRequired_ = false;
     bool loadingWidgets_ = false;
+    bool syncingSimple_ = false;
+    bool isSycon_ = false;
     bool editsPending_ = false;
     bool busy_ = false;
     QProcess *applyProcess_ = nullptr;
 
+    QLabel *subtitleLabel_ = nullptr;
     QLabel *statusBadge_ = nullptr;
     QLabel *detailLabel_ = nullptr;
+    QFrame *simpleCard_ = nullptr;
+    QComboBox *simpleBufferSize_ = nullptr;
+    QCheckBox *safeMode_ = nullptr;
+    QLabel *modeHint_ = nullptr;
+    QCheckBox *advancedToggle_ = nullptr;
     QTabWidget *settingsTabs_ = nullptr;
     QComboBox *rate_ = nullptr;
     QSpinBox *periodSize_ = nullptr;

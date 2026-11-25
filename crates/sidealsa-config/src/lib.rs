@@ -556,6 +556,12 @@ pub fn direct_pro_write_reserve_frames(period: u32, rate: u32) -> u32 {
         .min(rate.div_ceil(3_000))
 }
 
+/// Sycon writes into an in-memory SPSC ring rather than committing via ALSA,
+/// so it needs a smaller reserve than the ALSA direct worker (~83 us at 48 kHz).
+pub fn sycon_pro_write_reserve_frames(period: u32, rate: u32) -> u32 {
+    period.div_ceil(16).min(rate.div_ceil(12_000))
+}
+
 impl HardwareConfig {
     pub fn validate(&self) -> Result<(), ProfileError> {
         if self.name.trim().is_empty() {
@@ -826,10 +832,14 @@ impl HardwareConfig {
 
     pub fn pro_handoff_nanos(&self) -> u64 {
         if self.pro_handoff_auto && self.uses_event_driven_pro() {
-            let reserve = direct_pro_write_reserve_frames(self.period_size, self.rate);
+            let reserve = if self.backend == HardwareBackend::Sycon {
+                sycon_pro_write_reserve_frames(self.period_size, self.rate)
+            } else {
+                direct_pro_write_reserve_frames(self.period_size, self.rate)
+            };
             // Bound the configured ceiling as well as actual queue occupancy.
             // A temporarily fuller queue must not extend Q64 beyond its
-            // established 1 ms window (or spend the next cycle's write time).
+            // established window (or spend the next cycle's write time).
             return u64::from(self.period_size.saturating_sub(reserve)) * 1_000_000_000
                 / u64::from(self.rate.max(1));
         }
@@ -1251,6 +1261,26 @@ mod tests {
         assert!(document.profile().device.pro_handoff_auto);
         profile.device.playback_timer_scheduling = true;
         assert_eq!(profile.device.pro_handoff_nanos(), 1_000_000);
+    }
+
+    #[test]
+    fn sycon_automatic_handoff_uses_smaller_ring_write_reserve() {
+        let mut profile =
+            Profile::from_toml(include_str!("../../../profiles/topping-e1x2-sycon.toml")).unwrap();
+        // Default Sycon profile enables safe-mode spike headroom (2.0 ms at Q64).
+        assert!(!profile.device.pro_handoff_auto);
+        assert_eq!(profile.device.pro_handoff_nanos(), 2_000_000);
+        // Auto mode uses Sycon's 4-frame (~83 us) ring reserve: 60 frames = 1.25 ms at Q64.
+        profile.device.pro_handoff_auto = true;
+        for (frames, budget) in [
+            (32, 625_000),
+            (64, 1_250_000),
+            (128, 2_583_333),
+            (256, 5_250_000),
+        ] {
+            profile.device.period_size = frames;
+            assert_eq!(profile.device.pro_handoff_nanos(), budget);
+        }
     }
 
     #[test]
@@ -1938,10 +1968,11 @@ mod tests {
 
         // ALSA-only scheduling keys must not change the Sycon handoff budget or latency.
         let mut timer = sycon.clone();
+        timer.device.pro_handoff_auto = true;
         timer.device.playback_timer_scheduling = true;
         timer.device.duplex_link = Some(false);
-        assert_eq!(timer.device.pro_handoff_nanos(), 1_000_000);
-        assert_eq!(sycon.device.pro_handoff_nanos(), 1_000_000);
+        assert_eq!(timer.device.pro_handoff_nanos(), 1_250_000);
+        assert_eq!(sycon.device.pro_handoff_nanos(), 2_000_000);
 
         let mut staged = sycon.clone();
         staged.device.pro_latency_periods = 1;

@@ -13,7 +13,7 @@ use std::{
 };
 
 use sidealsa_client::SideAlsaClient;
-use sidealsa_config::{Profile, ProfileDocument, ProfileError, TimingSettings};
+use sidealsa_config::{HardwareBackend, Profile, ProfileDocument, ProfileError, TimingSettings};
 use sidealsa_protocol::DeviceInfo;
 use thiserror::Error;
 
@@ -188,6 +188,14 @@ pub fn render_snapshot(
     push_setting(&mut output, "profile_path", profile_path);
     push_setting(&mut output, "socket_path", socket_path);
     push_setting(&mut output, "revision", &profile_revision(&text));
+    push_setting(
+        &mut output,
+        "backend",
+        match document.profile().device.backend {
+            HardwareBackend::Alsa => "alsa",
+            HardwareBackend::Sycon => "sycon",
+        },
+    );
     push_timing(&mut output, &document.timing());
 
     match SideAlsaClient::connect_with_timeout(socket, Duration::from_millis(250)) {

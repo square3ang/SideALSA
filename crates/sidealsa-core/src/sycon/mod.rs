@@ -1421,12 +1421,20 @@ mod tests {
 
     #[test]
     fn e1x2_layout_budgets_handoff_ahead_of_one_urb() {
+        // Default E1x2 Sycon profile uses safe mode (2.0 ms = 96 frames);
+        // one 1-packet URB is 7 frames, safety defaults to 6 frames.
         let layout = layout_for(SYCON_PROFILE);
-        // Q64 auto handoff is 48 frames (1 ms); one 1-packet URB is 7 frames;
-        // safety defaults to one microframe (6 frames).
-        assert_eq!(layout.handoff_nanos, 1_000_000);
+        assert_eq!(layout.handoff_nanos, 2_000_000);
         assert_eq!(layout.reserve_frames, 7 + 6);
-        assert_eq!(layout.lead_frames, 48 + 7 + 6);
+        assert_eq!(layout.lead_frames, 96 + 7 + 6);
+
+        // Low-latency auto handoff gives 60 frames (1.25 ms) at Q64/48k.
+        let mut auto = Profile::from_toml(SYCON_PROFILE).unwrap();
+        auto.device.pro_handoff_auto = true;
+        let auto_layout = layout_for_profile(&auto);
+        assert_eq!(auto_layout.handoff_nanos, 1_250_000);
+        assert_eq!(auto_layout.reserve_frames, 7 + 6);
+        assert_eq!(auto_layout.lead_frames, 60 + 7 + 6);
     }
 
     #[test]

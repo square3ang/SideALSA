@@ -18,7 +18,7 @@ product_id = 0x8755
 # port = "1-11"            # optional sysfs port; required only with two identical devices
 packets_per_urb = 1        # 1..=8; one packet = one bInterval (125 us at high speed)
 playback_urbs = 12         # 2..=16 OUT URBs in flight
-capture_urbs = 12          # 2..=16 IN URBs in flight
+capture_urbs = 16          # 2..=16 IN URBs in flight
 # safety_frames = 6        # extra OUT ring margin; default one nominal packet, max 10 ms
 ```
 
@@ -64,7 +64,10 @@ realtime priorities and the SHARED settings apply as usual; `pro_latency_periods
   is available, hands it to the bridge, renders playback and queues it. The
   playback ring starts with `lead` silent frames:
   `lead = handoff + packets_per_urb * (nominal_packet + 1) + safety`.
-  At 48 kHz / P64 / 1 ms handoff / 1 packet that is 61 frames (1.27 ms).
+  At 48 kHz / P64 / 1 packet, automatic low-latency handoff reserves 4 frames
+  (83 us) for a 1.25 ms budget (`lead = 73` frames, 1.52 ms); safe mode
+  (`pro_handoff_auto = false`, `pro_handoff_us = 2000`) gives 2.0 ms of spike
+  headroom (`lead = 109` frames, 2.27 ms).
 - **Restart.** If the OUT or IN URB queue drains (the xHCI ring then has an
   unmeasurable gap), the I/O thread cancels everything, bumps `generation`,
   counts a hardware XRUN in the affected direction, and restarts after the cycle

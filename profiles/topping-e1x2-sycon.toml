@@ -11,9 +11,10 @@ shared_buffer_size = 512
 playback_timer_scheduling = false
 duplex_link = true
 pro_latency_periods = 0
-# Automatic budget scales with Q; the manual ceiling is retained for opt-out.
-pro_handoff_us = 1000
-pro_handoff_auto = true
+# Safe mode: 2.0 ms handoff headroom absorbs isolated DSP spikes at Q64
+# (~7.2 ms RTL). Set pro_handoff_auto = true for minimum latency (1.25 ms budget).
+pro_handoff_us = 2000
+pro_handoff_auto = false
 # Keep userspace audio below the PREEMPT_RT xHCI IRQ thread (FIFO 50 here).
 pro_realtime_priority = 46
 shared_latency_periods = 5
@@ -31,7 +32,7 @@ product_id = 0x8755
 # One packet is one 125 us microframe; an OUT URB adds this much latency.
 packets_per_urb = 1
 playback_urbs = 12
-capture_urbs = 12
+capture_urbs = 16
 
 [device.playback]
 device = "hw:OTG,0"

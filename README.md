@@ -168,7 +168,7 @@ The main installer's `--with-asio` installs system files only; **prefix registra
 
 Sycon mode (`backend = "sycon"`) is an optional userspace USB Audio Class 2 backend that replaces the ALSA hardware engine. `sidealsad` opens `/dev/bus/usb/...`, detaches `snd-usb-audio`, and drives isochronous URBs directly with explicit feedback clock tracking. Everything above the engine (PRO, SHARED, ALSA ioplug, PipeWire, Wine ASIO, and `sidealsa-stats`) stays unchanged.
 
-To install using the Topping E1x2 OTG reference profile (48 kHz / Q64, 1 packet/URB, 12+12 URBs):
+To install using the Topping E1x2 OTG reference profile (48 kHz / Q64, Safe mode 2.0 ms headroom, 1 packet/URB, 12+16 URBs):
 
 ```bash
 bash scripts/install.sh --profile profiles/topping-e1x2-sycon.toml --replace-profile
@@ -179,13 +179,15 @@ Or enable it in an existing profile (set `backend = "alsa"` to switch back):
 ```toml
 [device]
 backend = "sycon"
+pro_handoff_auto = false   # Safe mode (2.0 ms headroom); true = low latency (1.25 ms)
+pro_handoff_us = 2000
 
 [device.sycon]
 vendor_id = 0x152a
 product_id = 0x8755
 packets_per_urb = 1
 playback_urbs = 12
-capture_urbs = 12
+capture_urbs = 16
 ```
 
 - **ALSA card handoff.** While `sidealsad` runs, the device's ALSA card and hardware mixer controls disappear. Stopping the service rebinds `snd-usb-audio`; after a crash, systemd's `ExecStopPost` (`sidealsad --release-usb`) restores it.
