@@ -1869,11 +1869,37 @@ impl CaptureSpin {
     }
 
     fn observe(&mut self, sequence: u64, observed: u64, generation: u64) {
+        if observed == 0 {
+            self.last = None;
+            return;
+        }
         // Never extrapolate across a missed cycle or lifecycle transition.
-        let consecutive = self.last.is_none_or(|(previous, _, previous_generation)| {
-            sequence == previous.wrapping_add(1) && generation == previous_generation
-        });
-        self.last = (consecutive && observed != 0).then_some((sequence, observed, generation));
+        let anchor = match self.last {
+            None => observed,
+            Some((previous, previous_anchor, previous_generation))
+                if sequence == previous.wrapping_add(1) && generation == previous_generation =>
+            {
+                let predicted = previous_anchor.saturating_add(self.period_nanos);
+                let delta = observed.abs_diff(predicted);
+                if delta <= self.period_nanos / 2 {
+                    // Smooth 1/8 PLL onto the mean USB URB phase so non-integer
+                    // URB cadence (e.g. 24-frame URBs on Q64) stays centered inside
+                    // the spin window on all phases instead of missing every 3rd cycle.
+                    if observed >= predicted {
+                        predicted.saturating_add(delta / 8)
+                    } else {
+                        predicted.saturating_sub(delta / 8)
+                    }
+                } else {
+                    observed
+                }
+            }
+            Some(_) => {
+                self.last = None;
+                return;
+            }
+        };
+        self.last = Some((sequence, anchor, generation));
     }
 }
 
@@ -3493,6 +3519,29 @@ mod tests {
         spin.half_window_nanos = 0;
         spin.observe(6, 8_000_000, 2);
         assert_eq!(spin.window(2, true), None);
+
+        // 24-frame (500 us) USB URB cadence on Q64 (1,333.3 us) yields 1500/1500/1000 us
+        // inter-arrival intervals; after lock-in all three phases stay inside +-200 us.
+        let mut usb_spin = super::CaptureSpin {
+            half_window_nanos: 200_000,
+            period_nanos: 1_333_333,
+            last: None,
+        };
+        let mut t = 10_000_000_u64;
+        let intervals = [1_500_000_u64, 1_500_000, 1_000_000];
+        let mut hits = 0_u32;
+        for seq in 0_u64..42 {
+            if let Some((start, end, _)) = usb_spin.window(1, true)
+                && seq >= 18
+                && t >= start
+                && t <= end
+            {
+                hits += 1;
+            }
+            usb_spin.observe(seq, t, 1);
+            t += intervals[(seq as usize) % intervals.len()];
+        }
+        assert_eq!(hits, 24);
     }
 
     #[test]

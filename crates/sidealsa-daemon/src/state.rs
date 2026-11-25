@@ -2281,18 +2281,39 @@ impl ProPlaybackSource for DaemonPlaybackBridge {
             return;
         }
 
+        // Wake slightly before the hard cutoff and spin the final tail in userspace
+        // so timerfd wakeup jitter never overshoots into an ALSA XRUN and borderline
+        // PRO publications are observed without an eventfd kernel round-trip.
+        const PRO_WAIT_SPIN_TAIL_NANOS: u64 = 50_000;
         let wait_started_nanos = entry_now.unwrap_or_else(monotonic_nanos);
         let mut now = wait_started_nanos;
         loop {
             if cutoff_nanos <= now {
                 break;
             }
+            if cutoff_nanos - now <= PRO_WAIT_SPIN_TAIL_NANOS {
+                while !self.pro_wait_should_stop(
+                    endpoint,
+                    session_id,
+                    hardware_generation,
+                    sequence,
+                ) {
+                    if monotonic_nanos() >= cutoff_nanos {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                break;
+            }
             endpoint.events.drain_playback_ready();
             if self.pro_wait_should_stop(endpoint, session_id, hardware_generation, sequence) {
                 break;
             }
-            match endpoint.events.wait_playback_ready_before(cutoff_nanos) {
-                PlaybackReadyWait::Ready | PlaybackReadyWait::Interrupted => {
+            let sleep_cutoff = cutoff_nanos - PRO_WAIT_SPIN_TAIL_NANOS;
+            match endpoint.events.wait_playback_ready_before(sleep_cutoff) {
+                PlaybackReadyWait::Ready
+                | PlaybackReadyWait::Interrupted
+                | PlaybackReadyWait::Timeout => {
                     if self.pro_wait_should_stop(
                         endpoint,
                         session_id,
@@ -2303,7 +2324,6 @@ impl ProPlaybackSource for DaemonPlaybackBridge {
                     }
                     now = monotonic_nanos();
                 }
-                PlaybackReadyWait::Timeout => break,
                 PlaybackReadyWait::Failed => {
                     self.core_miss_pro_sequence = Some(sequence);
                     break;

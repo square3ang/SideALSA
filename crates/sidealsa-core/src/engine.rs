@@ -4332,11 +4332,69 @@ fn open_pcm(
     })
 }
 
+fn direct_capture_period_candidates(hardware_period: u32, buffer_size: u32, rate: u32) -> [u32; 6] {
+    // Request the smallest capture ALSA period down to ~333 us (16 frames @ 48 kHz)
+    // that evenly divides both `hardware_period` and `buffer_size`. On USB UAC2
+    // (`snd-usb-audio` lowlatency), this shrinks capture URB granularity to 1
+    // microframe (6 frames / 125 us) while `avail_min = period_size` keeps wakeups
+    // at the logical period rate and playback retains its full hardware period.
+    let min_target = rate.div_ceil(3_000).max(16);
+    let mut desc = [0_u32; 6];
+    let mut len = 0_usize;
+    let mut candidate = hardware_period;
+    while len < desc.len() && candidate > 0 {
+        if hardware_period.is_multiple_of(candidate) && buffer_size.is_multiple_of(candidate) {
+            desc[len] = candidate;
+            len += 1;
+        }
+        if candidate <= min_target || !candidate.is_multiple_of(2) {
+            break;
+        }
+        let next = candidate / 2;
+        if next < min_target {
+            break;
+        }
+        candidate = next;
+    }
+    // Reverse so callers try the smallest valid capture period first and fall back
+    // to `hardware_period` on devices that reject smaller periods.
+    let mut asc = [0_u32; 6];
+    let mut i = 0;
+    while i < len {
+        asc[i] = desc[len - 1 - i];
+        i += 1;
+    }
+    asc
+}
+
 fn configure_pcm(
     pcm: &PCM,
     config: &HardwareConfig,
     stream: &crate::PcmConfig,
     direction: StreamDirection,
+) -> Result<(), EngineError> {
+    let hardware_period = config.effective_hardware_period_size();
+    if direction == StreamDirection::Capture && config.uses_event_driven_linked_pro() {
+        let candidates =
+            direct_capture_period_candidates(hardware_period, config.buffer_size, config.rate);
+        for target_period in candidates
+            .into_iter()
+            .filter(|&p| p > 0 && p < hardware_period)
+        {
+            if configure_pcm_with_period(pcm, config, stream, direction, target_period).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+    configure_pcm_with_period(pcm, config, stream, direction, hardware_period)
+}
+
+fn configure_pcm_with_period(
+    pcm: &PCM,
+    config: &HardwareConfig,
+    stream: &crate::PcmConfig,
+    direction: StreamDirection,
+    target_period: u32,
 ) -> Result<(), EngineError> {
     let params = HwParams::any(pcm).map_err(|source| EngineError::Alsa {
         operation: "create hardware parameters",
@@ -4372,10 +4430,7 @@ fn configure_pcm(
             source,
         })?;
     params
-        .set_period_size(
-            i64::from(config.effective_hardware_period_size()),
-            ValueOr::Nearest,
-        )
+        .set_period_size(i64::from(target_period), ValueOr::Nearest)
         .map_err(|source| EngineError::Alsa {
             operation: "set period size",
             direction,
@@ -4437,7 +4492,7 @@ fn configure_pcm(
     })?;
 
     if actual_rate != config.rate
-        || actual_period != i64::from(config.effective_hardware_period_size())
+        || actual_period != i64::from(target_period)
         || actual_buffer != i64::from(config.buffer_size)
         || actual_channels != stream.channels
         || actual_format != Format::S32LE
@@ -5054,6 +5109,30 @@ mod tests {
         assert_eq!(
             playback_target_sleep(2, 48_000, 50_000),
             Duration::from_micros(1)
+        );
+    }
+
+    #[test]
+    fn direct_capture_period_candidates_shrink_to_sub_millisecond_divisors() {
+        assert_eq!(
+            super::direct_capture_period_candidates(64, 256, 48_000),
+            [16, 32, 64, 0, 0, 0]
+        );
+        assert_eq!(
+            super::direct_capture_period_candidates(256, 512, 48_000),
+            [16, 32, 64, 128, 256, 0]
+        );
+        assert_eq!(
+            super::direct_capture_period_candidates(128, 512, 96_000),
+            [32, 64, 128, 0, 0, 0]
+        );
+        assert_eq!(
+            super::direct_capture_period_candidates(48, 192, 48_000),
+            [24, 48, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            super::direct_capture_period_candidates(16, 128, 48_000),
+            [16, 0, 0, 0, 0, 0]
         );
     }
 
