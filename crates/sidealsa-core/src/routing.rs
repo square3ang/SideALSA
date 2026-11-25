@@ -22,11 +22,22 @@ pub enum RoutingError {
     SampleCountOverflow,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChannelLayout {
+    Empty,
+    Mono(usize),
+    Contiguous { start: usize, len: usize },
+    Pair(usize, usize),
+    General,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompiledPort {
     id: Box<str>,
     name: Box<str>,
     channels: Box<[usize]>,
+    max_channel: Option<usize>,
+    layout: ChannelLayout,
 }
 
 impl CompiledPort {
@@ -49,14 +60,74 @@ impl CompiledPort {
         frames: usize,
         logical: &mut [T],
     ) -> Result<(), RoutingError> {
-        self.check_buffers(physical.len(), physical_channels, frames, logical.len())?;
+        let (physical_samples, logical_samples) =
+            self.check_buffers(physical.len(), physical_channels, frames, logical.len())?;
+        if frames == 0 {
+            return Ok(());
+        }
+        let physical = &physical[..physical_samples];
+        let logical = &mut logical[..logical_samples];
 
-        for frame in 0..frames {
-            let physical_offset = frame * physical_channels;
-            let logical_offset = frame * self.channels.len();
-            for (logical_channel, &physical_channel) in self.channels.iter().enumerate() {
-                logical[logical_offset + logical_channel] =
-                    physical[physical_offset + physical_channel];
+        match self.layout {
+            ChannelLayout::Empty => {}
+            ChannelLayout::Mono(ch) => {
+                assert!(ch < physical_channels);
+                for (dst, src) in logical
+                    .iter_mut()
+                    .zip(physical.chunks_exact(physical_channels))
+                {
+                    *dst = src[ch];
+                }
+            }
+            ChannelLayout::Contiguous { start: 0, len } if len == physical_channels => {
+                logical.copy_from_slice(physical);
+            }
+            ChannelLayout::Contiguous { start, len: 2 } => {
+                let c0 = start;
+                let c1 = start + 1;
+                assert!(c1 < physical_channels);
+                for (dst, src) in logical
+                    .as_chunks_mut::<2>()
+                    .0
+                    .iter_mut()
+                    .zip(physical.chunks_exact(physical_channels))
+                {
+                    dst[0] = src[c0];
+                    dst[1] = src[c1];
+                }
+            }
+            ChannelLayout::Contiguous { start, len } => {
+                let end = start + len;
+                assert!(end <= physical_channels);
+                for (dst, src) in logical
+                    .chunks_exact_mut(len)
+                    .zip(physical.chunks_exact(physical_channels))
+                {
+                    dst.copy_from_slice(&src[start..end]);
+                }
+            }
+            ChannelLayout::Pair(c0, c1) => {
+                assert!(c0 < physical_channels && c1 < physical_channels);
+                for (dst, src) in logical
+                    .as_chunks_mut::<2>()
+                    .0
+                    .iter_mut()
+                    .zip(physical.chunks_exact(physical_channels))
+                {
+                    dst[0] = src[c0];
+                    dst[1] = src[c1];
+                }
+            }
+            ChannelLayout::General => {
+                let logical_channels = self.channels.len();
+                for (dst, src) in logical
+                    .chunks_exact_mut(logical_channels)
+                    .zip(physical.chunks_exact(physical_channels))
+                {
+                    for (logical_channel, &physical_channel) in self.channels.iter().enumerate() {
+                        dst[logical_channel] = src[physical_channel];
+                    }
+                }
             }
         }
         Ok(())
@@ -69,14 +140,74 @@ impl CompiledPort {
         frames: usize,
         physical: &mut [T],
     ) -> Result<(), RoutingError> {
-        self.check_buffers(physical.len(), physical_channels, frames, logical.len())?;
+        let (physical_samples, logical_samples) =
+            self.check_buffers(physical.len(), physical_channels, frames, logical.len())?;
+        if frames == 0 {
+            return Ok(());
+        }
+        let logical = &logical[..logical_samples];
+        let physical = &mut physical[..physical_samples];
 
-        for frame in 0..frames {
-            let physical_offset = frame * physical_channels;
-            let logical_offset = frame * self.channels.len();
-            for (logical_channel, &physical_channel) in self.channels.iter().enumerate() {
-                physical[physical_offset + physical_channel] =
-                    logical[logical_offset + logical_channel];
+        match self.layout {
+            ChannelLayout::Empty => {}
+            ChannelLayout::Mono(ch) => {
+                assert!(ch < physical_channels);
+                for (&src, dst) in logical
+                    .iter()
+                    .zip(physical.chunks_exact_mut(physical_channels))
+                {
+                    dst[ch] = src;
+                }
+            }
+            ChannelLayout::Contiguous { start: 0, len } if len == physical_channels => {
+                physical.copy_from_slice(logical);
+            }
+            ChannelLayout::Contiguous { start, len: 2 } => {
+                let c0 = start;
+                let c1 = start + 1;
+                assert!(c1 < physical_channels);
+                for (src, dst) in logical
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .zip(physical.chunks_exact_mut(physical_channels))
+                {
+                    dst[c0] = src[0];
+                    dst[c1] = src[1];
+                }
+            }
+            ChannelLayout::Contiguous { start, len } => {
+                let end = start + len;
+                assert!(end <= physical_channels);
+                for (src, dst) in logical
+                    .chunks_exact(len)
+                    .zip(physical.chunks_exact_mut(physical_channels))
+                {
+                    dst[start..end].copy_from_slice(src);
+                }
+            }
+            ChannelLayout::Pair(c0, c1) => {
+                assert!(c0 < physical_channels && c1 < physical_channels);
+                for (src, dst) in logical
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .zip(physical.chunks_exact_mut(physical_channels))
+                {
+                    dst[c0] = src[0];
+                    dst[c1] = src[1];
+                }
+            }
+            ChannelLayout::General => {
+                let logical_channels = self.channels.len();
+                for (src, dst) in logical
+                    .chunks_exact(logical_channels)
+                    .zip(physical.chunks_exact_mut(physical_channels))
+                {
+                    for (logical_channel, &physical_channel) in self.channels.iter().enumerate() {
+                        dst[physical_channel] = src[logical_channel];
+                    }
+                }
             }
         }
         Ok(())
@@ -89,15 +220,79 @@ impl CompiledPort {
         frames: usize,
         physical: &mut [i32],
     ) -> Result<(), RoutingError> {
-        self.check_buffers(physical.len(), physical_channels, frames, logical.len())?;
+        let (physical_samples, logical_samples) =
+            self.check_buffers(physical.len(), physical_channels, frames, logical.len())?;
+        if frames == 0 {
+            return Ok(());
+        }
+        let logical = &logical[..logical_samples];
+        let physical = &mut physical[..physical_samples];
 
-        for frame in 0..frames {
-            let physical_offset = frame * physical_channels;
-            let logical_offset = frame * self.channels.len();
-            for (logical_channel, &physical_channel) in self.channels.iter().enumerate() {
-                let physical_index = physical_offset + physical_channel;
-                physical[physical_index] = physical[physical_index]
-                    .saturating_add(logical[logical_offset + logical_channel]);
+        match self.layout {
+            ChannelLayout::Empty => {}
+            ChannelLayout::Mono(ch) => {
+                assert!(ch < physical_channels);
+                for (&src, dst) in logical
+                    .iter()
+                    .zip(physical.chunks_exact_mut(physical_channels))
+                {
+                    dst[ch] = dst[ch].saturating_add(src);
+                }
+            }
+            ChannelLayout::Contiguous { start: 0, len } if len == physical_channels => {
+                for (dst, &src) in physical.iter_mut().zip(logical.iter()) {
+                    *dst = dst.saturating_add(src);
+                }
+            }
+            ChannelLayout::Contiguous { start, len: 2 } => {
+                let c0 = start;
+                let c1 = start + 1;
+                assert!(c1 < physical_channels);
+                for (src, dst) in logical
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .zip(physical.chunks_exact_mut(physical_channels))
+                {
+                    dst[c0] = dst[c0].saturating_add(src[0]);
+                    dst[c1] = dst[c1].saturating_add(src[1]);
+                }
+            }
+            ChannelLayout::Contiguous { start, len } => {
+                let end = start + len;
+                assert!(end <= physical_channels);
+                for (src, dst) in logical
+                    .chunks_exact(len)
+                    .zip(physical.chunks_exact_mut(physical_channels))
+                {
+                    for (d, &s) in dst[start..end].iter_mut().zip(src.iter()) {
+                        *d = d.saturating_add(s);
+                    }
+                }
+            }
+            ChannelLayout::Pair(c0, c1) => {
+                assert!(c0 < physical_channels && c1 < physical_channels);
+                for (src, dst) in logical
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .zip(physical.chunks_exact_mut(physical_channels))
+                {
+                    dst[c0] = dst[c0].saturating_add(src[0]);
+                    dst[c1] = dst[c1].saturating_add(src[1]);
+                }
+            }
+            ChannelLayout::General => {
+                let logical_channels = self.channels.len();
+                for (src, dst) in logical
+                    .chunks_exact(logical_channels)
+                    .zip(physical.chunks_exact_mut(physical_channels))
+                {
+                    for (logical_channel, &physical_channel) in self.channels.iter().enumerate() {
+                        dst[physical_channel] =
+                            dst[physical_channel].saturating_add(src[logical_channel]);
+                    }
+                }
             }
         }
         Ok(())
@@ -109,15 +304,20 @@ impl CompiledPort {
         physical_channels: usize,
         frames: usize,
         logical_len: usize,
-    ) -> Result<(), RoutingError> {
+    ) -> Result<(usize, usize), RoutingError> {
         if physical_channels == 0 {
             return Err(RoutingError::ZeroPhysicalChannels);
         }
-        if let Some(&channel) = self
-            .channels
-            .iter()
-            .find(|&&channel| channel >= physical_channels)
+        if self
+            .max_channel
+            .is_some_and(|channel| channel >= physical_channels)
         {
+            let channel = self
+                .channels
+                .iter()
+                .copied()
+                .find(|&channel| channel >= physical_channels)
+                .unwrap_or(physical_channels);
             return Err(RoutingError::PhysicalChannelOutOfRange {
                 channel,
                 physical_channels,
@@ -141,8 +341,34 @@ impl CompiledPort {
                 required: logical_samples,
             });
         }
-        Ok(())
+        Ok((physical_samples, logical_samples))
     }
+}
+
+fn classify_channels(channels: &[usize]) -> (ChannelLayout, Option<usize>) {
+    let Some(max_channel) = channels.iter().copied().max() else {
+        return (ChannelLayout::Empty, None);
+    };
+    let layout = if channels.len() == 1 {
+        ChannelLayout::Mono(channels[0])
+    } else {
+        let start = channels[0];
+        let contiguous = channels
+            .iter()
+            .enumerate()
+            .all(|(offset, &channel)| start.checked_add(offset) == Some(channel));
+        if contiguous {
+            ChannelLayout::Contiguous {
+                start,
+                len: channels.len(),
+            }
+        } else if channels.len() == 2 {
+            ChannelLayout::Pair(channels[0], channels[1])
+        } else {
+            ChannelLayout::General
+        }
+    };
+    (layout, Some(max_channel))
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -190,10 +416,13 @@ fn compile_ports(ports: &[PortConfig]) -> Result<Box<[CompiledPort]>, RoutingErr
                 })
                 .collect::<Result<Vec<_>, _>>()?
                 .into_boxed_slice();
+            let (layout, max_channel) = classify_channels(&channels);
             Ok(CompiledPort {
                 id: port.id.clone().into_boxed_str(),
                 name: port.name.clone().into_boxed_str(),
                 channels,
+                max_channel,
+                layout,
             })
         })
         .collect::<Result<Vec<_>, _>>()
@@ -291,5 +520,193 @@ mod tests {
             .expect("mix should succeed");
 
         assert_eq!(physical, [0, i32::MAX, 0, 2, 0, -i32::MAX, 0, -3]);
+    }
+
+    #[test]
+    fn fast_paths_match_reference_across_all_channel_layouts() {
+        let layouts: &[(&str, &str)] = &[
+            ("mono", "[5]"),
+            ("stereo", "[2, 3]"),
+            ("triple_contig", "[4, 5, 6]"),
+            ("pair_sparse", "[7, 1]"),
+            ("general", "[6, 0, 3]"),
+            ("full", "[0, 1, 2, 3, 4, 5, 6, 7]"),
+        ];
+        let physical_channels = 8;
+        let frames = 5;
+        let source_physical: Vec<i32> = (0..(frames * physical_channels) as i32)
+            .map(|i| i * 100 - 500)
+            .collect();
+
+        for &(id, channels) in layouts {
+            let profile_toml = format!(
+                r#"
+                [device]
+                name = "Layout matrix"
+                rate = 48000
+                period_size = 64
+                buffer_size = 128
+
+                [device.playback]
+                device = "hw:Test,0"
+                channels = 8
+                format = "S32_LE"
+
+                [device.capture]
+                device = "hw:Test,0"
+                channels = 8
+                format = "S32_LE"
+
+                [[ports.playback]]
+                id = "{id}"
+                name = "{id}"
+                channels = {channels}
+                "#
+            );
+            let profile = Profile::from_toml(&profile_toml).expect("profile should parse");
+            let routing = RoutingTable::compile(&profile).expect("routing should compile");
+            let port = routing.find_playback(id).expect("port should exist");
+            let logical_channels = port.channels().len();
+            let mut logical = vec![0_i32; frames * logical_channels];
+            port.copy_from_physical(&source_physical, physical_channels, frames, &mut logical)
+                .expect("copy_from_physical should succeed");
+
+            let mut expected_logical = vec![0_i32; frames * logical_channels];
+            for frame in 0..frames {
+                for (lch, &pch) in port.channels().iter().enumerate() {
+                    expected_logical[frame * logical_channels + lch] =
+                        source_physical[frame * physical_channels + pch];
+                }
+            }
+            assert_eq!(logical, expected_logical, "copy_from {}", port.id());
+
+            let mut dst_physical = vec![-7_i32; frames * physical_channels];
+            port.copy_to_physical(&logical, physical_channels, frames, &mut dst_physical)
+                .expect("copy_to_physical should succeed");
+            let mut expected_physical = vec![-7_i32; frames * physical_channels];
+            for frame in 0..frames {
+                for (lch, &pch) in port.channels().iter().enumerate() {
+                    expected_physical[frame * physical_channels + pch] =
+                        logical[frame * logical_channels + lch];
+                }
+            }
+            assert_eq!(dst_physical, expected_physical, "copy_to {}", port.id());
+
+            let mut mixed = vec![i32::MAX - 10; frames * physical_channels];
+            let mut expected_mixed = mixed.clone();
+            port.add_to_physical_saturating(&logical, physical_channels, frames, &mut mixed)
+                .expect("add_to_physical_saturating should succeed");
+            for frame in 0..frames {
+                for (lch, &pch) in port.channels().iter().enumerate() {
+                    let idx = frame * physical_channels + pch;
+                    expected_mixed[idx] =
+                        expected_mixed[idx].saturating_add(logical[frame * logical_channels + lch]);
+                }
+            }
+            assert_eq!(mixed, expected_mixed, "add_sat {}", port.id());
+
+            // Zero frames still validates channel range and leaves buffers untouched.
+            port.copy_from_physical::<i32>(&[], physical_channels, 0, &mut [])
+                .expect("zero frames should succeed");
+            if port.channels().iter().any(|&ch| ch >= 4) {
+                let first_oob = port.channels().iter().copied().find(|&ch| ch >= 4).unwrap();
+                let err = port
+                    .copy_from_physical::<i32>(&[], 4, 0, &mut [])
+                    .expect_err("out-of-range channel must fail even for zero frames");
+                assert!(matches!(
+                    err,
+                    RoutingError::PhysicalChannelOutOfRange {
+                        channel,
+                        physical_channels: 4
+                    } if channel == first_oob
+                ));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "microbenchmark"]
+    fn benchmark_compiled_port_routing_hot_paths() {
+        let profile_toml = r#"
+            [device]
+            name = "Bench"
+            rate = 48000
+            period_size = 64
+            buffer_size = 128
+
+            [device.playback]
+            device = "hw:Test,0"
+            channels = 8
+            format = "S32_LE"
+
+            [device.capture]
+            device = "hw:Test,0"
+            channels = 10
+            format = "S32_LE"
+
+            [[ports.playback]]
+            id = "line1"
+            name = "Line 1"
+            channels = [0, 1]
+
+            [[ports.capture]]
+            id = "mic1"
+            name = "Mic 1"
+            channels = [0]
+        "#;
+        let profile = Profile::from_toml(profile_toml).unwrap();
+        let routing = RoutingTable::compile(&profile).unwrap();
+        let stereo = routing.find_playback("line1").unwrap();
+        let mono = routing.find_capture("mic1").unwrap();
+
+        let frames = 64;
+        let iterations = 200_000_usize;
+        let mut physical = vec![1234_i32; frames * 8];
+        let mut capture = vec![5678_i32; frames * 10];
+        let mut logical_stereo = vec![99_i32; frames * 2];
+        let mut logical_mono = vec![0_i32; frames];
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iterations {
+            stereo
+                .add_to_physical_saturating(
+                    std::hint::black_box(&logical_stereo),
+                    8,
+                    frames,
+                    std::hint::black_box(&mut physical),
+                )
+                .unwrap();
+        }
+        let mix_ns = t0.elapsed().as_nanos() as f64 / iterations as f64;
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..iterations {
+            stereo
+                .copy_from_physical(
+                    std::hint::black_box(&physical),
+                    8,
+                    frames,
+                    std::hint::black_box(&mut logical_stereo),
+                )
+                .unwrap();
+        }
+        let stereo_copy_ns = t1.elapsed().as_nanos() as f64 / iterations as f64;
+
+        let t2 = std::time::Instant::now();
+        for _ in 0..iterations {
+            mono.copy_from_physical(
+                std::hint::black_box(&capture),
+                10,
+                frames,
+                std::hint::black_box(&mut logical_mono),
+            )
+            .unwrap();
+        }
+        let mono_copy_ns = t2.elapsed().as_nanos() as f64 / iterations as f64;
+
+        std::hint::black_box((&mut capture, &physical, &logical_stereo, &logical_mono));
+        eprintln!(
+            "routing Q64: stereo_add={mix_ns:.1}ns stereo_copy={stereo_copy_ns:.1}ns mono_copy={mono_copy_ns:.1}ns"
+        );
     }
 }

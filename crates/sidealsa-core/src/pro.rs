@@ -40,9 +40,12 @@ pub trait ProPlaybackSource: Send {
     fn end_playback_commit(&mut self) {}
 
     /// Takes one already-ready exact-sequence block without waiting.
+    /// Implementations must write the entire `playback` buffer (or zero-fill on silence/miss);
+    /// the engine does not pre-zero `playback` before calling this method.
     fn process_playback(&mut self, sequence: u64, playback: &mut [i32]);
 
     /// Takes an exact-sequence block only when it was published by the cutoff.
+    /// Implementations must write the entire `playback` buffer (or zero-fill on silence/miss).
     fn process_playback_before(&mut self, sequence: u64, _cutoff_nanos: u64, playback: &mut [i32]) {
         self.process_playback(sequence, playback);
     }

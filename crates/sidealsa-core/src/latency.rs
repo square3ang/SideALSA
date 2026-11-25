@@ -8,7 +8,9 @@ const STALL_WINDOW_NANOS: u64 = 10_000_000_000;
 pub(crate) struct LatencyGuard {
     period_frames: i64,
     period_nanos: u64,
-    sample_periods: u64,
+    // `sample_periods` is always a power of two; storing the bitmask replaces a
+    // per-period 64-bit runtime division with a single bitwise AND.
+    sample_mask: u64,
     stall_window_nanos: u64,
     generation: Option<u64>,
     warm_until: u64,
@@ -29,7 +31,7 @@ impl LatencyGuard {
         Self {
             period_frames,
             period_nanos,
-            sample_periods,
+            sample_mask: sample_periods - 1,
             stall_window_nanos: STALL_WINDOW_NANOS.max(
                 period_nanos
                     .saturating_mul(sample_periods)
@@ -46,8 +48,9 @@ impl LatencyGuard {
         }
     }
 
+    #[inline]
     pub(crate) fn sample_due(&self, sequence: u64) -> bool {
-        sequence.is_multiple_of(self.sample_periods)
+        (sequence & self.sample_mask) == 0
     }
 
     pub(crate) fn ready(&mut self, generation: u64, now: u64) {
@@ -152,8 +155,13 @@ mod tests {
     fn sampling_scales_with_period_and_rejects_single_outliers() {
         for (period, stride) in [(64, 64), (256, 16), (1024, 4)] {
             let g = LatencyGuard::new(period, 48000);
+            assert!(g.sample_due(0));
+            assert!(!g.sample_due(stride - 1));
             assert!(g.sample_due(stride));
+            assert!(!g.sample_due(stride + 1));
+            assert!(g.sample_due(stride * 2));
             assert!(!g.sample_due(stride / 2));
+            assert!(!g.sample_due(u64::MAX));
         }
         let mut g = primed();
         g.completed(1_000_000_000, 1_004_000_000);
