@@ -1082,16 +1082,25 @@ mod tests {
         assert_eq!(profile.ports.capture[0].channels, vec![0]);
     }
 
+    fn alsa_e1x2_profile() -> String {
+        E1X2_PROFILE
+            .replace("backend = \"sycon\"\n", "backend = \"alsa\"\n")
+            .replace("pro_handoff_us = 2000\n", "pro_handoff_us = 1000\n")
+            .replace("pro_handoff_auto = false\n", "pro_handoff_auto = true\n")
+    }
+
     #[test]
     fn parses_reference_direct_pro_profile() {
         let profile = Profile::from_toml(E1X2_PROFILE).expect("reference profile should parse");
 
+        assert_eq!(profile.device.backend, HardwareBackend::Sycon);
         assert_eq!(profile.device.buffer_size, 256);
         assert_eq!(profile.device.period_size, 64);
         assert_eq!(profile.device.hardware_period_size, Some(64));
         assert_eq!(profile.device.effective_hardware_period_size(), 64);
         assert_eq!(profile.device.playback_queue_periods, Some(2));
-        assert_eq!(profile.device.pro_handoff_us, 1000);
+        assert_eq!(profile.device.pro_handoff_us, 2000);
+        assert!(!profile.device.pro_handoff_auto);
         assert_eq!(profile.device.pro_latency_periods, 0);
         assert!(!profile.device.playback_timer_scheduling);
         assert!(profile.device.uses_event_driven_linked_pro());
@@ -1109,7 +1118,8 @@ mod tests {
     #[test]
     fn timing_edits_preserve_startup_loopback_table() {
         let text = format!(
-            "{E1X2_PROFILE}\n[device.startup_loopback]\nplayback_channel = 0\ncapture_channel = 4\ntarget_frames = 376\n"
+            "{}\n[device.startup_loopback]\nplayback_channel = 0\ncapture_channel = 4\ntarget_frames = 376\n",
+            alsa_e1x2_profile()
         );
         let mut document = ProfileDocument::from_toml(&text).unwrap();
         let expected = document.profile().device.startup_loopback;
@@ -1123,7 +1133,7 @@ mod tests {
 
     #[test]
     fn startup_loopback_is_explicit_validated_and_fingerprinted() {
-        let mut profile = Profile::from_toml(E1X2_PROFILE).unwrap();
+        let mut profile = Profile::from_toml(&alsa_e1x2_profile()).unwrap();
         profile.device.startup_loopback = None;
         let baseline_hash = profile.fingerprint();
         let settings = StartupLoopbackConfig {
@@ -1218,7 +1228,10 @@ mod tests {
 
     #[test]
     fn automatic_handoff_defaults_on_and_respects_explicit_opt_out() {
-        let legacy = E1X2_PROFILE.replace("pro_handoff_auto = true\n", "");
+        let alsa_toml = E1X2_PROFILE
+            .replace("backend = \"sycon\"\n", "backend = \"alsa\"\n")
+            .replace("pro_handoff_us = 2000\n", "pro_handoff_us = 1000\n");
+        let legacy = alsa_toml.replace("pro_handoff_auto = false\n", "");
         let mut profile = Profile::from_toml(&legacy).unwrap();
         assert!(profile.device.pro_handoff_auto);
         profile.device.period_size = 256;
@@ -1231,7 +1244,10 @@ mod tests {
 
     #[test]
     fn automatic_handoff_scales_with_period_and_manual_mode_is_preserved() {
-        let mut profile = Profile::from_toml(E1X2_PROFILE).unwrap();
+        let alsa_toml = E1X2_PROFILE
+            .replace("backend = \"sycon\"\n", "backend = \"alsa\"\n")
+            .replace("pro_handoff_us = 2000\n", "pro_handoff_us = 1000\n");
+        let mut profile = Profile::from_toml(&alsa_toml).unwrap();
         profile.device.pro_handoff_auto = true;
         for (frames, budget) in [
             (64, 1_000_000),
@@ -1251,7 +1267,7 @@ mod tests {
         );
         auto.apply_to(&mut profile.device);
         assert!(profile.device.pro_handoff_auto);
-        let mut document = ProfileDocument::from_toml(E1X2_PROFILE).unwrap();
+        let mut document = ProfileDocument::from_toml(&alsa_toml).unwrap();
         let mut timing = document.timing();
         timing.pro_handoff_auto = false;
         document.apply_timing(&timing).unwrap();
@@ -1265,8 +1281,7 @@ mod tests {
 
     #[test]
     fn sycon_automatic_handoff_uses_smaller_ring_write_reserve() {
-        let mut profile =
-            Profile::from_toml(include_str!("../../../profiles/topping-e1x2-sycon.toml")).unwrap();
+        let mut profile = Profile::from_toml(E1X2_PROFILE).unwrap();
         // Default Sycon profile enables safe-mode spike headroom (2.0 ms at Q64).
         assert!(!profile.device.pro_handoff_auto);
         assert_eq!(profile.device.pro_handoff_nanos(), 2_000_000);
@@ -1461,7 +1476,7 @@ mod tests {
 
     #[test]
     fn direct_whole_period_handoff_is_a_user_selected_budget() {
-        let text = E1X2_PROFILE.replace("pro_handoff_us = 1000", "pro_handoff_us = 1100");
+        let text = alsa_e1x2_profile().replace("pro_handoff_us = 1000", "pro_handoff_us = 1100");
 
         assert_eq!(
             Profile::from_toml(&text).unwrap().device.pro_handoff_us,
@@ -1595,7 +1610,8 @@ mod tests {
 
     #[test]
     fn direct_transport_allows_user_budgets_and_physically_aligned_ring() {
-        let text = E1X2_PROFILE.replace("hardware_period_size = 64", "hardware_period_size = 32");
+        let text =
+            alsa_e1x2_profile().replace("hardware_period_size = 64", "hardware_period_size = 32");
         let profile =
             Profile::from_toml(&text).expect("Q64 client with P32 transport should parse");
         assert!(profile.device.uses_event_driven_linked_pro());
@@ -1633,7 +1649,7 @@ mod tests {
 
     #[test]
     fn timing_edit_round_trips_q64_p32_b160_without_rounding_client_or_shared_geometry() {
-        let mut document = ProfileDocument::from_toml(E1X2_PROFILE).unwrap();
+        let mut document = ProfileDocument::from_toml(&alsa_e1x2_profile()).unwrap();
         let mut timing = document.timing();
         timing.rate = 48_000;
         timing.period_size = 64;
@@ -1955,14 +1971,23 @@ mod tests {
 
     #[test]
     fn parses_sycon_profile_and_fingerprints_backend() {
-        let sycon_toml = include_str!("../../../profiles/topping-e1x2-sycon.toml");
-        let sycon = Profile::from_toml(sycon_toml).expect("sycon profile should parse");
-        let alsa = Profile::from_toml(E1X2_PROFILE).expect("reference profile should parse");
+        let sycon_toml = E1X2_PROFILE;
+        let sycon = Profile::from_toml(sycon_toml).expect("e1x2 sycon profile should parse");
+        let e2x2 = Profile::from_toml(include_str!("../../../profiles/topping-e2x2.toml"))
+            .expect("e2x2 sycon profile should parse");
+        let alsa_toml = sycon_toml.replace("backend = \"sycon\"", "backend = \"alsa\"");
+        let alsa = Profile::from_toml(&alsa_toml).expect("alsa fallback profile should parse");
 
         assert_eq!(sycon.device.backend, HardwareBackend::Sycon);
         let table = sycon.device.sycon.as_ref().expect("sycon table");
         assert_eq!((table.vendor_id, table.product_id), (0x152a, 0x8755));
         assert_eq!(table.packets_per_urb, 1);
+        assert_eq!(e2x2.device.backend, HardwareBackend::Sycon);
+        let e2x2_table = e2x2.device.sycon.as_ref().expect("e2x2 sycon table");
+        assert_eq!(
+            (e2x2_table.vendor_id, e2x2_table.product_id),
+            (0x152a, 0x8756)
+        );
         assert_eq!(alsa.device.backend, HardwareBackend::Alsa);
         assert_ne!(sycon.fingerprint(), alsa.fingerprint());
 

@@ -1417,7 +1417,7 @@ mod tests {
         layout_for_profile(&Profile::from_toml(profile).unwrap())
     }
 
-    const SYCON_PROFILE: &str = include_str!("../../../../profiles/topping-e1x2-sycon.toml");
+    const SYCON_PROFILE: &str = include_str!("../../../../profiles/topping-e1x2.toml");
 
     #[test]
     fn e1x2_layout_budgets_handoff_ahead_of_one_urb() {

@@ -22,8 +22,9 @@ capture_urbs = 16          # 2..=16 IN URBs in flight
 # safety_frames = 6        # extra OUT ring margin; default one nominal packet, max 10 ms
 ```
 
-[`profiles/topping-e1x2-sycon.toml`](../profiles/topping-e1x2-sycon.toml) is the
-E1x2 reference. ALSA-only keys (`device = "hw:..."`, buffer, queue, timer and
+[`profiles/topping-e1x2.toml`](../profiles/topping-e1x2.toml) (E1x2 OTG) and
+[`profiles/topping-e2x2.toml`](../profiles/topping-e2x2.toml) (E2x2 OTG) enable
+Sycon by default. ALSA-only keys (`device = "hw:..."`, buffer, queue, timer and
 linked-duplex tuning) must still form a valid ALSA profile but are ignored at run
 time, so the same file switches back by setting `backend = "alsa"`. `pro_handoff_auto`, `pro_handoff_us`,
 realtime priorities and the SHARED settings apply as usual; `pro_latency_periods` must be `0`.
@@ -114,7 +115,7 @@ Direct hardware check without the daemon:
 
 ```bash
 sudo systemctl stop sidealsad.service
-sudo target/release/sidealsa-hw-test --profile profiles/topping-e1x2-sycon.toml --periods 7500
+sudo target/release/sidealsa-hw-test --profile profiles/topping-e1x2.toml --periods 7500
 sudo systemctl start sidealsad.service
 ```
 

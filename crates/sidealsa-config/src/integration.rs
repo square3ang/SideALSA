@@ -361,9 +361,10 @@ mod tests {
 
     #[test]
     fn metadata_survives_timing_edits_and_extends_fingerprint() {
-        let text = include_str!("../../../profiles/topping-e1x2.toml");
-        let baseline = profile();
-        // Reconstruct the pre-metadata hash to guard shipped fingerprint compatibility.
+        let text = include_str!("../../../profiles/topping-e1x2.toml")
+            .replace("backend = \"sycon\"\n", "backend = \"alsa\"\n");
+        let baseline = Profile::from_toml(&text).unwrap();
+        // Reconstruct the pre-metadata ALSA hash to guard shipped fingerprint compatibility.
         let mut legacy = 0xcbf29ce484222325;
         crate::hash_u64(
             &mut legacy,

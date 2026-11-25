@@ -5193,6 +5193,7 @@ mod tests {
     fn q64_automatic_handoff_does_not_expand_when_the_queue_is_fuller() {
         let mut profile =
             crate::Profile::from_toml(include_str!("../../../profiles/topping-e1x2.toml")).unwrap();
+        profile.device.backend = crate::HardwareBackend::Alsa;
         profile.device.pro_handoff_auto = true;
         assert_eq!(profile.device.pro_handoff_nanos(), 1_000_000);
         for queued in [64, 96, 128, 192] {

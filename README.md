@@ -168,13 +168,13 @@ The main installer's `--with-asio` installs system files only; **prefix registra
 
 Sycon mode (`backend = "sycon"`) is an optional userspace USB Audio Class 2 backend that replaces the ALSA hardware engine. `sidealsad` opens `/dev/bus/usb/...`, detaches `snd-usb-audio`, and drives isochronous URBs directly with explicit feedback clock tracking. Everything above the engine (PRO, SHARED, ALSA ioplug, PipeWire, Wine ASIO, and `sidealsa-stats`) stays unchanged.
 
-To install using the Topping E1x2 OTG reference profile (48 kHz / Q64, Safe mode 2.0 ms headroom, 1 packet/URB, 12+16 URBs):
+To install using the Topping E1x2 OTG reference profile (Sycon default, 48 kHz / Q64, Safe mode 2.0 ms headroom, 1 packet/URB, 12+16 URBs):
 
 ```bash
-bash scripts/install.sh --profile profiles/topping-e1x2-sycon.toml --replace-profile
+bash scripts/install.sh --profile profiles/topping-e1x2.toml --replace-profile
 ```
 
-Or enable it in an existing profile (set `backend = "alsa"` to switch back):
+Both `profiles/topping-e1x2.toml` and `profiles/topping-e2x2.toml` default to Sycon. To switch back to the kernel ALSA backend, set `backend = "alsa"` in the profile:
 
 ```toml
 [device]
@@ -194,7 +194,7 @@ capture_urbs = 16
 - **USB unplug/replug.** Disconnecting the device stops `sidealsad` cleanly; systemd (`StartLimitIntervalSec=0`, `RestartSec=2`) retries until it returns, and `sidealsa-reconnect` refreshes PipeWire links.
 - **Limits.** Requires UAC2 with explicit feedback (or sync/adaptive endpoints), 32-bit (`S32_LE`) 4-byte subslots, and `pro_latency_periods = 0` (`startup_loopback` is rejected). Stop `sidealsad` before running `sidealsa-setup`.
 
-See [Sycon Direct UAC2 Backend](docs/sycon.md) and [Topping E1x2 Sycon Profile](profiles/topping-e1x2-sycon.toml).
+See [Sycon Direct UAC2 Backend](docs/sycon.md), [Topping E1x2 Profile](profiles/topping-e1x2.toml), and [Topping E2x2 Profile](profiles/topping-e2x2.toml).
 
 ## Everyday Use
 
@@ -314,7 +314,7 @@ The ALSA ioplug supports only S32_LE / RW-interleaved at the profile's sample ra
 | Topic | Documentation |
 | --- | --- |
 | Installation / selection menus | [Installation Details](docs/installation.md), [Device TUI](docs/onboard-setup.md), [ASIO TUI](docs/asio-setup.md) |
-| Profiles / channel splits | [Device Profiles and Integration Config Generation](docs/device-profiles.md), [Profile Validation](docs/milestone-2.md), [E1x2 Profile](profiles/topping-e1x2.toml), [E1x2 Sycon Profile](profiles/topping-e1x2-sycon.toml) |
+| Profiles / channel splits | [Device Profiles and Integration Config Generation](docs/device-profiles.md), [Profile Validation](docs/milestone-2.md), [E1x2 Profile](profiles/topping-e1x2.toml), [E2x2 Profile](profiles/topping-e2x2.toml) |
 | Engine / communication | [Direct ALSA Engine](docs/milestone-1.md), [Sycon Direct UAC2 Backend](docs/sycon.md), [Local PRO](docs/milestone-3.md), [Daemon and Protocol](docs/milestone-4.md) |
 | Clients / integration | [SHARED](docs/milestone-5.md), [Client Library](docs/milestone-6.md), [ALSA ioplug](docs/milestone-7.md), [PipeWire](docs/milestone-8.md) |
 | Timing / validation history | [Wine ASIO](docs/milestone-asio.md), [Startup Loopback Normalization](docs/startup-loopback.md), [Performance](docs/performance.md), [Audio Load Benchmark](docs/audio-load-benchmark.md) |
