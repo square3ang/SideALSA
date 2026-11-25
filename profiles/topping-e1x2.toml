@@ -15,13 +15,13 @@ pro_latency_periods = 0
 # (~7.2 ms RTL). Set pro_handoff_auto = true for minimum latency (1.25 ms budget).
 pro_handoff_us = 2000
 pro_handoff_auto = false
-# Keep userspace audio below the PREEMPT_RT xHCI IRQ thread (FIFO 50 here).
+# Keep DAW/ASIO callbacks below default kernel threaded IRQ priority (50).
 pro_realtime_priority = 46
 shared_latency_periods = 5
 shared_playback_repeat_on_underrun = false
 realtime = true
-# USB I/O thread; the PRO cycle thread runs one below.
-realtime_priority = 48
+# USB I/O thread (97); PRO cycle runs at 96; Sycon boosts the device's xHCI IRQ to 98.
+realtime_priority = 97
 # Sycon mode: sidealsad drives the UAC2 function directly over usbfs and
 # detaches snd-usb-audio while it runs (the ALSA card disappears).
 # Set backend = "alsa" to use the kernel ALSA driver instead.

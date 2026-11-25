@@ -20,8 +20,9 @@ mod uac2;
 mod usbfs;
 
 use std::{
-    io,
+    fs, io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    path::Path,
     ptr,
     sync::{
         Arc,
@@ -55,6 +56,8 @@ const IO_STALL_MS: i32 = 1000;
 const CYCLE_POLL_MS: i32 = 5;
 const RESTART_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 const DRAIN_TIMEOUT_NANOS: u64 = 500_000_000;
+/// Strictly below kernel migration/watchdog threads (SCHED_FIFO 99).
+const MAX_IRQ_RT_PRIORITY: i32 = 98;
 
 pub struct SyconEngine {
     config: HardwareConfig,
@@ -62,6 +65,7 @@ pub struct SyconEngine {
     routing: RoutingTable,
     layout: Layout,
     started: bool,
+    _irq_guard: IrqPriorityGuard,
     device: UsbDevice,
 }
 
@@ -216,12 +220,18 @@ impl SyconEngine {
             layout.capture_urbs,
             layout.lead_frames,
         );
+        let irq_guard = if config.realtime {
+            IrqPriorityGuard::boost(&located.port, config.realtime_priority)
+        } else {
+            IrqPriorityGuard::default()
+        };
         Ok(Self {
             config,
             timeline: Arc::new(HardwareTimeline::default()),
             routing,
             layout,
             started: false,
+            _irq_guard: irq_guard,
             device,
         })
     }
@@ -406,6 +416,166 @@ impl Drop for SyconEngine {
     fn drop(&mut self) {
         let _ = self.stop();
     }
+}
+
+struct SavedIrqPriority {
+    pid: libc::pid_t,
+    comm: String,
+    policy: libc::c_int,
+    priority: libc::c_int,
+}
+
+/// Raises threaded xHCI IRQ handler(s) for the audio device's USB host
+/// controller above `sycon-usb` and restores their original priority on Drop.
+#[derive(Default)]
+struct IrqPriorityGuard {
+    saved: Vec<SavedIrqPriority>,
+}
+
+impl IrqPriorityGuard {
+    fn boost(port: &str, realtime_priority: u32) -> Self {
+        let target = irq_target_priority(realtime_priority);
+        let irqs = find_controller_irqs(&Path::new("/sys/bus/usb/devices").join(port));
+        if irqs.is_empty() {
+            return Self::default();
+        }
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return Self::default();
+        };
+        let mut saved = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().and_then(|s| s.parse::<libc::pid_t>().ok()) else {
+                continue;
+            };
+            let proc_dir = entry.path();
+            if !is_kernel_thread(&proc_dir) {
+                continue;
+            }
+            let Ok(comm_raw) = fs::read_to_string(proc_dir.join("comm")) else {
+                continue;
+            };
+            let comm = comm_raw.trim();
+            if !is_matching_irq_comm(comm, &irqs) {
+                continue;
+            }
+            // SAFETY: plain sched queries on a verified kernel IRQ thread pid.
+            let prev_policy = unsafe { libc::sched_getscheduler(pid) };
+            let mut prev_param = libc::sched_param { sched_priority: 0 };
+            if prev_policy < 0 || unsafe { libc::sched_getparam(pid, &mut prev_param) } != 0 {
+                continue;
+            }
+            if prev_policy == libc::SCHED_FIFO && prev_param.sched_priority >= target {
+                continue;
+            }
+            let target_param = libc::sched_param {
+                sched_priority: target,
+            };
+            // SAFETY: raises only the matched kernel IRQ thread, bounded to <= 98.
+            if unsafe { libc::sched_setscheduler(pid, libc::SCHED_FIFO, &target_param) } == 0 {
+                eprintln!(
+                    "sycon: boosted {comm} (pid {pid}) SCHED_FIFO {} -> {target}",
+                    prev_param.sched_priority
+                );
+                saved.push(SavedIrqPriority {
+                    pid,
+                    comm: comm.to_string(),
+                    policy: prev_policy,
+                    priority: prev_param.sched_priority,
+                });
+            } else {
+                eprintln!(
+                    "sycon: could not boost {comm} (pid {pid}) to SCHED_FIFO {target}: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for IrqPriorityGuard {
+    fn drop(&mut self) {
+        for saved in self.saved.drain(..) {
+            let proc_dir = Path::new("/proc").join(saved.pid.to_string());
+            if !is_kernel_thread(&proc_dir) {
+                continue;
+            }
+            let Ok(comm) = fs::read_to_string(proc_dir.join("comm")) else {
+                continue;
+            };
+            if comm.trim() != saved.comm {
+                continue;
+            }
+            let param = libc::sched_param {
+                sched_priority: saved.priority,
+            };
+            // SAFETY: restores the same verified kernel IRQ thread to its previous policy.
+            unsafe {
+                let _ = libc::sched_setscheduler(saved.pid, saved.policy, &param);
+            }
+        }
+    }
+}
+
+fn irq_target_priority(realtime_priority: u32) -> i32 {
+    (realtime_priority as i32)
+        .saturating_add(1)
+        .clamp(1, MAX_IRQ_RT_PRIORITY)
+}
+
+fn find_controller_irqs(usb_device_sysfs: &Path) -> Vec<u32> {
+    let Ok(canonical) = fs::canonicalize(usb_device_sysfs) else {
+        return Vec::new();
+    };
+    let mut current = canonical.as_path();
+    while let Some(parent) = current.parent() {
+        let msi_dir = parent.join("msi_irqs");
+        let irq_file = parent.join("irq");
+        if msi_dir.is_dir() || irq_file.is_file() {
+            let mut irqs = Vec::new();
+            if let Ok(entries) = fs::read_dir(&msi_dir) {
+                for entry in entries.flatten() {
+                    if let Some(irq) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .filter(|&n| n > 0)
+                    {
+                        irqs.push(irq);
+                    }
+                }
+            }
+            if let Ok(text) = fs::read_to_string(&irq_file)
+                && let Ok(irq) = text.trim().parse::<u32>()
+                && irq > 0
+            {
+                irqs.push(irq);
+            }
+            irqs.sort_unstable();
+            irqs.dedup();
+            return irqs;
+        }
+        current = parent;
+    }
+    Vec::new()
+}
+
+fn is_kernel_thread(proc_dir: &Path) -> bool {
+    fs::read(proc_dir.join("cmdline")).is_ok_and(|bytes| bytes.is_empty())
+}
+
+fn is_matching_irq_comm(comm: &str, irqs: &[u32]) -> bool {
+    let Some(rest) = comm.trim().strip_prefix("irq/") else {
+        return false;
+    };
+    let Some((number, _)) = rest.split_once('-') else {
+        return false;
+    };
+    number
+        .parse::<u32>()
+        .ok()
+        .is_some_and(|irq| irqs.binary_search(&irq).is_ok())
 }
 
 impl Layout {
@@ -1898,5 +2068,31 @@ mod tests {
         assert_eq!(shared.playback.len(), 8);
         assert!(shared.resync_requested.load(Ordering::Acquire));
         assert_eq!(timeline.snapshot().hw_playback_xruns, 0);
+    }
+
+    #[test]
+    fn irq_priority_clamps_below_99_and_matches_controller_irqs() {
+        assert_eq!(irq_target_priority(48), 49);
+        assert_eq!(irq_target_priority(97), 98);
+        assert_eq!(irq_target_priority(98), 98);
+        assert_eq!(irq_target_priority(99), 98);
+
+        let irqs = vec![45, 124, 125];
+        assert!(is_matching_irq_comm("irq/45-xhci_hcd\n", &irqs));
+        assert!(is_matching_irq_comm("irq/124-xhci_hcd", &irqs));
+        assert!(!is_matching_irq_comm("irq/46-xhci_hcd", &irqs));
+        assert!(!is_matching_irq_comm("xhci_hcd", &irqs));
+        assert!(!is_matching_irq_comm("irq/124", &irqs));
+
+        let temp = std::env::temp_dir().join(format!("sidealsa-irq-test-{}", std::process::id()));
+        let usb_dev = temp.join("0000:00:14.0/usb1/1-11");
+        let msi_dir = temp.join("0000:00:14.0/msi_irqs");
+        fs::create_dir_all(&usb_dev).unwrap();
+        fs::create_dir_all(&msi_dir).unwrap();
+        fs::write(temp.join("0000:00:14.0/irq"), "124\n").unwrap();
+        fs::write(msi_dir.join("124"), "").unwrap();
+        fs::write(msi_dir.join("125"), "").unwrap();
+        assert_eq!(find_controller_irqs(&usb_dev), vec![124, 125]);
+        let _ = fs::remove_dir_all(&temp);
     }
 }

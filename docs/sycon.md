@@ -89,6 +89,10 @@ realtime priorities and the SHARED settings apply as usual; `pro_latency_periods
   external clock) is switched to the first valid input, like snd-usb-audio's
   autoclock. A rate outside the clock's `GET_RANGE` is a profile error: sidealsad
   exits 78 and systemd does not retry, so the card does not flap.
+- **Threaded xHCI IRQ priority.** When `realtime = true` on a `threadirqs`
+  kernel, `SyconEngine::open` boosts the audio interface's USB host controller
+  IRQ thread (`irq/<N>-xhci_hcd`) to `SCHED_FIFO min(realtime_priority + 1, 98)`
+  and restores its original priority on exit. On hardirq kernels it is a no-op.
 
 No allocation, lock, log or formatting happens in either steady-state loop. URB
 buffers and rings are allocated before streaming starts.
