@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
 };
 
-use sidealsa_core::{DuplexEngine, Profile, RoutingTable};
+use sidealsa_core::{HardwareEngine, Profile, RoutingTable};
 use signal_hook::{
     consts::signal::{SIGINT, SIGTERM},
     flag,
@@ -46,7 +46,8 @@ fn main() {
         return;
     }
 
-    let mut engine = match DuplexEngine::open(profile) {
+    // Signals keep their default action during open: a blocking ALSA open stays killable.
+    let mut engine = match HardwareEngine::open(profile) {
         Ok(engine) => engine,
         Err(error) => {
             eprintln!("{error}");
@@ -55,18 +56,20 @@ fn main() {
     };
 
     let stop = Arc::new(AtomicBool::new(false));
-    if let Err(error) = flag::register(SIGINT, Arc::clone(&stop)) {
-        eprintln!("could not register SIGINT handler: {error}");
-        std::process::exit(1);
-    }
-    if let Err(error) = flag::register(SIGTERM, Arc::clone(&stop)) {
-        eprintln!("could not register SIGTERM handler: {error}");
-        std::process::exit(1);
+    for (signal, name) in [(SIGINT, "SIGINT"), (SIGTERM, "SIGTERM")] {
+        if let Err(error) = flag::register(signal, Arc::clone(&stop)) {
+            eprintln!("could not register {name} handler: {error}");
+            // process::exit skips Drop, which releases a Sycon device.
+            drop(engine);
+            std::process::exit(1);
+        }
     }
 
     let run_result = engine.run(&stop, args.periods);
     let stop_result = engine.stop();
     let stats = engine.stats();
+    // Release the device before any process::exit, which skips Drop.
+    drop(engine);
 
     if let Err(error) = run_result {
         eprintln!("stream stopped: {error}");
@@ -146,7 +149,7 @@ fn print_help() {
     println!("sidealsa-hw-test [--profile PATH] [--periods COUNT] [--list-ports]");
     println!("default profile: profiles/topping-e1x2.toml");
     println!("without --periods, run until SIGINT or SIGTERM");
-    println!("--list-ports validates and prints compiled logical ports without opening ALSA");
+    println!("--list-ports validates and prints compiled logical ports without opening hardware");
 }
 
 fn print_ports(direction: &str, ports: &[sidealsa_core::CompiledPort]) {

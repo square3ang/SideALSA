@@ -3,10 +3,14 @@
 Description=SideALSA physical audio daemon
 After=sound.target systemd-tmpfiles-setup.service
 Wants=sound.target
+# Keep retrying across USB unplug/replug; bad profiles still stop on exit 78.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=@PREFIX@/bin/sidealsad --profile @PROFILE@ --socket @SOCKET@
+# Sycon mode detaches snd-usb-audio; rebind it even after a crash. No-op for ALSA.
+ExecStopPost=-@PREFIX@/bin/sidealsad --profile @PROFILE@ --socket @SOCKET@ --release-usb
 Restart=on-failure
 RestartPreventExitStatus=78
 RestartSec=2
@@ -14,6 +18,12 @@ Group=audio
 UMask=0007
 LimitRTPRIO=99
 LimitMEMLOCK=infinity
+NoNewPrivileges=yes
+PrivateNetwork=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
 
 [Install]
 WantedBy=multi-user.target

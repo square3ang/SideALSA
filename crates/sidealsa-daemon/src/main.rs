@@ -10,7 +10,7 @@ use sidealsa_config::Profile;
 use sidealsa_config::selection::{
     DEFAULT_SOCKET_PATH, InstalledSelection, LEGACY_PROFILE_PATH, installed_selection,
 };
-use sidealsa_core::DuplexEngine;
+use sidealsa_core::{HardwareBackend, HardwareEngine};
 use sidealsa_daemon::{DaemonState, run_control_listener};
 use signal_hook::{
     consts::signal::{SIGINT, SIGTERM},
@@ -22,6 +22,7 @@ struct Args {
     profile: PathBuf,
     socket: PathBuf,
     pro_diagnostics: bool,
+    release_usb: bool,
 }
 
 fn main() {
@@ -40,47 +41,62 @@ fn main() {
             std::process::exit(78);
         }
     };
-    if args.pro_diagnostics && !profile.device.uses_event_driven_linked_pro() {
-        eprintln!("--pro-diagnostics currently requires direct event-driven linked PRO");
+    if args.release_usb {
+        // ExecStopPost: a killed Sycon daemon leaves snd-usb-audio unbound.
+        match sidealsa_core::release_sycon_device(&profile) {
+            Ok(_) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.pro_diagnostics && !profile.device.uses_event_driven_pro() {
+        eprintln!("--pro-diagnostics currently requires zero-lead event-driven PRO");
         std::process::exit(2);
     }
-    let engine = match DuplexEngine::open(profile.clone()) {
-        Ok(engine) => engine,
-        Err(error) => {
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
-    };
-    let timeline = engine.timeline_handle();
-    let state = match DaemonState::new(&profile, timeline) {
-        Ok(state) => Arc::new(state),
-        Err(error) => {
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
-    };
-
-    let stop = Arc::new(AtomicBool::new(false));
-    if args.pro_diagnostics {
-        state.enable_pro_diagnostics();
-    }
-    if let Err(error) = flag::register(SIGINT, Arc::clone(&stop)) {
-        eprintln!("could not register SIGINT handler: {error}");
-        std::process::exit(1);
-    }
-    if let Err(error) = flag::register(SIGTERM, Arc::clone(&stop)) {
-        eprintln!("could not register SIGTERM handler: {error}");
-        std::process::exit(1);
-    }
-    let hardware_stop = Arc::clone(&stop);
-    let hardware_ready = state.hardware_ready_handle();
-    let (capture_bridge, playback_bridge) = state.bridges();
     if profile.device.realtime
         && let Err(error) = lock_process_memory()
     {
         eprintln!("could not lock realtime memory: {error}");
         std::process::exit(1);
     }
+    let backend = profile.device.backend;
+    // Signals keep their default action until open returns: a blocking ALSA
+    // open must stay killable.
+    let engine = match HardwareEngine::open(profile.clone()) {
+        Ok(engine) => engine,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(hardware_error_exit_code(&error, backend));
+        }
+    };
+    // From here process::exit skips the Sycon engine's Drop, which rebinds
+    // snd-usb-audio: drop it first on every early exit.
+    let stop = Arc::new(AtomicBool::new(false));
+    for (signal, name) in [(SIGINT, "SIGINT"), (SIGTERM, "SIGTERM")] {
+        if let Err(error) = flag::register(signal, Arc::clone(&stop)) {
+            eprintln!("could not register {name} handler: {error}");
+            drop(engine);
+            std::process::exit(1);
+        }
+    }
+    let timeline = engine.timeline_handle();
+    let state = match DaemonState::new(&profile, timeline) {
+        Ok(state) => Arc::new(state),
+        Err(error) => {
+            eprintln!("{error}");
+            drop(engine);
+            std::process::exit(1);
+        }
+    };
+
+    if args.pro_diagnostics {
+        state.enable_pro_diagnostics();
+    }
+    let hardware_stop = Arc::clone(&stop);
+    let hardware_ready = state.hardware_ready_handle();
+    let (capture_bridge, playback_bridge) = state.bridges();
     let hardware_handle = thread::spawn(move || {
         prefault_realtime_stack();
         let mut engine = engine;
@@ -106,7 +122,7 @@ fn main() {
         let mut exit_code = 1;
         match hardware_handle.join() {
             Ok((Err(error), _)) => {
-                exit_code = hardware_error_exit_code(&error);
+                exit_code = hardware_error_exit_code(&error, backend);
                 eprintln!("hardware stopped before ready: {error}");
             }
             Ok((_, Err(error))) => eprintln!("hardware cleanup failed before ready: {error}"),
@@ -154,7 +170,7 @@ fn main() {
 
     if let Err(error) = run_result {
         eprintln!("hardware stopped: {error}");
-        std::process::exit(hardware_error_exit_code(&error));
+        std::process::exit(hardware_error_exit_code(&error, backend));
     }
     if let Err(error) = stop_result {
         eprintln!("hardware cleanup failed: {error}");
@@ -229,11 +245,15 @@ fn main() {
     }
 }
 
-fn hardware_error_exit_code(error: &sidealsa_core::EngineError) -> i32 {
-    if matches!(error, sidealsa_core::EngineError::StartupLoopback(_)) {
-        78 // EX_CONFIG: don't let systemd retry hardware starts until one happens to fit.
-    } else {
-        1
+fn hardware_error_exit_code(error: &sidealsa_core::EngineError, backend: HardwareBackend) -> i32 {
+    match error {
+        // EX_CONFIG: don't let systemd retry hardware starts until one happens to fit.
+        sidealsa_core::EngineError::StartupLoopback(_) => 78,
+        // A profile the device cannot run will not fix itself, and each Sycon
+        // retry would detach and rebind snd-usb-audio. ALSA keeps retrying:
+        // its rate negotiation can fail while another program holds the clock.
+        sidealsa_core::EngineError::InvalidConfig(_) if backend == HardwareBackend::Sycon => 78,
+        _ => 1,
     }
 }
 
@@ -290,10 +310,12 @@ fn parse_args_with_selection(
     let mut profile = None;
     let mut socket = None;
     let mut pro_diagnostics = false;
+    let mut release_usb = false;
 
     while let Some(argument) = arguments.next() {
         match argument.to_str() {
             Some("--pro-diagnostics") => pro_diagnostics = true,
+            Some("--release-usb") => release_usb = true,
             Some("--profile") => {
                 let value = arguments
                     .next()
@@ -314,7 +336,7 @@ fn parse_args_with_selection(
             None => return Err("arguments must be valid UTF-8".into()),
         }
     }
-    if (profile.is_none() || socket.is_none())
+    if (profile.is_none() || (!release_usb && socket.is_none()))
         && let Some(selected) = selection()?
     {
         profile.get_or_insert(selected.profile);
@@ -330,12 +352,16 @@ fn parse_args_with_selection(
         profile,
         socket,
         pro_diagnostics,
+        release_usb,
     })
 }
 
 fn print_help() {
-    println!("sidealsad [--profile PATH] [--socket PATH] [--pro-diagnostics]");
+    println!("sidealsad [--profile PATH] [--socket PATH] [--pro-diagnostics] [--release-usb]");
     println!("--pro-diagnostics: log direct-PRO last-miss timing once per second, outside RT");
+    println!(
+        "--release-usb: rebind the kernel driver of a backend = \"sycon\" profile's device and exit"
+    );
     println!(
         "Defaults: trusted /etc/sidealsa/active.toml; legacy profile only if installed; otherwise use --profile PATH."
     );
@@ -425,6 +451,17 @@ mod tests {
         )
         .unwrap();
         assert!(!defaults.pro_diagnostics);
+        assert!(!defaults.release_usb);
+        let release = super::parse_args_with_selection(
+            ["--profile", "dev.toml", "--release-usb"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+            || Err("untrusted selection".into()),
+            || panic!("must not fall back"),
+        )
+        .unwrap();
+        assert!(release.release_usb);
+        assert_eq!(release.profile, std::path::PathBuf::from("dev.toml"));
         let enabled = super::parse_args_from(
             [
                 "--pro-diagnostics",
@@ -446,19 +483,50 @@ mod tests {
 
     #[test]
     fn unqualified_loopback_prevents_service_restart() {
+        use sidealsa_core::{EngineError, HardwareBackend};
+        let invalid = || EngineError::InvalidConfig("rate does not fit".into());
         assert_eq!(
-            super::hardware_error_exit_code(&sidealsa_core::EngineError::StartupLoopback(
-                "missing digital route"
-            )),
+            super::hardware_error_exit_code(
+                &EngineError::StartupLoopback("missing digital route"),
+                HardwareBackend::Alsa
+            ),
             78
         );
         assert_eq!(
-            super::hardware_error_exit_code(&sidealsa_core::EngineError::Stopped),
+            super::hardware_error_exit_code(&invalid(), HardwareBackend::Sycon),
+            78
+        );
+        // ALSA rate negotiation can fail while another program holds the clock.
+        assert_eq!(
+            super::hardware_error_exit_code(&invalid(), HardwareBackend::Alsa),
             1
         );
-        assert!(
-            include_str!("../../../packaging/sidealsad.service.in")
-                .contains("RestartPreventExitStatus=78")
+        assert_eq!(
+            super::hardware_error_exit_code(&EngineError::Stopped, HardwareBackend::Sycon),
+            1
         );
+        assert_eq!(
+            super::hardware_error_exit_code(
+                &EngineError::Usb {
+                    operation: "locate device",
+                    source: std::io::Error::new(std::io::ErrorKind::NotFound, "absent"),
+                },
+                HardwareBackend::Sycon,
+            ),
+            1
+        );
+        assert_eq!(
+            super::hardware_error_exit_code(
+                &EngineError::Usb {
+                    operation: "stream",
+                    source: std::io::Error::from_raw_os_error(libc::ENODEV),
+                },
+                HardwareBackend::Sycon,
+            ),
+            1
+        );
+        let unit = include_str!("../../../packaging/sidealsad.service.in");
+        assert!(unit.contains("RestartPreventExitStatus=78"));
+        assert!(unit.contains("StartLimitIntervalSec=0"));
     }
 }

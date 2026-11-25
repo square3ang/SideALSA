@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use sidealsa_core::{DuplexEngine, ProCaptureSink, ProPlaybackSource, Profile};
+use sidealsa_core::{HardwareEngine, ProCaptureSink, ProPlaybackSource, Profile};
 use signal_hook::{
     consts::signal::{SIGINT, SIGTERM},
     flag,
@@ -61,7 +61,8 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let mut engine = match DuplexEngine::open(profile) {
+    // Signals keep their default action during open: a blocking ALSA open stays killable.
+    let mut engine = match HardwareEngine::open(profile) {
         Ok(engine) => engine,
         Err(error) => {
             eprintln!("{error}");
@@ -70,13 +71,13 @@ fn main() {
     };
 
     let stop = Arc::new(AtomicBool::new(false));
-    if let Err(error) = flag::register(SIGINT, Arc::clone(&stop)) {
-        eprintln!("could not register SIGINT handler: {error}");
-        std::process::exit(1);
-    }
-    if let Err(error) = flag::register(SIGTERM, Arc::clone(&stop)) {
-        eprintln!("could not register SIGTERM handler: {error}");
-        std::process::exit(1);
+    for (signal, name) in [(SIGINT, "SIGINT"), (SIGTERM, "SIGTERM")] {
+        if let Err(error) = flag::register(signal, Arc::clone(&stop)) {
+            eprintln!("could not register {name} handler: {error}");
+            // process::exit skips Drop, which releases a Sycon device.
+            drop(engine);
+            std::process::exit(1);
+        }
     }
 
     let capture = FakeCapture {
@@ -86,6 +87,8 @@ fn main() {
     let run_result = engine.run_pro(&stop, args.periods, capture, FakePlayback);
     let stop_result = engine.stop();
     let stats = engine.stats();
+    // Release the device before any process::exit, which skips Drop.
+    drop(engine);
 
     if let Err(error) = run_result {
         eprintln!("stream stopped: {error}");

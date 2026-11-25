@@ -99,6 +99,12 @@ pub enum EngineError {
     LinkedStartupInterrupted,
     #[error("startup digital loopback normalization failed: {0}")]
     StartupLoopback(&'static str),
+    #[error("USB {operation} failed: {source}")]
+    Usb {
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
 }
 
 pub struct DuplexEngine {
@@ -923,13 +929,13 @@ impl Drop for DuplexEngine {
     }
 }
 
-struct RealtimeGuard {
+pub(crate) struct RealtimeGuard {
     policy: libc::c_int,
     priority: libc::c_int,
 }
 
 impl RealtimeGuard {
-    fn enter(priority: i32, operation: &'static str) -> Result<Self, EngineError> {
+    pub(crate) fn enter(priority: i32, operation: &'static str) -> Result<Self, EngineError> {
         let policy = unsafe { libc::sched_getscheduler(0) };
         if policy < 0 {
             return Err(EngineError::RealtimeScheduling {
@@ -964,7 +970,10 @@ impl Drop for RealtimeGuard {
     }
 }
 
-fn set_current_realtime(priority: i32, operation: &'static str) -> Result<(), EngineError> {
+pub(crate) fn set_current_realtime(
+    priority: i32,
+    operation: &'static str,
+) -> Result<(), EngineError> {
     let parameters = libc::sched_param {
         sched_priority: priority,
     };
@@ -1036,7 +1045,7 @@ impl WorkerControl<'_> {
     }
 }
 
-struct NoopPro;
+pub(crate) struct NoopPro;
 
 impl ProCaptureSink for NoopPro {
     fn process_capture(&mut self, _sequence: u64, _capture: &[i32]) {}
@@ -3882,7 +3891,7 @@ fn wait_for_handoff_target(
     }
 }
 
-fn monotonic_nanos() -> u64 {
+pub(crate) fn monotonic_nanos() -> u64 {
     let mut timestamp = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -4553,7 +4562,7 @@ fn configure_sw_params(
     })
 }
 
-fn ensure_supported_format(
+pub(crate) fn ensure_supported_format(
     format: &SampleFormat,
     direction: StreamDirection,
 ) -> Result<(), EngineError> {
@@ -4566,12 +4575,12 @@ fn ensure_supported_format(
     }
 }
 
-fn sample_count(frames: u32, channels: u32) -> Result<usize, EngineError> {
+pub(crate) fn sample_count(frames: u32, channels: u32) -> Result<usize, EngineError> {
     usize::try_from(u64::from(frames) * u64::from(channels))
         .map_err(|_| EngineError::InvalidConfig("sample count does not fit usize".into()))
 }
 
-fn routing_error_to_engine_error(error: RoutingError) -> EngineError {
+pub(crate) fn routing_error_to_engine_error(error: RoutingError) -> EngineError {
     EngineError::InvalidConfig(error.to_string())
 }
 

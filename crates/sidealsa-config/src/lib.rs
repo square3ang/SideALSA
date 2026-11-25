@@ -69,8 +69,59 @@ pub struct HardwareConfig {
     pub realtime_priority: u32,
     #[serde(default)]
     pub startup_loopback: Option<StartupLoopbackConfig>,
+    /// Physical transport: ALSA PCMs (default) or direct UAC2 over usbfs.
+    #[serde(default)]
+    pub backend: HardwareBackend,
+    #[serde(default)]
+    pub sycon: Option<SyconConfig>,
     pub playback: PcmConfig,
     pub capture: PcmConfig,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HardwareBackend {
+    #[default]
+    Alsa,
+    /// Direct USB Audio Class 2 streaming; snd-usb-audio is detached while running.
+    Sycon,
+}
+
+pub const MAX_SYCON_PACKETS_PER_URB: u32 = 8;
+pub const MAX_SYCON_URBS: u32 = 16;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SyconConfig {
+    pub vendor_id: u16,
+    pub product_id: u16,
+    /// sysfs port path such as "1-11", required only when several units match.
+    #[serde(default)]
+    pub port: Option<String>,
+    /// Isochronous packets per URB; one packet is one (micro)frame.
+    #[serde(default = "default_sycon_packets_per_urb")]
+    pub packets_per_urb: u32,
+    /// OUT URBs kept in flight; their data is committed and adds playback latency.
+    #[serde(default = "default_sycon_playback_urbs")]
+    pub playback_urbs: u32,
+    /// IN URBs kept in flight; they add tolerance, not latency.
+    #[serde(default = "default_sycon_capture_urbs")]
+    pub capture_urbs: u32,
+    /// Extra playback lead beyond the PRO handoff budget, in frames.
+    #[serde(default)]
+    pub safety_frames: Option<u32>,
+}
+
+fn default_sycon_packets_per_urb() -> u32 {
+    2
+}
+
+fn default_sycon_playback_urbs() -> u32 {
+    3
+}
+
+fn default_sycon_capture_urbs() -> u32 {
+    4
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -200,6 +251,20 @@ impl Profile {
             hash_u32(&mut hash, loopback.playback_channel);
             hash_u32(&mut hash, loopback.capture_channel);
             hash_u32(&mut hash, loopback.target_frames);
+        }
+        if self.device.backend == HardwareBackend::Sycon
+            && let Some(sycon) = &self.device.sycon
+        {
+            hash_string(&mut hash, "backend.sycon");
+            hash_u32(
+                &mut hash,
+                u32::from(sycon.vendor_id) << 16 | u32::from(sycon.product_id),
+            );
+            hash_string(&mut hash, sycon.port.as_deref().unwrap_or(""));
+            hash_u32(&mut hash, sycon.packets_per_urb);
+            hash_u32(&mut hash, sycon.playback_urbs);
+            hash_u32(&mut hash, sycon.capture_urbs);
+            hash_u32(&mut hash, sycon.safety_frames.unwrap_or(u32::MAX));
         }
         if self.integration != IntegrationConfig::default() {
             hash_string(&mut hash, "integration.pipewire");
@@ -660,6 +725,7 @@ impl HardwareConfig {
         }
         self.playback.validate("playback")?;
         self.capture.validate("capture")?;
+        self.validate_sycon()?;
         if let Some(loopback) = self.startup_loopback {
             if !self.uses_event_driven_linked_pro() {
                 return Err(ProfileError::Invalid(
@@ -682,6 +748,63 @@ impl HardwareConfig {
         Ok(())
     }
 
+    fn validate_sycon(&self) -> Result<(), ProfileError> {
+        if self.backend != HardwareBackend::Sycon {
+            return Ok(());
+        }
+        let Some(sycon) = &self.sycon else {
+            return Err(ProfileError::Invalid(
+                "backend = \"sycon\" requires a [device.sycon] table".into(),
+            ));
+        };
+        if self.startup_loopback.is_some() {
+            return Err(ProfileError::Invalid(
+                "startup_loopback is not supported by the sycon backend".into(),
+            ));
+        }
+        if self.pro_latency_periods != 0 {
+            return Err(ProfileError::Invalid(
+                "sycon backend requires pro_latency_periods = 0".into(),
+            ));
+        }
+        if self.pro_handoff_nanos() > 100_000_000 {
+            return Err(ProfileError::Invalid(
+                "sycon pro_handoff must be at most 100 ms".into(),
+            ));
+        }
+        if !(1..=MAX_SYCON_PACKETS_PER_URB).contains(&sycon.packets_per_urb) {
+            return Err(ProfileError::Invalid(format!(
+                "sycon.packets_per_urb must be between 1 and {MAX_SYCON_PACKETS_PER_URB}"
+            )));
+        }
+        for (name, urbs) in [
+            ("playback_urbs", sycon.playback_urbs),
+            ("capture_urbs", sycon.capture_urbs),
+        ] {
+            if !(2..=MAX_SYCON_URBS).contains(&urbs) {
+                return Err(ProfileError::Invalid(format!(
+                    "sycon.{name} must be between 2 and {MAX_SYCON_URBS}"
+                )));
+            }
+        }
+        if sycon
+            .safety_frames
+            .is_some_and(|frames| frames > self.rate / 100)
+        {
+            return Err(ProfileError::Invalid(
+                "sycon.safety_frames must be at most 10 ms".into(),
+            ));
+        }
+        if sycon
+            .port
+            .as_deref()
+            .is_some_and(|port| port.trim().is_empty())
+        {
+            return Err(ProfileError::Invalid("sycon.port is empty".into()));
+        }
+        Ok(())
+    }
+
     pub fn effective_pro_realtime_priority(&self) -> u32 {
         if !self.realtime || self.realtime_priority <= 2 {
             0
@@ -691,8 +814,18 @@ impl HardwareConfig {
         }
     }
 
+    /// Zero-lead PRO driven by capture completions, for either backend.
+    pub fn uses_event_driven_pro(&self) -> bool {
+        // Sycon is always capture-driven duplex; the ALSA link/timer keys do not apply.
+        if self.backend == HardwareBackend::Sycon {
+            self.pro_latency_periods == 0
+        } else {
+            self.uses_event_driven_linked_pro()
+        }
+    }
+
     pub fn pro_handoff_nanos(&self) -> u64 {
-        if self.pro_handoff_auto && self.uses_event_driven_linked_pro() {
+        if self.pro_handoff_auto && self.uses_event_driven_pro() {
             let reserve = direct_pro_write_reserve_frames(self.period_size, self.rate);
             // Bound the configured ceiling as well as actual queue occupancy.
             // A temporarily fuller queue must not extend Q64 beyond its
@@ -736,7 +869,8 @@ impl HardwareConfig {
 
     pub fn uses_staged_pro_packets(&self) -> bool {
         let hardware_period = self.effective_hardware_period_size();
-        self.effective_duplex_link()
+        self.backend == HardwareBackend::Alsa
+            && self.effective_duplex_link()
             && self.pro_latency_periods == 1
             && hardware_period < self.period_size
             && self.buffer_size >= self.period_size.saturating_add(hardware_period)
@@ -1787,6 +1921,103 @@ mod tests {
         let error = Profile::from_toml(&text).expect_err("profile should fail");
 
         assert!(error.to_string().contains("at least one channel"));
+    }
+
+    #[test]
+    fn parses_sycon_profile_and_fingerprints_backend() {
+        let sycon_toml = include_str!("../../../profiles/topping-e1x2-sycon.toml");
+        let sycon = Profile::from_toml(sycon_toml).expect("sycon profile should parse");
+        let alsa = Profile::from_toml(E1X2_PROFILE).expect("reference profile should parse");
+
+        assert_eq!(sycon.device.backend, HardwareBackend::Sycon);
+        let table = sycon.device.sycon.as_ref().expect("sycon table");
+        assert_eq!((table.vendor_id, table.product_id), (0x152a, 0x8755));
+        assert_eq!(table.packets_per_urb, 1);
+        assert_eq!(alsa.device.backend, HardwareBackend::Alsa);
+        assert_ne!(sycon.fingerprint(), alsa.fingerprint());
+
+        // ALSA-only scheduling keys must not change the Sycon handoff budget or latency.
+        let mut timer = sycon.clone();
+        timer.device.playback_timer_scheduling = true;
+        timer.device.duplex_link = Some(false);
+        assert_eq!(timer.device.pro_handoff_nanos(), 1_000_000);
+        assert_eq!(sycon.device.pro_handoff_nanos(), 1_000_000);
+
+        let mut staged = sycon.clone();
+        staged.device.pro_latency_periods = 1;
+        staged.device.hardware_period_size = Some(32);
+        staged.device.duplex_link = Some(true);
+        assert!(!staged.device.uses_staged_pro_packets());
+        assert_eq!(staged.device.effective_pro_output_latency_frames(), 64);
+
+        // Timing edits through ProfileDocument must preserve backend and [device.sycon].
+        let mut document = ProfileDocument::from_toml(sycon_toml).expect("sycon document");
+        let mut timing = document.timing();
+        timing.period_size = 128;
+        timing.hardware_period_size = Some(128);
+        document.apply_timing(&timing).expect("apply timing");
+        let reparsed = Profile::from_toml(&document.to_toml()).expect("reparse edited sycon");
+        assert_eq!(reparsed.device.backend, HardwareBackend::Sycon);
+        assert_eq!(reparsed.device.sycon, sycon.device.sycon);
+        assert_eq!(reparsed.device.period_size, 128);
+    }
+
+    #[test]
+    fn rejects_invalid_sycon_settings() {
+        let base = PROFILE
+            .replace("[device]\n", "[device]\nbackend = \"sycon\"\n")
+            .replace("pro_latency_periods = 1", "pro_latency_periods = 0");
+        let table = "\n[device.sycon]\nvendor_id = 1\nproduct_id = 2\n";
+        let cases = [
+            (base.clone(), "requires a [device.sycon]"),
+            (format!("{base}{table}"), ""),
+            (
+                format!(
+                    "{}{table}",
+                    base.replace("pro_latency_periods = 0", "pro_latency_periods = 1")
+                ),
+                "pro_latency_periods = 0",
+            ),
+            (
+                format!(
+                    "{}{table}",
+                    base.replace(
+                        "pro_latency_periods = 0",
+                        "pro_latency_periods = 0\npro_handoff_auto = false\npro_handoff_us = 100001"
+                    )
+                ),
+                "100 ms",
+            ),
+            (
+                format!(
+                    "{base}{table}\n[device.startup_loopback]\nplayback_channel = 0\ncapture_channel = 0\ntarget_frames = 64\n"
+                ),
+                "startup_loopback",
+            ),
+            (
+                format!("{base}{table}safety_frames = 481\n"),
+                "safety_frames",
+            ),
+            (
+                format!("{base}{table}port = \"   \"\n"),
+                "sycon.port is empty",
+            ),
+            (
+                format!("{base}{table}packets_per_urb = 9\n"),
+                "packets_per_urb",
+            ),
+            (format!("{base}{table}capture_urbs = 1\n"), "capture_urbs"),
+            (format!("{base}{table}bogus = 1\n"), "unknown field"),
+        ];
+        for (text, expected) in cases {
+            match Profile::from_toml(&text) {
+                Ok(_) => assert!(expected.is_empty(), "expected error containing {expected}"),
+                Err(error) => assert!(
+                    !expected.is_empty() && error.to_string().contains(expected),
+                    "{error}"
+                ),
+            }
+        }
     }
 
     #[test]
