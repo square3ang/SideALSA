@@ -6,7 +6,7 @@
 
 **One audio interface, with PRO for production and SHARED for desktop audio.**
 
-SideALSA is an experimental professional-audio layer for Linux. One daemon owns the physical ALSA device and provides separate paths for DAWs and Wine ASIO, and for PipeWire desktop audio.
+SideALSA is an experimental professional-audio layer for Linux. One daemon owns the physical audio device (via ALSA or optional direct UAC2 **Sycon** mode) and provides separate paths for DAWs and Wine ASIO, and for PipeWire desktop audio.
 Its core goal is to keep the hardware streaming even when a client runs late or exits.
 
 > [!WARNING]
@@ -14,11 +14,11 @@ Its core goal is to keep the hardware streaming even when a client runs late or 
 > Small buffers and zero XRUNs do not guarantee fixed analog round-trip latency.
 > Validate your own device and setup before using it for important work.
 
-[Quick Start](#quick-start) · [Wine / Steam ASIO](#wine--steam-asio) · [Everyday Use](#everyday-use) · [Updates and Removal](#updates-and-removal) · [Technical Documentation](#technical-documentation)
+[Quick Start](#quick-start) · [Wine / Steam ASIO](#wine--steam-asio) · [Sycon Mode (Direct UAC2)](#sycon-mode-direct-uac2) · [Everyday Use](#everyday-use) · [Updates and Removal](#updates-and-removal) · [Technical Documentation](#technical-documentation)
 
 ```mermaid
 flowchart TB
-    hardware["Audio interface<br/>Physical ALSA device"]
+    hardware["Audio interface<br/>Physical ALSA or UAC2 (Sycon)"]
     daemon["sidealsad<br/>Hardware clock and RT engine"]
     hardware <--> daemon
 
@@ -164,6 +164,36 @@ location, substitute the actual paths printed by the installer. Select the SideA
 The main installer's `--with-asio` installs system files only; **prefix registration still requires this separate step**.
 [ASIO Setup Guide](docs/asio-setup.md) · [ASIO Implementation and Validation](docs/milestone-asio.md)
 
+## Sycon Mode (Direct UAC2)
+
+Sycon mode (`backend = "sycon"`) is an optional userspace USB Audio Class 2 backend that replaces the ALSA hardware engine. `sidealsad` opens `/dev/bus/usb/...`, detaches `snd-usb-audio`, and drives isochronous URBs directly with explicit feedback clock tracking. Everything above the engine (PRO, SHARED, ALSA ioplug, PipeWire, Wine ASIO, and `sidealsa-stats`) stays unchanged.
+
+To install using the Topping E1x2 OTG reference profile (48 kHz / Q64, 1 packet/URB, 12+12 URBs):
+
+```bash
+bash scripts/install.sh --profile profiles/topping-e1x2-sycon.toml --replace-profile
+```
+
+Or enable it in an existing profile (set `backend = "alsa"` to switch back):
+
+```toml
+[device]
+backend = "sycon"
+
+[device.sycon]
+vendor_id = 0x152a
+product_id = 0x8755
+packets_per_urb = 1
+playback_urbs = 12
+capture_urbs = 12
+```
+
+- **ALSA card handoff.** While `sidealsad` runs, the device's ALSA card and hardware mixer controls disappear. Stopping the service rebinds `snd-usb-audio`; after a crash, systemd's `ExecStopPost` (`sidealsad --release-usb`) restores it.
+- **USB unplug/replug.** Disconnecting the device stops `sidealsad` cleanly; systemd (`StartLimitIntervalSec=0`, `RestartSec=2`) retries until it returns, and `sidealsa-reconnect` refreshes PipeWire links.
+- **Limits.** Requires UAC2 with explicit feedback (or sync/adaptive endpoints), 32-bit (`S32_LE`) 4-byte subslots, and `pro_latency_periods = 0` (`startup_loopback` is rejected). Stop `sidealsad` before running `sidealsa-setup`.
+
+See [Sycon Direct UAC2 Backend](docs/sycon.md) and [Topping E1x2 Sycon Profile](profiles/topping-e1x2-sycon.toml).
+
 ## Everyday Use
 
 For heavy multithreaded DSP, enable **Scheduling → Automatic PRO handoff** in the
@@ -228,7 +258,7 @@ sidealsa-stats --samples 100 --interval-ms 100
 journalctl -u sidealsad.service -f
 ```
 
-`hw_playback_xruns` / `hw_capture_xruns` count actual ALSA XRUNs.
+`hw_playback_xruns` / `hw_capture_xruns` count actual hardware (ALSA or USB) XRUNs.
 `pro_deadline_misses` tracks PRO fallback output; `shared_underruns` / `shared_overruns` track SHARED losses.
 `timeline_resets` / `generation` indicate hardware restarts or timeline rebasing.
 Check SideALSA counters alongside PipeWire graph XRUNs, not just the latter.
@@ -282,7 +312,7 @@ The ALSA ioplug supports only S32_LE / RW-interleaved at the profile's sample ra
 | Topic | Documentation |
 | --- | --- |
 | Installation / selection menus | [Installation Details](docs/installation.md), [Device TUI](docs/onboard-setup.md), [ASIO TUI](docs/asio-setup.md) |
-| Profiles / channel splits | [Device Profiles and Integration Config Generation](docs/device-profiles.md), [Profile Validation](docs/milestone-2.md), [E1x2 Profile](profiles/topping-e1x2.toml) |
+| Profiles / channel splits | [Device Profiles and Integration Config Generation](docs/device-profiles.md), [Profile Validation](docs/milestone-2.md), [E1x2 Profile](profiles/topping-e1x2.toml), [E1x2 Sycon Profile](profiles/topping-e1x2-sycon.toml) |
 | Engine / communication | [Direct ALSA Engine](docs/milestone-1.md), [Sycon Direct UAC2 Backend](docs/sycon.md), [Local PRO](docs/milestone-3.md), [Daemon and Protocol](docs/milestone-4.md) |
 | Clients / integration | [SHARED](docs/milestone-5.md), [Client Library](docs/milestone-6.md), [ALSA ioplug](docs/milestone-7.md), [PipeWire](docs/milestone-8.md) |
 | Timing / validation history | [Wine ASIO](docs/milestone-asio.md), [Startup Loopback Normalization](docs/startup-loopback.md), [Performance](docs/performance.md), [Audio Load Benchmark](docs/audio-load-benchmark.md) |
