@@ -815,6 +815,7 @@ impl DuplexEngine {
         };
         let startup = if config.event_driven {
             normalize_startup_loopback(&playback_pcm, &capture_pcm, config, control)
+                .map(|padding| config.start_frames.saturating_add(padding))
         } else {
             calibrate_linked_phase(
                 &playback_pcm,
@@ -823,8 +824,9 @@ impl DuplexEngine {
                 config,
                 control,
             )
+            .map(|()| config.start_frames)
         };
-        let result = startup.and_then(|()| {
+        let result = startup.and_then(|initial_playback_lead| {
             run_catching_worker_panic(control, || {
                 linked_pro_cycle_loop(
                     &playback_pcm,
@@ -832,6 +834,7 @@ impl DuplexEngine {
                     &mut self.capture_scratch,
                     &mut playback_scratch,
                     config,
+                    initial_playback_lead,
                     control,
                     capture_sink,
                     playback_source,
@@ -1345,9 +1348,9 @@ fn normalize_startup_loopback(
     capture_pcm: &PCM,
     config: LinkedProConfig<'_>,
     control: WorkerControl<'_>,
-) -> Result<(), EngineError> {
+) -> Result<alsa::pcm::Frames, EngineError> {
     let Some(loopback) = config.startup_loopback else {
-        return Ok(());
+        return Ok(0);
     };
     let deadline = Instant::now() + Duration::from_secs(2);
     // Requalification during recovery must not leave the engine looking unqualified,
@@ -1359,6 +1362,7 @@ fn normalize_startup_loopback(
         let period = config.period as usize;
         let interval = (u64::from(loopback.target_frames) + 2 * period as u64)
             .max(u64::from(config.rate) / 12 + 1);
+        let mut applied_padding = 0 as alsa::pcm::Frames;
         for (phase, markers) in STARTUP_LOOPBACK_MARKERS.into_iter().enumerate() {
             let mut probe = StartupLoopbackProbe {
                 markers,
@@ -1440,11 +1444,13 @@ fn normalize_startup_loopback(
                         Ok(())
                     },
                 )?;
+                applied_padding = alsa::pcm::Frames::try_from(padding).unwrap_or(0);
                 // Reset both measurement origins together. Do not count padding
                 // as logical output or change the base prime used on recovery.
             }
         }
-        check_startup_loopback_deadline(control, deadline)
+        check_startup_loopback_deadline(control, deadline)?;
+        Ok(applied_padding)
     })();
     if result.is_ok()
         && was_ready
@@ -1982,10 +1988,10 @@ impl<P: ProPlaybackSource + ?Sized> Drop for PlaybackCommitGuard<'_, P> {
 }
 
 // Stream recovery can take seconds; client STOP/CLOSE must not spin on the barrier meanwhile.
-fn recover_with_commit_released<P: ProPlaybackSource + ?Sized>(
+fn recover_with_commit_released<P: ProPlaybackSource + ?Sized, T>(
     playback_commit: &mut PlaybackCommitGuard<'_, P>,
-    recover: impl FnOnce() -> Result<(), EngineError>,
-) -> Result<(), EngineError> {
+    recover: impl FnOnce() -> Result<T, EngineError>,
+) -> Result<T, EngineError> {
     playback_commit.finish();
     recover()
 }
@@ -2019,6 +2025,7 @@ fn linked_pro_cycle_loop<C: ProCaptureSink, P: ProPlaybackSource>(
     capture_scratch: &mut [i32],
     playback_scratch: &mut [i32],
     config: LinkedProConfig<'_>,
+    mut playback_lead_frames: alsa::pcm::Frames,
     control: WorkerControl<'_>,
     capture_sink: &mut C,
     playback_source: &mut P,
@@ -2078,6 +2085,7 @@ fn linked_pro_cycle_loop<C: ProCaptureSink, P: ProPlaybackSource>(
                 cache,
                 config.period,
                 config.buffer,
+                playback_lead_frames,
                 control,
             ) {
                 Ok((readiness, capture_avail)) => (Some(readiness), Some(capture_avail)),
@@ -2087,7 +2095,7 @@ fn linked_pro_cycle_loop<C: ProCaptureSink, P: ProPlaybackSource>(
                 }
                 Err(error) if error.is_recoverable() => {
                     pending_rebase = false;
-                    recover_linked_streams_during_cycle(
+                    playback_lead_frames = recover_linked_streams_during_cycle(
                         playback_pcm,
                         capture_pcm,
                         capture_scratch,
@@ -2124,7 +2132,7 @@ fn linked_pro_cycle_loop<C: ProCaptureSink, P: ProPlaybackSource>(
             }
             Err(error) if error.is_recoverable() => {
                 pending_rebase = false;
-                recover_linked_streams_during_cycle(
+                playback_lead_frames = recover_linked_streams_during_cycle(
                     playback_pcm,
                     capture_pcm,
                     capture_scratch,
@@ -2157,18 +2165,23 @@ fn linked_pro_cycle_loop<C: ProCaptureSink, P: ProPlaybackSource>(
         if config.event_driven && pending_rebase {
             pending_rebase = false;
             // Rebase before publishing this capture block to any clients.
-            match rebase_linked_streams(playback_pcm, capture_pcm, control, config, 0) {
-                Ok(()) => normalize_startup_loopback(playback_pcm, capture_pcm, config, control)?,
-                Err(error) if error.is_recoverable() => recover_linked_streams_during_cycle(
-                    playback_pcm,
-                    capture_pcm,
-                    capture_scratch,
-                    &error,
-                    config,
-                    control,
-                )?,
-                Err(error) => return Err(error),
-            }
+            playback_lead_frames =
+                match rebase_linked_streams(playback_pcm, capture_pcm, control, config, 0) {
+                    Ok(()) => {
+                        let padding =
+                            normalize_startup_loopback(playback_pcm, capture_pcm, config, control)?;
+                        config.start_frames.saturating_add(padding)
+                    }
+                    Err(error) if error.is_recoverable() => recover_linked_streams_during_cycle(
+                        playback_pcm,
+                        capture_pcm,
+                        capture_scratch,
+                        &error,
+                        config,
+                        control,
+                    )?,
+                    Err(error) => return Err(error),
+                };
             if let Some(cache) = poll_cache.as_mut() {
                 cache.refresh(playback_pcm, capture_pcm)?;
             }
@@ -2381,7 +2394,7 @@ fn linked_pro_cycle_loop<C: ProCaptureSink, P: ProPlaybackSource>(
             }
             Err(error) if error.is_recoverable() => {
                 pending_rebase = false;
-                recover_with_commit_released(&mut playback_commit, || {
+                playback_lead_frames = recover_with_commit_released(&mut playback_commit, || {
                     recover_linked_streams_during_cycle(
                         playback_pcm,
                         capture_pcm,
@@ -3692,6 +3705,7 @@ fn wait_for_linked_duplex_period(
     poll_cache: &mut LinkedPollCache,
     period: alsa::pcm::Frames,
     buffer: alsa::pcm::Frames,
+    playback_lead_frames: alsa::pcm::Frames,
     control: WorkerControl<'_>,
 ) -> Result<(DirectDuplexReadiness, alsa::pcm::Frames), EngineError> {
     const POLL_TIMEOUT_MS: i32 = 100;
@@ -3765,13 +3779,37 @@ fn wait_for_linked_duplex_period(
         if playback_ready && capture_ready {
             return Ok((
                 DirectDuplexReadiness {
-                    playback_queued_frames: buffer.saturating_sub(playback_available).max(0),
+                    playback_queued_frames: effective_direct_playback_queued_frames(
+                        buffer,
+                        playback_available,
+                        playback_lead_frames,
+                        capture_available,
+                    ),
                     observed_nanos,
                 },
                 capture_available,
             ));
         }
     }
+}
+
+#[inline]
+fn effective_direct_playback_queued_frames(
+    buffer: alsa::pcm::Frames,
+    playback_available: alsa::pcm::Frames,
+    playback_lead_frames: alsa::pcm::Frames,
+    capture_available: alsa::pcm::Frames,
+) -> alsa::pcm::Frames {
+    // On USB UAC2 interfaces, playback_pcm.avail_update() can lag behind the
+    // real hardware clock until an outbound URB retires, while capture_available
+    // already reflects URB wakeup overshoot past the period boundary. Since
+    // linked duplex keeps appl_ptr(playback) - appl_ptr(capture) == lead,
+    // remaining playback frames cannot exceed lead - capture_available.
+    let playback_queued = buffer.saturating_sub(playback_available).max(0);
+    let linked_queued = playback_lead_frames
+        .saturating_sub(capture_available)
+        .max(0);
+    playback_queued.min(linked_queued)
 }
 
 fn wait_for_transfer(
@@ -4092,7 +4130,7 @@ fn recover_linked_streams(
     control: WorkerControl<'_>,
     config: LinkedProConfig<'_>,
     dither_frames: alsa::pcm::Frames,
-) -> Result<(), EngineError> {
+) -> Result<alsa::pcm::Frames, EngineError> {
     record_linked_hardware_xruns(error, control);
     control.ensure_running()?;
     alsa_call(
@@ -4164,9 +4202,9 @@ fn recover_linked_streams(
         "restart linked duplex streams after stream failure",
         StreamDirection::Playback,
     )?;
-    normalize_startup_loopback(playback_pcm, capture_pcm, config, control)?;
+    let padding = normalize_startup_loopback(playback_pcm, capture_pcm, config, control)?;
     control.timeline.reset_after_hardware_restart();
-    Ok(())
+    Ok(config.start_frames.saturating_add(padding))
 }
 
 fn recover_linked_streams_during_cycle(
@@ -4176,7 +4214,7 @@ fn recover_linked_streams_during_cycle(
     error: &EngineError,
     config: LinkedProConfig<'_>,
     control: WorkerControl<'_>,
-) -> Result<(), EngineError> {
+) -> Result<alsa::pcm::Frames, EngineError> {
     if control
         .hardware_ready
         .is_some_and(|ready| !ready.load(Ordering::Acquire))
@@ -4185,11 +4223,12 @@ fn recover_linked_streams_during_cycle(
         record_linked_hardware_xruns(error, control);
         return Err(EngineError::LinkedStartupInterrupted);
     }
-    recover_linked_streams(playback_pcm, capture_pcm, error, control, config, 0)?;
+    let playback_lead =
+        recover_linked_streams(playback_pcm, capture_pcm, error, control, config, 0)?;
     if !config.event_driven {
         recalibrate_linked_phase(playback_pcm, capture_pcm, capture_scratch, config, control)?;
     }
-    Ok(())
+    Ok(playback_lead)
 }
 
 fn record_linked_hardware_xruns(error: &EngineError, control: WorkerControl<'_>) {
@@ -5015,6 +5054,36 @@ mod tests {
         assert_eq!(
             playback_target_sleep(2, 48_000, 50_000),
             Duration::from_micros(1)
+        );
+    }
+
+    #[test]
+    fn effective_direct_playback_queued_bounds_stale_playback_by_capture_overshoot() {
+        // Stale playback avail_update (68 queued) with 21-frame capture overshoot (85 avail)
+        // on a 128-frame linked lead leaves only 43 queued frames.
+        assert_eq!(
+            super::effective_direct_playback_queued_frames(256, 188, 128, 85),
+            43
+        );
+        // Fresh playback avail_update (already dropped to 43) is not double-subtracted.
+        assert_eq!(
+            super::effective_direct_playback_queued_frames(256, 213, 128, 85),
+            43
+        );
+        // Scheduling hiccup with capture >= lead collapses remaining budget to zero.
+        assert_eq!(
+            super::effective_direct_playback_queued_frames(256, 188, 128, 130),
+            0
+        );
+        // Nominal Q256 wakeup at exact period boundary preserves full 256-frame queue.
+        assert_eq!(
+            super::effective_direct_playback_queued_frames(512, 256, 512, 256),
+            256
+        );
+        // Deeper startup queue (192 frames) retains full wait margin despite 21-frame overshoot.
+        assert_eq!(
+            super::effective_direct_playback_queued_frames(256, 128, 192, 85),
+            107
         );
     }
 
