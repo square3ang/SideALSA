@@ -1638,26 +1638,28 @@ unsafe fn copy_from_area_scalar(
         .checked_add(last_frame_offset)
         .and_then(|value| value.checked_add(frame_bytes))
         .ok_or(libc::EOVERFLOW)?;
-    let mut source = unsafe { base.add(start_offset) };
+    let start = unsafe { base.add(start_offset) };
     if cfg!(target_endian = "little") {
-        let mut dest = destination.as_mut_ptr().cast::<u8>();
-        for _ in 0..frames {
+        let dest_base = destination.as_mut_ptr().cast::<u8>();
+        for frame in 0..frames {
             unsafe {
-                ptr::copy_nonoverlapping(source, dest, frame_bytes);
-                source = source.add(step);
-                dest = dest.add(frame_bytes);
+                ptr::copy_nonoverlapping(
+                    start.add(frame * step),
+                    dest_base.add(frame * frame_bytes),
+                    frame_bytes,
+                );
             }
         }
         return Ok(());
     }
     for frame in 0..frames {
+        let source = unsafe { start.add(frame * step) };
         for channel in 0..channels {
             let bytes = unsafe {
                 ptr::read_unaligned(source.add(channel * size_of_i32()).cast::<[u8; 4]>())
             };
             destination[frame * channels + channel] = i32::from_le_bytes(bytes);
         }
-        source = unsafe { source.add(step) };
     }
     Ok(())
 }
@@ -1716,19 +1718,22 @@ unsafe fn copy_to_area_scalar(
         .checked_add(last_frame_offset)
         .and_then(|value| value.checked_add(frame_bytes))
         .ok_or(libc::EOVERFLOW)?;
-    let mut destination = unsafe { base.add(start_offset) };
+    let start = unsafe { base.add(start_offset) };
     if cfg!(target_endian = "little") {
-        let mut src = source.as_ptr().cast::<u8>();
-        for _ in 0..frames {
+        let src_base = source.as_ptr().cast::<u8>();
+        for frame in 0..frames {
             unsafe {
-                ptr::copy_nonoverlapping(src, destination, frame_bytes);
-                src = src.add(frame_bytes);
-                destination = destination.add(step);
+                ptr::copy_nonoverlapping(
+                    src_base.add(frame * frame_bytes),
+                    start.add(frame * step),
+                    frame_bytes,
+                );
             }
         }
         return Ok(());
     }
     for frame in 0..frames {
+        let destination = unsafe { start.add(frame * step) };
         for channel in 0..channels {
             let bytes = source[frame * channels + channel].to_le_bytes();
             unsafe {
@@ -1738,7 +1743,6 @@ unsafe fn copy_to_area_scalar(
                 )
             };
         }
-        destination = unsafe { destination.add(step) };
     }
     Ok(())
 }
@@ -2017,6 +2021,26 @@ mod tests {
                 &[0xa5; 4]
             );
         }
+
+        // Tight caller buffer ending immediately after the final frame's samples
+        // (no trailing padding after frame `frames - 1`).
+        let tight_len = first + (frames - 1) * step + channels * size_of_i32();
+        let mut tight = vec![0x5a_u8; tight_len];
+        let tight_area = SideAlsaChannelArea {
+            addr: tight.as_mut_ptr().cast(),
+            first: (first * 8) as c_uint,
+            step: (step * 8) as c_uint,
+        };
+        unsafe {
+            copy_to_area(&tight_area, 0, frames, channels, &source)
+                .expect("tight strided output should encode");
+        }
+        let mut tight_decoded = [0_i32; 6];
+        unsafe {
+            copy_from_area(&tight_area, 0, frames, channels, &mut tight_decoded)
+                .expect("tight strided input should decode");
+        }
+        assert_eq!(tight_decoded, source);
     }
 
     #[test]
