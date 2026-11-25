@@ -107,10 +107,10 @@ pub fn run_control_listener(
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
-                let Some(slot) = peer_credentials(&stream)
-                    .ok()
-                    .and_then(|peer| slots.acquire(peer.uid))
-                else {
+                let Ok(peer) = peer_credentials(&stream) else {
+                    continue;
+                };
+                let Some(slot) = slots.acquire(peer.uid) else {
                     continue;
                 };
                 let state = Arc::clone(&state);
@@ -120,11 +120,16 @@ pub fn run_control_listener(
                     .stack_size(CONTROL_THREAD_STACK)
                     .spawn(move || {
                         let _slot = slot;
-                        handle_client(stream, state);
+                        handle_client_with_peer(stream, peer, state);
                     });
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(10));
+                let mut pfd = libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let _ = unsafe { libc::poll(&mut pfd, 1, 50) };
             }
             Err(error) if is_transient_accept_error(&error) => {
                 // Descriptor/memory pressure must not take the hardware engine down.
@@ -217,13 +222,17 @@ fn remove_stale_socket(path: &Path) -> Result<(), io::Error> {
     }
 }
 
-fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
+#[cfg(test)]
+fn handle_client(stream: UnixStream, state: Arc<DaemonState>) {
     let Ok(peer) = peer_credentials(&stream) else {
         return;
     };
-    if stream
-        .set_read_timeout(Some(CONTROL_HANDSHAKE_TIMEOUT))
-        .is_err()
+    handle_client_with_peer(stream, peer, state);
+}
+
+fn handle_client_with_peer(mut stream: UnixStream, peer: libc::ucred, state: Arc<DaemonState>) {
+    let mut current_read_timeout = Some(CONTROL_HANDSHAKE_TIMEOUT);
+    if stream.set_read_timeout(current_read_timeout).is_err()
         || stream
             .set_write_timeout(Some(CONTROL_HANDSHAKE_TIMEOUT))
             .is_err()
@@ -466,9 +475,13 @@ fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
         } else {
             Some(CONTROL_HANDSHAKE_TIMEOUT)
         };
-        if requests_before_hello >= MAX_REQUESTS_BEFORE_HELLO
-            || stream.set_read_timeout(read_timeout).is_err()
-        {
+        let timeout_failed = if read_timeout != current_read_timeout {
+            current_read_timeout = read_timeout;
+            stream.set_read_timeout(read_timeout).is_err()
+        } else {
+            false
+        };
+        if requests_before_hello >= MAX_REQUESTS_BEFORE_HELLO || timeout_failed {
             let _ = send_response(&mut stream, &response, &fds);
             break;
         }

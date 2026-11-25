@@ -7,9 +7,8 @@ use sidealsa_protocol::{
 };
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering, fence},
 };
-use std::time::Instant;
 use thiserror::Error;
 
 use crate::diagnostics::{ProDiagnostics, ProDiagnosticsSnapshot, ProMiss};
@@ -18,16 +17,107 @@ use crate::shared::{PlaybackReadyWait, SharedError, SharedEvents, SharedRegion};
 const SESSION_CLOSING: u64 = u64::MAX;
 // A stalled-but-connected client must not turn a repeated block into a sustained tone.
 const MAX_REPEATED_PLAYBACK_PERIODS: u32 = 4;
+const RT_READER_INACTIVE: u64 = u64::MAX;
+const RT_SLOT_CAPTURE: usize = 0;
+const RT_SLOT_PLAYBACK: usize = 1;
+
+#[repr(align(64))]
+struct CachePadded<T>(T);
+
+struct RtReadDomain {
+    epoch: CachePadded<AtomicU64>,
+    readers: [CachePadded<AtomicU64>; 2],
+}
+
+impl Default for RtReadDomain {
+    fn default() -> Self {
+        Self {
+            epoch: CachePadded(AtomicU64::new(0)),
+            readers: [
+                CachePadded(AtomicU64::new(RT_READER_INACTIVE)),
+                CachePadded(AtomicU64::new(RT_READER_INACTIVE)),
+            ],
+        }
+    }
+}
+
+impl RtReadDomain {
+    #[inline]
+    fn begin_unflushed(&self, slot: usize) {
+        // Acquire pairs with wait_for_idle()'s epoch.fetch_add(SeqCst) so observing
+        // epoch > retired guarantees visibility of the preceding swap or stop.
+        let epoch = self.epoch.0.load(Ordering::Acquire);
+        // Release ensures any prior critical section on this slot happens-before a
+        // concurrent wait_for_idle() that observes this new epoch.
+        self.readers[slot].0.store(epoch, Ordering::Release);
+    }
+
+    #[inline]
+    fn enter(&self, slot: usize) -> RtPin<'_> {
+        self.begin_unflushed(slot);
+        // Pairs with SeqCst swap/stop + epoch.fetch_add + readers.load(SeqCst) in
+        // wait_for_idle(): either wait_for_idle waits on our active epoch, or our
+        // subsequent Acquire loads observe the swap/stop that preceded wait_for_idle.
+        fence(Ordering::SeqCst);
+        RtPin { domain: self, slot }
+    }
+
+    #[inline]
+    fn exit(&self, slot: usize) {
+        self.readers[slot]
+            .0
+            .store(RT_READER_INACTIVE, Ordering::Release);
+    }
+
+    fn wait_for_idle(&self) {
+        let retired = self.epoch.0.fetch_add(1, Ordering::SeqCst);
+        for reader in &self.readers {
+            while {
+                let observed = reader.0.load(Ordering::SeqCst);
+                observed != RT_READER_INACTIVE && observed <= retired
+            } {
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+struct RtPin<'a> {
+    domain: &'a RtReadDomain,
+    slot: usize,
+}
+
+impl Drop for RtPin<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.domain.exit(self.slot);
+    }
+}
+
+struct CapturePairGuard<'a> {
+    bridge: &'a mut DaemonCaptureBridge,
+}
+
+impl<'a> CapturePairGuard<'a> {
+    #[inline]
+    fn enter(bridge: &'a mut DaemonCaptureBridge) -> Self {
+        bridge.pro_domain.begin_unflushed(RT_SLOT_CAPTURE);
+        bridge.pro_capture_domain.begin_unflushed(RT_SLOT_CAPTURE);
+        fence(Ordering::SeqCst);
+        Self { bridge }
+    }
+}
+
+impl Drop for CapturePairGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.bridge.pro_domain.exit(RT_SLOT_CAPTURE);
+        self.bridge.pro_capture_domain.exit(RT_SLOT_CAPTURE);
+    }
+}
 
 struct SessionState {
     endpoint: Arc<EndpointSlot>,
-    owner: Arc<AtomicU64>,
-    active: Arc<AtomicU64>,
-    lifecycle_generation: Arc<AtomicU64>,
-    lifecycle_hardware_generation: Arc<AtomicU64>,
-    armed: Arc<AtomicU64>,
-    outage: Arc<AtomicU64>,
-    warmup_blocks: Arc<AtomicU64>,
     playback_epoch: Option<Arc<AtomicU64>>,
     playback_commits: Option<Arc<PlaybackCommitBarrier>>,
     period_frames: u32,
@@ -38,6 +128,8 @@ struct SessionState {
 
 struct SessionEndpoint {
     session_id: u64,
+    has_capture: bool,
+    slot_count: usize,
     region: SharedRegion,
     events: SharedEvents,
 }
@@ -50,14 +142,18 @@ impl SessionEndpoint {
         capture_channels: u32,
         slot_count: u32,
     ) -> Result<Box<Self>, SharedError> {
+        let region = SharedRegion::create_with_slot_count(
+            period_frames,
+            playback_channels,
+            capture_channels,
+            slot_count,
+        )?;
+        let region_slots = region.info().slot_count as usize;
         Ok(Box::new(Self {
             session_id,
-            region: SharedRegion::create_with_slot_count(
-                period_frames,
-                playback_channels,
-                capture_channels,
-                slot_count,
-            )?,
+            has_capture: capture_channels != 0,
+            slot_count: region_slots,
+            region,
             events: SharedEvents::new()?,
         }))
     }
@@ -76,10 +172,26 @@ impl SessionEndpoint {
     }
 }
 
-struct EndpointSlot {
+// Fits all hot RT-read session atomics in one 64-byte cache line, isolated from
+// control-plane / GET_STATS writes in the rest of EndpointSlot.
+#[repr(align(64))]
+struct SessionHot {
     current: AtomicPtr<SessionEndpoint>,
+    active: AtomicU64,
+    lifecycle_generation: AtomicU64,
+    lifecycle_hardware_generation: AtomicU64,
+    armed: AtomicU64,
+    outage: AtomicU64,
+    warmup_blocks: AtomicU64,
+}
+
+#[repr(C)]
+struct EndpointSlot {
+    hot: SessionHot,
     reader_epoch: AtomicU64,
     reader_activity: [AtomicU32; 2],
+    owner: AtomicU64,
+    rt_domain: Option<Arc<RtReadDomain>>,
     retired_client_playback: Mutex<ClientPlaybackDiagnostics>,
     playback_underruns: AtomicU64,
     last_playback_underrun_sequence: AtomicU64,
@@ -96,11 +208,30 @@ struct ClientPlaybackDiagnostics {
 }
 
 impl EndpointSlot {
+    #[cfg(test)]
     fn new(endpoint: Box<SessionEndpoint>) -> Self {
+        Self::create(endpoint, None)
+    }
+
+    fn with_rt_domain(endpoint: Box<SessionEndpoint>, rt_domain: Arc<RtReadDomain>) -> Self {
+        Self::create(endpoint, Some(rt_domain))
+    }
+
+    fn create(endpoint: Box<SessionEndpoint>, rt_domain: Option<Arc<RtReadDomain>>) -> Self {
         Self {
-            current: AtomicPtr::new(Box::into_raw(endpoint)),
+            hot: SessionHot {
+                current: AtomicPtr::new(Box::into_raw(endpoint)),
+                active: AtomicU64::new(0),
+                lifecycle_generation: AtomicU64::new(0),
+                lifecycle_hardware_generation: AtomicU64::new(0),
+                armed: AtomicU64::new(0),
+                outage: AtomicU64::new(0),
+                warmup_blocks: AtomicU64::new(0),
+            },
             reader_epoch: AtomicU64::new(0),
             reader_activity: [AtomicU32::new(0), AtomicU32::new(0)],
+            owner: AtomicU64::new(0),
+            rt_domain,
             retired_client_playback: Mutex::new(ClientPlaybackDiagnostics::default()),
             playback_underruns: AtomicU64::new(0),
             last_playback_underrun_sequence: AtomicU64::new(0),
@@ -118,7 +249,7 @@ impl EndpointSlot {
                 drop(activity);
                 continue;
             }
-            let current = self.current.load(Ordering::SeqCst);
+            let current = self.hot.current.load(Ordering::SeqCst);
             debug_assert!(!current.is_null());
             // SAFETY: `current` comes from `Box::into_raw`. A replacement swaps the pointer,
             // advances the reader epoch, and drains this epoch before freeing the old endpoint.
@@ -130,13 +261,30 @@ impl EndpointSlot {
         }
     }
 
+    /// # Safety
+    /// Caller must hold an active pin on `domain` (which must match `self.rt_domain`)
+    /// for at least the returned reference lifetime.
+    #[inline]
+    unsafe fn load_pinned<'a>(&'a self, domain: &Arc<RtReadDomain>) -> &'a SessionEndpoint {
+        debug_assert!(
+            self.rt_domain
+                .as_ref()
+                .is_some_and(|slot_domain| Arc::ptr_eq(slot_domain, domain))
+        );
+        let current = self.hot.current.load(Ordering::Acquire);
+        debug_assert!(!current.is_null());
+        // SAFETY: `current` comes from `Box::into_raw`; `replace()` drains `rt_domain`
+        // after swapping `current` and before freeing the retired `SessionEndpoint`.
+        unsafe { &*current }
+    }
+
     fn replace(&self, endpoint: Box<SessionEndpoint>) {
         let mut retired_diagnostics = self
             .retired_client_playback
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let replacement = Box::into_raw(endpoint);
-        let retired = self.current.swap(replacement, Ordering::SeqCst);
+        let retired = self.hot.current.swap(replacement, Ordering::SeqCst);
         self.wait_for_idle();
         debug_assert!(!retired.is_null());
         // SAFETY: session ownership serializes replacements, and the activity barrier proves
@@ -159,8 +307,12 @@ impl EndpointSlot {
         while retired_activity.load(Ordering::SeqCst) != 0 {
             std::thread::yield_now();
         }
+        if let Some(rt_domain) = &self.rt_domain {
+            rt_domain.wait_for_idle();
+        }
     }
 
+    // Single writer: the daemon's sole playback bridge.
     fn record_playback_miss(&self, sequence: u64, sequence_lag_periods: u64, starts_outage: bool) {
         self.last_playback_underrun_sequence
             .store(sequence, Ordering::Relaxed);
@@ -168,10 +320,20 @@ impl EndpointSlot {
             .store(monotonic_nanos(), Ordering::Relaxed);
         self.last_playback_sequence_lag_periods
             .store(sequence_lag_periods, Ordering::Relaxed);
-        self.max_playback_sequence_lag_periods
-            .fetch_max(sequence_lag_periods, Ordering::Relaxed);
+        if sequence_lag_periods
+            > self
+                .max_playback_sequence_lag_periods
+                .load(Ordering::Relaxed)
+        {
+            self.max_playback_sequence_lag_periods
+                .store(sequence_lag_periods, Ordering::Relaxed);
+        }
         if starts_outage {
-            self.playback_underruns.fetch_add(1, Ordering::Release);
+            let next = self
+                .playback_underruns
+                .load(Ordering::Relaxed)
+                .wrapping_add(1);
+            self.playback_underruns.store(next, Ordering::Release);
         }
     }
 
@@ -217,7 +379,7 @@ struct SharedPlaybackDiagnostics {
 
 impl Drop for EndpointSlot {
     fn drop(&mut self) {
-        let current = *self.current.get_mut();
+        let current = *self.hot.current.get_mut();
         debug_assert!(!current.is_null());
         // SAFETY: dropping the last `EndpointSlot` owner requires exclusive access, so no guard
         // can remain, and `current` is the one outstanding `Box::into_raw` pointer.
@@ -255,6 +417,7 @@ impl Drop for RtActivity<'_> {
     }
 }
 
+#[repr(align(64))]
 #[derive(Default)]
 struct PlaybackCommitBarrier {
     started: AtomicU64,
@@ -262,12 +425,24 @@ struct PlaybackCommitBarrier {
 }
 
 impl PlaybackCommitBarrier {
-    fn begin(&self) {
-        self.started.fetch_add(1, Ordering::SeqCst);
+    #[inline]
+    fn begin_unflushed(&self) {
+        // Single writer: the daemon's sole playback bridge.
+        let next = self.started.load(Ordering::Relaxed).wrapping_add(1);
+        self.started.store(next, Ordering::Release);
     }
 
+    #[cfg(test)]
+    fn begin(&self) {
+        self.begin_unflushed();
+        fence(Ordering::SeqCst);
+    }
+
+    #[inline]
     fn end(&self) {
-        self.completed.fetch_add(1, Ordering::SeqCst);
+        // Single writer: Release orders all commit work before wait_for() observes completion.
+        let next = self.completed.load(Ordering::Relaxed).wrapping_add(1);
+        self.completed.store(next, Ordering::Release);
     }
 
     fn wait_for_preexisting(&self) {
@@ -275,7 +450,7 @@ impl PlaybackCommitBarrier {
     }
 
     fn wait_for(&self, target: u64) {
-        while sequence_is_before(self.completed.load(Ordering::SeqCst), target) {
+        while sequence_is_before(self.completed.load(Ordering::Acquire), target) {
             std::thread::yield_now();
         }
     }
@@ -287,24 +462,21 @@ impl SessionState {
         playback_channels: u32,
         capture_channels: u32,
         slot_count: u32,
+        rt_domain: Arc<RtReadDomain>,
         playback_epoch: Option<Arc<AtomicU64>>,
         playback_commits: Option<Arc<PlaybackCommitBarrier>>,
     ) -> Result<Self, SharedError> {
         Ok(Self {
-            endpoint: Arc::new(EndpointSlot::new(SessionEndpoint::create(
-                0,
-                period_frames,
-                playback_channels,
-                capture_channels,
-                slot_count,
-            )?)),
-            owner: Arc::new(AtomicU64::new(0)),
-            active: Arc::new(AtomicU64::new(0)),
-            lifecycle_generation: Arc::new(AtomicU64::new(0)),
-            lifecycle_hardware_generation: Arc::new(AtomicU64::new(0)),
-            armed: Arc::new(AtomicU64::new(0)),
-            outage: Arc::new(AtomicU64::new(0)),
-            warmup_blocks: Arc::new(AtomicU64::new(0)),
+            endpoint: Arc::new(EndpointSlot::with_rt_domain(
+                SessionEndpoint::create(
+                    0,
+                    period_frames,
+                    playback_channels,
+                    capture_channels,
+                    slot_count,
+                )?,
+                rt_domain,
+            )),
             playback_epoch,
             playback_commits,
             period_frames,
@@ -335,6 +507,7 @@ impl SessionState {
         capture_channels: u32,
     ) -> Result<Option<(SharedRegionInfo, [std::os::fd::RawFd; 4])>, SharedError> {
         if self
+            .endpoint
             .owner
             .compare_exchange(0, session_id, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
@@ -350,7 +523,7 @@ impl SessionState {
         ) {
             Ok(endpoint) => endpoint,
             Err(error) => {
-                self.owner.store(0, Ordering::Release);
+                self.endpoint.owner.store(0, Ordering::Release);
                 return Err(error);
             }
         };
@@ -362,8 +535,8 @@ impl SessionState {
     }
 
     fn start(&self, session_id: u64, hardware_generation: u64) -> bool {
-        if self.owner.load(Ordering::Acquire) != session_id
-            || self.active.load(Ordering::SeqCst) != 0
+        if self.endpoint.owner.load(Ordering::Acquire) != session_id
+            || self.endpoint.hot.active.load(Ordering::SeqCst) != 0
         {
             return false;
         }
@@ -373,14 +546,23 @@ impl SessionState {
         }
         endpoint.region.reset_slots();
         endpoint.events.drain();
-        let generation = self.lifecycle_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let generation = self
+            .endpoint
+            .hot
+            .lifecycle_generation
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
         endpoint.region.set_lifecycle_generation(generation);
-        self.lifecycle_hardware_generation
+        self.endpoint
+            .hot
+            .lifecycle_hardware_generation
             .store(hardware_generation, Ordering::Release);
         endpoint.region.set_hardware_generation(hardware_generation);
         endpoint.region.reset_activation();
         endpoint.region.set_client_state(SHARED_CLIENT_STARTING);
         if self
+            .endpoint
+            .hot
             .active
             .compare_exchange(0, session_id, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
@@ -388,20 +570,22 @@ impl SessionState {
             endpoint.region.set_client_state(SHARED_CLIENT_IDLE);
             return false;
         }
-        self.armed.store(0, Ordering::Release);
-        self.outage.store(0, Ordering::Release);
-        self.warmup_blocks.store(0, Ordering::Release);
+        self.endpoint.hot.armed.store(0, Ordering::Release);
+        self.endpoint.hot.outage.store(0, Ordering::Release);
+        self.endpoint.hot.warmup_blocks.store(0, Ordering::Release);
         true
     }
 
     fn stop(&self, session_id: u64) -> bool {
-        if self.active.load(Ordering::SeqCst) != session_id {
+        if self.endpoint.hot.active.load(Ordering::SeqCst) != session_id {
             return false;
         }
-        self.armed.store(0, Ordering::Release);
-        self.outage.store(0, Ordering::Release);
-        self.warmup_blocks.store(0, Ordering::Release);
+        self.endpoint.hot.armed.store(0, Ordering::Release);
+        self.endpoint.hot.outage.store(0, Ordering::Release);
+        self.endpoint.hot.warmup_blocks.store(0, Ordering::Release);
         let stopped = self
+            .endpoint
+            .hot
             .active
             .compare_exchange(session_id, 0, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok();
@@ -411,9 +595,9 @@ impl SessionState {
             endpoint.events.notify_playback_ready();
             drop(endpoint);
             self.wait_for_rt_idle();
-            self.armed.store(0, Ordering::Release);
-            self.outage.store(0, Ordering::Release);
-            self.warmup_blocks.store(0, Ordering::Release);
+            self.endpoint.hot.armed.store(0, Ordering::Release);
+            self.endpoint.hot.outage.store(0, Ordering::Release);
+            self.endpoint.hot.warmup_blocks.store(0, Ordering::Release);
             let endpoint = self.endpoint.load();
             endpoint.region.reset_slots();
             endpoint.events.drain();
@@ -423,6 +607,7 @@ impl SessionState {
 
     fn close(&self, session_id: u64) -> bool {
         if self
+            .endpoint
             .owner
             .compare_exchange(
                 session_id,
@@ -434,13 +619,15 @@ impl SessionState {
         {
             return false;
         }
-        let was_active = self.active.load(Ordering::SeqCst) == session_id;
+        let was_active = self.endpoint.hot.active.load(Ordering::SeqCst) == session_id;
         if was_active {
-            self.armed.store(0, Ordering::Release);
-            self.outage.store(0, Ordering::Release);
-            self.warmup_blocks.store(0, Ordering::Release);
+            self.endpoint.hot.armed.store(0, Ordering::Release);
+            self.endpoint.hot.outage.store(0, Ordering::Release);
+            self.endpoint.hot.warmup_blocks.store(0, Ordering::Release);
         }
         let stopped = self
+            .endpoint
+            .hot
             .active
             .compare_exchange(session_id, 0, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok();
@@ -451,13 +638,13 @@ impl SessionState {
         endpoint.events.notify_playback_ready();
         drop(endpoint);
         self.wait_for_rt_idle();
-        self.armed.store(0, Ordering::Release);
-        self.outage.store(0, Ordering::Release);
-        self.warmup_blocks.store(0, Ordering::Release);
+        self.endpoint.hot.armed.store(0, Ordering::Release);
+        self.endpoint.hot.outage.store(0, Ordering::Release);
+        self.endpoint.hot.warmup_blocks.store(0, Ordering::Release);
         let endpoint = self.endpoint.load();
         endpoint.region.reset_slots();
         endpoint.events.drain();
-        self.owner.store(0, Ordering::Release);
+        self.endpoint.owner.store(0, Ordering::Release);
         true
     }
 
@@ -496,6 +683,7 @@ impl SharedPortState {
         direction: PortDirection,
         period_frames: u32,
         slot_count: u32,
+        rt_domain: Arc<RtReadDomain>,
         playback_epoch: Option<Arc<AtomicU64>>,
         playback_commits: Option<Arc<PlaybackCommitBarrier>>,
     ) -> Result<Self, SharedError> {
@@ -528,6 +716,7 @@ impl SharedPortState {
                 playback_channels,
                 capture_channels,
                 slot_count,
+                rt_domain,
                 playback_epoch,
                 playback_commits,
             )?,
@@ -554,6 +743,10 @@ pub struct DaemonState {
     info: DeviceInfo,
     timeline: Arc<HardwareTimeline>,
     hardware_ready: Arc<AtomicBool>,
+    pro_domain: Arc<RtReadDomain>,
+    pro_capture_domain: Arc<RtReadDomain>,
+    shared_playback_domain: Arc<RtReadDomain>,
+    shared_capture_domain: Arc<RtReadDomain>,
     pro: SessionState,
     pro_capture: SessionState,
     pro_ownership: Mutex<ProOwnership>,
@@ -599,11 +792,16 @@ impl DaemonState {
         .map_err(|_| SharedError::Protocol(sidealsa_protocol::ProtocolError::LayoutOverflow))?;
         let playback_epoch = Arc::new(AtomicU64::new(0));
         let playback_commits = Arc::new(PlaybackCommitBarrier::default());
+        let pro_domain = Arc::new(RtReadDomain::default());
+        let pro_capture_domain = Arc::new(RtReadDomain::default());
+        let shared_playback_domain = Arc::new(RtReadDomain::default());
+        let shared_capture_domain = Arc::new(RtReadDomain::default());
         let pro = SessionState::new(
             profile.device.period_size,
             profile.device.playback.channels,
             profile.device.capture.channels,
             sidealsa_protocol::SHARED_SLOT_COUNT,
+            Arc::clone(&pro_domain),
             Some(Arc::clone(&playback_epoch)),
             Some(Arc::clone(&playback_commits)),
         )?;
@@ -615,6 +813,7 @@ impl DaemonState {
                 PortDirection::Playback,
                 profile.device.period_size,
                 sidealsa_protocol::SHARED_SLOT_COUNT,
+                Arc::clone(&shared_playback_domain),
                 Some(Arc::clone(&playback_epoch)),
                 Some(Arc::clone(&playback_commits)),
             )?);
@@ -628,6 +827,7 @@ impl DaemonState {
                 PortDirection::Capture,
                 profile.device.period_size,
                 slot_count,
+                Arc::clone(&shared_capture_domain),
                 None,
                 None,
             )?);
@@ -638,12 +838,17 @@ impl DaemonState {
             pro_diagnostics: Arc::new(ProDiagnostics::default()),
             timeline,
             hardware_ready: Arc::new(AtomicBool::new(false)),
+            pro_domain,
+            pro_capture_domain: Arc::clone(&pro_capture_domain),
+            shared_playback_domain,
+            shared_capture_domain,
             pro,
             pro_capture: SessionState::new(
                 profile.device.period_size,
                 0,
                 profile.device.capture.channels,
                 sidealsa_protocol::SHARED_SLOT_COUNT,
+                pro_capture_domain,
                 None,
                 None,
             )?,
@@ -854,19 +1059,19 @@ impl DaemonState {
         }
         // Only PRO needs the ownership lock. SHARED start may spin on client-written
         // activation state, and its session ids are owned by a single connection.
-        if self.pro_capture.owner.load(Ordering::Acquire) == session_id
-            || self.pro.owner.load(Ordering::Acquire) == session_id
+        if self.pro_capture.endpoint.owner.load(Ordering::Acquire) == session_id
+            || self.pro.endpoint.owner.load(Ordering::Acquire) == session_id
         {
             let _ownership = self
                 .pro_ownership
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let hardware_generation = self.timeline.generation();
-            if self.pro_capture.owner.load(Ordering::Acquire) == session_id {
+            if self.pro_capture.endpoint.owner.load(Ordering::Acquire) == session_id {
                 return self.pro_capture.start(session_id, hardware_generation);
             }
-            if self.pro.owner.load(Ordering::Acquire) == session_id {
-                if self.pro.active.load(Ordering::SeqCst) != 0 {
+            if self.pro.endpoint.owner.load(Ordering::Acquire) == session_id {
+                if self.pro.endpoint.hot.active.load(Ordering::SeqCst) != 0 {
                     return false;
                 }
                 return self.pro.start(session_id, hardware_generation);
@@ -899,7 +1104,7 @@ impl DaemonState {
         } else {
             return false;
         };
-        if state.active.load(Ordering::SeqCst) != 0 {
+        if state.endpoint.hot.active.load(Ordering::SeqCst) != 0 {
             return false;
         }
         self.pro_pair_start.fetch_or(bit, Ordering::Release);
@@ -968,12 +1173,12 @@ impl DaemonState {
         if session_id == 0 || session_id == SESSION_CLOSING {
             return false;
         }
-        self.pro.owner.load(Ordering::Acquire) == session_id
-            || self.pro_capture.owner.load(Ordering::Acquire) == session_id
+        self.pro.endpoint.owner.load(Ordering::Acquire) == session_id
+            || self.pro_capture.endpoint.owner.load(Ordering::Acquire) == session_id
             || self
                 .shared
                 .iter()
-                .any(|port| port.session.owner.load(Ordering::Acquire) == session_id)
+                .any(|port| port.session.endpoint.owner.load(Ordering::Acquire) == session_id)
     }
 
     pub fn bridges(&self) -> (DaemonCaptureBridge, DaemonPlaybackBridge) {
@@ -1019,20 +1224,13 @@ impl DaemonState {
             .into_boxed_slice();
         let capture = DaemonCaptureBridge {
             pair_start: Arc::clone(&self.pro_pair_start),
-            pair_owners: [
-                Arc::clone(&self.pro.owner),
-                Arc::clone(&self.pro_capture.owner),
-            ],
             pair_wait: [None, None],
+            pro_domain: Arc::clone(&self.pro_domain),
+            pro_capture_domain: Arc::clone(&self.pro_capture_domain),
+            shared_capture_domain: Arc::clone(&self.shared_capture_domain),
             directional_endpoint: Arc::clone(&self.pro_capture.endpoint),
-            directional_active: Arc::clone(&self.pro_capture.active),
-            directional_hardware_generation: Arc::clone(
-                &self.pro_capture.lifecycle_hardware_generation,
-            ),
             directional_capture_index: 0,
-            pro_hardware_generation: Arc::clone(&self.pro.lifecycle_hardware_generation),
             pro_endpoint: Arc::clone(&self.pro.endpoint),
-            pro_active: Arc::clone(&self.pro.active),
             pro_capture_index: 0,
             shared: capture_shared,
             timeline: Arc::clone(&self.timeline),
@@ -1040,18 +1238,16 @@ impl DaemonState {
         let playback = DaemonPlaybackBridge {
             pro_diagnostics: Arc::clone(&self.pro_diagnostics),
             pro_wait_timing: None,
+            pro_domain: Arc::clone(&self.pro_domain),
+            shared_playback_domain: Arc::clone(&self.shared_playback_domain),
+            commit_pinned: false,
             pro_endpoint: Arc::clone(&self.pro.endpoint),
-            pro_active: Arc::clone(&self.pro.active),
-            pro_gate: ProPlaybackGate {
-                lifecycle_generation: Arc::clone(&self.pro.lifecycle_generation),
-                lifecycle_hardware_generation: Arc::clone(&self.pro.lifecycle_hardware_generation),
-                armed: Arc::clone(&self.pro.armed),
-                warmup_blocks: Arc::clone(&self.pro.warmup_blocks),
-            },
             playback_epoch: Arc::clone(&self.playback_epoch),
             playback_commits: Arc::clone(&self.playback_commits),
             defer_playback_notifications: false,
             pending_pro_notify: false,
+            any_pending_shared_notify: false,
+            any_prepared_shared: false,
             shared: playback_shared,
             prepared_shared_sequence: None,
             last_valid_pro: vec![0; self.period_frames * self.playback_channels].into_boxed_slice(),
@@ -1081,15 +1277,13 @@ impl DaemonState {
 
 pub struct DaemonCaptureBridge {
     pair_start: Arc<AtomicU64>,
-    pair_owners: [Arc<AtomicU64>; 2],
     pair_wait: [Option<(u64, u64, u64)>; 2],
+    pro_domain: Arc<RtReadDomain>,
+    pro_capture_domain: Arc<RtReadDomain>,
+    shared_capture_domain: Arc<RtReadDomain>,
     directional_endpoint: Arc<EndpointSlot>,
-    directional_active: Arc<AtomicU64>,
-    directional_hardware_generation: Arc<AtomicU64>,
     directional_capture_index: usize,
-    pro_hardware_generation: Arc<AtomicU64>,
     pro_endpoint: Arc<EndpointSlot>,
-    pro_active: Arc<AtomicU64>,
     pro_capture_index: usize,
     shared: Box<[SharedAudioPortBridge]>,
     timeline: Arc<HardwareTimeline>,
@@ -1099,13 +1293,16 @@ pub struct DaemonPlaybackBridge {
     pro_diagnostics: Arc<ProDiagnostics>,
     // Identity, sequence, cutoff, budget at entry to the direct client wait.
     pro_wait_timing: Option<(ProPlaybackIdentity, u64, u64, u64)>,
+    pro_domain: Arc<RtReadDomain>,
+    shared_playback_domain: Arc<RtReadDomain>,
+    commit_pinned: bool,
     pro_endpoint: Arc<EndpointSlot>,
-    pro_active: Arc<AtomicU64>,
-    pro_gate: ProPlaybackGate,
     playback_epoch: Arc<AtomicU64>,
     playback_commits: Arc<PlaybackCommitBarrier>,
     defer_playback_notifications: bool,
     pending_pro_notify: bool,
+    any_pending_shared_notify: bool,
+    any_prepared_shared: bool,
     shared: Box<[SharedAudioPortBridge]>,
     prepared_shared_sequence: Option<u64>,
     last_valid_pro: Box<[i32]>,
@@ -1113,6 +1310,16 @@ pub struct DaemonPlaybackBridge {
     pro_repeated_periods: u32,
     core_miss_pro_sequence: Option<u64>,
     timeline: Arc<HardwareTimeline>,
+}
+
+impl Drop for DaemonPlaybackBridge {
+    fn drop(&mut self) {
+        if self.commit_pinned {
+            self.commit_pinned = false;
+            self.pro_domain.exit(RT_SLOT_PLAYBACK);
+            self.shared_playback_domain.exit(RT_SLOT_PLAYBACK);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1151,59 +1358,248 @@ struct PreparedSharedPlayback {
     fresh: bool,
 }
 
-struct ProPlaybackGate {
-    lifecycle_generation: Arc<AtomicU64>,
-    lifecycle_hardware_generation: Arc<AtomicU64>,
-    armed: Arc<AtomicU64>,
-    warmup_blocks: Arc<AtomicU64>,
-}
-
 #[derive(Clone, Copy)]
 struct ProPlaybackGateState {
     hardware_generation: u64,
+    session_id: u64,
     blocked: bool,
 }
 
-impl ProPlaybackGate {
-    fn synchronize(
-        &self,
-        endpoint: &SessionEndpoint,
-        active: &AtomicU64,
-        timeline: &HardwareTimeline,
-        sequence: u64,
-        notify_immediately: bool,
-    ) -> ProPlaybackGateState {
-        let hardware_generation = timeline.generation();
-        endpoint.region.set_hardware_generation(hardware_generation);
-        endpoint.region.set_playback_sequence(sequence);
+#[inline]
+fn ensure_activation(region: &SharedRegion, sequence: u64) -> bool {
+    // Avoid an unconditional shared-memory CAS on every steady-state period once activated.
+    !region.activation_ready() && region.establish_activation(sequence)
+}
 
-        let session_id = active.load(Ordering::SeqCst);
-        let blocked = session_id != 0
-            && endpoint.session_id == session_id
-            && self.lifecycle_hardware_generation.load(Ordering::Acquire) != hardware_generation;
-        if blocked {
-            let _ = self
-                .armed
-                .compare_exchange(session_id, 0, Ordering::AcqRel, Ordering::Acquire);
-            self.warmup_blocks.store(0, Ordering::Release);
-            if notify_immediately {
-                endpoint.events.notify_playback();
+#[inline]
+fn synchronize_pro_gate(
+    slot: &EndpointSlot,
+    endpoint: &SessionEndpoint,
+    timeline: &HardwareTimeline,
+    sequence: u64,
+    notify_immediately: bool,
+) -> ProPlaybackGateState {
+    let hardware_generation = timeline.generation();
+    endpoint.region.set_hardware_generation(hardware_generation);
+    endpoint.region.set_playback_sequence(sequence);
+
+    let session_id = slot.hot.active.load(Ordering::Acquire);
+    let blocked = session_id != 0
+        && endpoint.session_id == session_id
+        && slot
+            .hot
+            .lifecycle_hardware_generation
+            .load(Ordering::Acquire)
+            != hardware_generation;
+    if blocked {
+        let _ = slot
+            .hot
+            .armed
+            .compare_exchange(session_id, 0, Ordering::AcqRel, Ordering::Acquire);
+        slot.hot.warmup_blocks.store(0, Ordering::Release);
+        if notify_immediately {
+            endpoint.events.notify_playback();
+        }
+    }
+    ProPlaybackGateState {
+        hardware_generation,
+        session_id,
+        blocked,
+    }
+}
+
+enum ChannelMap {
+    /// Logical channels match physical channels 0..physical_channels identically.
+    Identity,
+    /// Single physical channel `ch < physical_channels`.
+    Mono(usize),
+    /// Contiguous stereo pair `[start, start + 1]` with `start + 2 <= physical_channels`.
+    StereoContiguous(usize),
+    /// Contiguous slice `[start..start + count]` with `start + count <= physical_channels`.
+    Contiguous { start: usize, count: usize },
+    /// Arbitrary channel order or non-contiguous indices.
+    General(Box<[usize]>),
+}
+
+impl ChannelMap {
+    fn from_channels(channels: &[usize], physical_channels: usize) -> Self {
+        match channels {
+            [ch] if *ch < physical_channels => {
+                if *ch == 0 && physical_channels == 1 {
+                    Self::Identity
+                } else {
+                    Self::Mono(*ch)
+                }
+            }
+            [a, b] if *b == a.wrapping_add(1) && a.saturating_add(2) <= physical_channels => {
+                if *a == 0 && physical_channels == 2 {
+                    Self::Identity
+                } else {
+                    Self::StereoContiguous(*a)
+                }
+            }
+            [first, ..]
+                if channels.len() <= physical_channels
+                    && first.saturating_add(channels.len()) <= physical_channels
+                    && channels
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &ch)| ch == first.wrapping_add(i)) =>
+            {
+                if *first == 0 && channels.len() == physical_channels {
+                    Self::Identity
+                } else {
+                    Self::Contiguous {
+                        start: *first,
+                        count: channels.len(),
+                    }
+                }
+            }
+            _ => Self::General(channels.to_vec().into_boxed_slice()),
+        }
+    }
+
+    #[inline]
+    fn mix_into_physical(
+        &self,
+        period_frames: usize,
+        physical_channels: usize,
+        scratch: &[i32],
+        physical: &mut [i32],
+    ) {
+        let total_physical = period_frames * physical_channels;
+        let physical = &mut physical[..total_physical];
+        match self {
+            Self::Identity => {
+                for (dst, &src) in physical.iter_mut().zip(&scratch[..total_physical]) {
+                    *dst = dst.saturating_add(src);
+                }
+            }
+            Self::Mono(ch) => {
+                let ch = *ch;
+                assert!(ch < physical_channels);
+                for (frame_out, &sample) in physical
+                    .chunks_exact_mut(physical_channels)
+                    .zip(&scratch[..period_frames])
+                {
+                    frame_out[ch] = frame_out[ch].saturating_add(sample);
+                }
+            }
+            Self::StereoContiguous(start) => {
+                let start = *start;
+                assert!(start + 2 <= physical_channels);
+                let (stereo_frames, _) = scratch[..period_frames * 2].as_chunks::<2>();
+                for (frame_out, frame_in) in physical
+                    .chunks_exact_mut(physical_channels)
+                    .zip(stereo_frames)
+                {
+                    let dst = &mut frame_out[start..start + 2];
+                    dst[0] = dst[0].saturating_add(frame_in[0]);
+                    dst[1] = dst[1].saturating_add(frame_in[1]);
+                }
+            }
+            Self::Contiguous { start, count } => {
+                let (start, count) = (*start, *count);
+                assert!(start + count <= physical_channels);
+                for (frame_out, frame_in) in physical
+                    .chunks_exact_mut(physical_channels)
+                    .zip(scratch[..period_frames * count].chunks_exact(count))
+                {
+                    for (dst, &src) in frame_out[start..start + count].iter_mut().zip(frame_in) {
+                        *dst = dst.saturating_add(src);
+                    }
+                }
+            }
+            Self::General(channels) => {
+                let logical_channels = channels.len();
+                if logical_channels == 0 {
+                    return;
+                }
+                for (frame_out, frame_in) in physical
+                    .chunks_exact_mut(physical_channels)
+                    .zip(scratch[..period_frames * logical_channels].chunks_exact(logical_channels))
+                {
+                    for (&physical_channel, &sample) in channels.iter().zip(frame_in) {
+                        frame_out[physical_channel] =
+                            frame_out[physical_channel].saturating_add(sample);
+                    }
+                }
             }
         }
-        ProPlaybackGateState {
-            hardware_generation,
-            blocked,
+    }
+
+    #[inline]
+    fn extract_from_physical<'a>(
+        &self,
+        period_frames: usize,
+        physical_channels: usize,
+        physical: &'a [i32],
+        scratch: &'a mut [i32],
+    ) -> &'a [i32] {
+        let total_physical = period_frames * physical_channels;
+        let physical = &physical[..total_physical];
+        match self {
+            Self::Identity => physical,
+            Self::Mono(ch) => {
+                let ch = *ch;
+                assert!(ch < physical_channels);
+                let out = &mut scratch[..period_frames];
+                for (dst, frame_in) in out.iter_mut().zip(physical.chunks_exact(physical_channels))
+                {
+                    *dst = frame_in[ch];
+                }
+                out
+            }
+            Self::StereoContiguous(start) => {
+                let start = *start;
+                assert!(start + 2 <= physical_channels);
+                let out = &mut scratch[..period_frames * 2];
+                let (stereo_out, _) = out.as_chunks_mut::<2>();
+                for (frame_out, frame_in) in stereo_out
+                    .iter_mut()
+                    .zip(physical.chunks_exact(physical_channels))
+                {
+                    let src = &frame_in[start..start + 2];
+                    frame_out[0] = src[0];
+                    frame_out[1] = src[1];
+                }
+                out
+            }
+            Self::Contiguous { start, count } => {
+                let (start, count) = (*start, *count);
+                assert!(start + count <= physical_channels);
+                let out = &mut scratch[..period_frames * count];
+                for (frame_out, frame_in) in out
+                    .chunks_exact_mut(count)
+                    .zip(physical.chunks_exact(physical_channels))
+                {
+                    frame_out.copy_from_slice(&frame_in[start..start + count]);
+                }
+                out
+            }
+            Self::General(channels) => {
+                let logical_channels = channels.len();
+                let out = &mut scratch[..period_frames * logical_channels];
+                if logical_channels == 0 {
+                    return out;
+                }
+                for (frame_out, frame_in) in out
+                    .chunks_exact_mut(logical_channels)
+                    .zip(physical.chunks_exact(physical_channels))
+                {
+                    for (dst, &physical_channel) in frame_out.iter_mut().zip(channels.iter()) {
+                        *dst = frame_in[physical_channel];
+                    }
+                }
+                out
+            }
         }
     }
 }
 
 struct SharedAudioPortBridge {
     endpoint: Arc<EndpointSlot>,
-    active: Arc<AtomicU64>,
-    lifecycle_generation: Arc<AtomicU64>,
-    armed: Arc<AtomicU64>,
-    outage: Arc<AtomicU64>,
-    channels: Box<[usize]>,
+    channel_map: ChannelMap,
     period_frames: usize,
     physical_channels: usize,
     capture_capacity_slots: usize,
@@ -1228,18 +1624,16 @@ impl SharedAudioPortBridge {
         latency_periods: u32,
         repeat_on_underrun: bool,
     ) -> Self {
+        let physical_channels = match port.direction {
+            PortDirection::Playback => playback_channels,
+            PortDirection::Capture => capture_channels,
+        };
+        let channel_map = ChannelMap::from_channels(&port.channels, physical_channels);
         Self {
             endpoint: Arc::clone(&port.session.endpoint),
-            active: Arc::clone(&port.session.active),
-            lifecycle_generation: Arc::clone(&port.session.lifecycle_generation),
-            armed: Arc::clone(&port.session.armed),
-            outage: Arc::clone(&port.session.outage),
-            channels: port.channels.clone(),
+            channel_map,
             period_frames,
-            physical_channels: match port.direction {
-                PortDirection::Playback => playback_channels,
-                PortDirection::Capture => capture_channels,
-            },
+            physical_channels,
             capture_capacity_slots,
             latency_periods: u64::from(latency_periods),
             repeat_on_underrun,
@@ -1253,19 +1647,32 @@ impl SharedAudioPortBridge {
         }
     }
 
-    fn flush_pending_notify(&mut self) {
+    /// # Safety
+    /// Caller must hold an active pin on `domain` covering `self.endpoint`.
+    #[inline]
+    unsafe fn flush_pending_notify_pinned(&mut self, domain: &Arc<RtReadDomain>) {
         if self.pending_notify {
             self.pending_notify = false;
-            self.endpoint.load().events.notify_playback();
+            unsafe { self.endpoint.load_pinned(domain) }
+                .events
+                .notify_playback();
         }
     }
 
-    fn prepare_playback(&mut self, sequence: u64, timeline: &HardwareTimeline, defer_notify: bool) {
+    /// # Safety
+    /// Caller must hold an active pin on `domain` covering `self.endpoint`.
+    unsafe fn prepare_playback_pinned(
+        &mut self,
+        sequence: u64,
+        hardware_generation: u64,
+        timeline: &HardwareTimeline,
+        defer_notify: bool,
+        domain: &Arc<RtReadDomain>,
+    ) {
         if self.prepared.take().is_some_and(|prepared| prepared.fresh) {
             self.last_valid_playback = None;
         }
-        let endpoint = self.endpoint.load();
-        let hardware_generation = timeline.generation();
+        let endpoint = unsafe { self.endpoint.load_pinned(domain) };
         let hardware_generation_changed = self
             .observed_hardware_generation
             .replace(hardware_generation)
@@ -1275,23 +1682,28 @@ impl SharedAudioPortBridge {
         }
         endpoint.region.set_hardware_generation(hardware_generation);
         endpoint.region.set_cycle_sequence(sequence);
-        let session_id = self.active.load(Ordering::SeqCst);
+        let session_id = self.endpoint.hot.active.load(Ordering::Acquire);
         if session_id == 0 || endpoint.session_id != session_id {
             self.last_valid_playback = None;
             return;
         }
-        let generation = self.lifecycle_generation.load(Ordering::Acquire);
-        if endpoint.region.establish_activation(sequence) {
+        let generation = self
+            .endpoint
+            .hot
+            .lifecycle_generation
+            .load(Ordering::Acquire);
+        if ensure_activation(&endpoint.region, sequence) {
             self.last_valid_playback = None;
-            notify_or_defer(&mut self.pending_notify, &endpoint, defer_notify);
+            notify_or_defer(&mut self.pending_notify, endpoint, defer_notify);
             return;
         }
-        if endpoint.region.client_state() == SHARED_CLIENT_STARTING {
+        let client_state = endpoint.region.client_state();
+        if client_state == SHARED_CLIENT_STARTING {
             self.last_valid_playback = None;
-            notify_or_defer(&mut self.pending_notify, &endpoint, defer_notify);
+            notify_or_defer(&mut self.pending_notify, endpoint, defer_notify);
             return;
         }
-        if endpoint.region.client_state() != SHARED_CLIENT_RUNNING {
+        if client_state != SHARED_CLIENT_RUNNING {
             self.last_valid_playback = None;
             return;
         }
@@ -1304,9 +1716,13 @@ impl SharedAudioPortBridge {
         let consumed = endpoint
             .region
             .try_consume_playback(expected_sequence, &mut self.scratch);
-        let session_is_current = self.active.load(Ordering::SeqCst) == session_id
-            && self.lifecycle_generation.load(Ordering::Acquire) == generation
-            && endpoint.session_id == session_id
+        let session_is_current = self.endpoint.hot.active.load(Ordering::Acquire) == session_id
+            && self
+                .endpoint
+                .hot
+                .lifecycle_generation
+                .load(Ordering::Acquire)
+                == generation
             && timeline.generation() == hardware_generation;
         if consumed && session_is_current {
             self.prepared = Some(PreparedSharedPlayback {
@@ -1315,10 +1731,10 @@ impl SharedAudioPortBridge {
                 fresh: true,
             });
         } else if !consumed && session_is_current {
-            let armed = self.armed.load(Ordering::Acquire) == session_id;
-            let outage = self.outage.load(Ordering::Acquire) == session_id;
+            let armed = self.endpoint.hot.armed.load(Ordering::Acquire) == session_id;
+            let outage = self.endpoint.hot.outage.load(Ordering::Acquire) == session_id;
             if !armed && !outage {
-                notify_or_defer(&mut self.pending_notify, &endpoint, defer_notify);
+                notify_or_defer(&mut self.pending_notify, endpoint, defer_notify);
                 return;
             }
             let sequence_lag = playback_sequence_lag(
@@ -1329,10 +1745,16 @@ impl SharedAudioPortBridge {
                 .record_playback_miss(expected_sequence, sequence_lag, armed);
             if armed {
                 timeline.record_shared_underrun();
-                let _ =
-                    self.armed
-                        .compare_exchange(session_id, 0, Ordering::AcqRel, Ordering::Acquire);
-                self.outage.store(session_id, Ordering::Release);
+                let _ = self.endpoint.hot.armed.compare_exchange(
+                    session_id,
+                    0,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                self.endpoint
+                    .hot
+                    .outage
+                    .store(session_id, Ordering::Release);
             }
             if self.repeat_on_underrun
                 && self.last_valid_playback == Some(identity)
@@ -1350,28 +1772,35 @@ impl SharedAudioPortBridge {
         } else {
             self.last_valid_playback = None;
         }
-        notify_or_defer(&mut self.pending_notify, &endpoint, defer_notify);
+        notify_or_defer(&mut self.pending_notify, endpoint, defer_notify);
     }
 
-    fn commit_prepared(
+    /// # Safety
+    /// Caller must hold an active pin on `domain` covering `self.endpoint`.
+    unsafe fn commit_prepared_pinned(
         &mut self,
         sequence: u64,
         physical: &mut [i32],
-        timeline: &HardwareTimeline,
+        hardware_generation: u64,
+        domain: &Arc<RtReadDomain>,
     ) {
         let Some(prepared) = self.prepared.take() else {
             return;
         };
         if prepared.sequence != sequence
-            || self.active.load(Ordering::SeqCst) != prepared.identity.session_id
-            || self.lifecycle_generation.load(Ordering::Acquire)
+            || self.endpoint.hot.active.load(Ordering::Acquire) != prepared.identity.session_id
+            || self
+                .endpoint
+                .hot
+                .lifecycle_generation
+                .load(Ordering::Acquire)
                 != prepared.identity.lifecycle_generation
-            || timeline.generation() != prepared.identity.hardware_generation
+            || hardware_generation != prepared.identity.hardware_generation
         {
             self.last_valid_playback = None;
             return;
         }
-        let endpoint = self.endpoint.load();
+        let endpoint = unsafe { self.endpoint.load_pinned(domain) };
         if endpoint.session_id != prepared.identity.session_id
             || endpoint.region.client_state() != SHARED_CLIENT_RUNNING
         {
@@ -1379,14 +1808,16 @@ impl SharedAudioPortBridge {
             return;
         }
         if prepared.fresh {
-            let _ = self.outage.compare_exchange(
-                prepared.identity.session_id,
-                0,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-            if self.armed.load(Ordering::Acquire) != prepared.identity.session_id {
-                let _ = self.armed.compare_exchange(
+            if self.endpoint.hot.outage.load(Ordering::Acquire) == prepared.identity.session_id {
+                let _ = self.endpoint.hot.outage.compare_exchange(
+                    prepared.identity.session_id,
+                    0,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+            if self.endpoint.hot.armed.load(Ordering::Acquire) != prepared.identity.session_id {
+                let _ = self.endpoint.hot.armed.compare_exchange(
                     0,
                     prepared.identity.session_id,
                     Ordering::AcqRel,
@@ -1396,59 +1827,73 @@ impl SharedAudioPortBridge {
             self.last_valid_playback = Some(prepared.identity);
             self.repeated_periods = 0;
         }
-        let logical_channels = self.channels.len();
-        for frame in 0..self.period_frames {
-            let physical_offset = frame * self.physical_channels;
-            let logical_offset = frame * logical_channels;
-            for (logical_channel, &physical_channel) in self.channels.iter().enumerate() {
-                let physical_index = physical_offset + physical_channel;
-                physical[physical_index] = physical[physical_index]
-                    .saturating_add(self.scratch[logical_offset + logical_channel]);
-            }
-        }
+        self.channel_map.mix_into_physical(
+            self.period_frames,
+            self.physical_channels,
+            &self.scratch,
+            physical,
+        );
     }
 
-    fn process_playback(
+    /// # Safety
+    /// Caller must hold an active pin on `domain` covering `self.endpoint`.
+    unsafe fn process_playback_pinned(
         &mut self,
         sequence: u64,
         physical: &mut [i32],
+        hardware_generation: u64,
         timeline: &HardwareTimeline,
         defer_notify: bool,
+        domain: &Arc<RtReadDomain>,
     ) {
-        self.prepare_playback(sequence, timeline, defer_notify);
-        self.commit_prepared(sequence, physical, timeline);
+        unsafe {
+            self.prepare_playback_pinned(
+                sequence,
+                hardware_generation,
+                timeline,
+                defer_notify,
+                domain,
+            );
+            self.commit_prepared_pinned(sequence, physical, timeline.generation(), domain);
+        }
     }
 
-    fn process_capture(&mut self, sequence: u64, physical: &[i32], timeline: &HardwareTimeline) {
-        let endpoint = self.endpoint.load();
-        endpoint
-            .region
-            .set_hardware_generation(timeline.generation());
+    /// # Safety
+    /// Caller must hold an active pin on `domain` covering `self.endpoint`.
+    unsafe fn process_capture_pinned(
+        &mut self,
+        sequence: u64,
+        physical: &[i32],
+        hardware_generation: u64,
+        timeline: &HardwareTimeline,
+        domain: &Arc<RtReadDomain>,
+    ) {
+        let endpoint = unsafe { self.endpoint.load_pinned(domain) };
+        endpoint.region.set_hardware_generation(hardware_generation);
         endpoint.region.set_cycle_sequence(sequence);
-        let session_id = self.active.load(Ordering::SeqCst);
+        let session_id = self.endpoint.hot.active.load(Ordering::Acquire);
         if session_id == 0
             || endpoint.session_id != session_id
             || endpoint.region.client_state() == SHARED_CLIENT_IDLE
         {
             return;
         }
-        if endpoint.region.establish_activation(sequence) {
+        if ensure_activation(&endpoint.region, sequence) {
             endpoint.region.set_client_state(SHARED_CLIENT_RUNNING);
             return;
         }
-        let logical_channels = self.channels.len();
-        for frame in 0..self.period_frames {
-            let physical_offset = frame * self.physical_channels;
-            let logical_offset = frame * logical_channels;
-            for (logical_channel, &physical_channel) in self.channels.iter().enumerate() {
-                self.scratch[logical_offset + logical_channel] =
-                    physical[physical_offset + physical_channel];
-            }
-        }
-        if endpoint.region.ready_capture_slots() >= self.capture_capacity_slots
+        let samples = self.channel_map.extract_from_physical(
+            self.period_frames,
+            self.physical_channels,
+            physical,
+            &mut self.scratch,
+        );
+        let over_capacity = self.capture_capacity_slots < endpoint.slot_count
+            && endpoint.region.ready_capture_slots() >= self.capture_capacity_slots;
+        if over_capacity
             || !endpoint
                 .region
-                .try_publish_capture(&mut self.index, sequence, &self.scratch)
+                .try_publish_capture(&mut self.index, sequence, samples)
         {
             timeline.record_shared_overrun();
             endpoint.region.record_capture_discontinuity();
@@ -1458,32 +1903,48 @@ impl SharedAudioPortBridge {
 }
 
 impl DaemonCaptureBridge {
-    fn activate_pair(&mut self, capture_sequence: u64, playback_sequence: u64) -> u64 {
+    /// # Safety
+    /// Caller must hold active pins on both `self.pro_domain` and `self.pro_capture_domain`.
+    unsafe fn activate_pair_pinned(
+        &mut self,
+        capture_sequence: u64,
+        playback_sequence: u64,
+        generation: u64,
+    ) -> u64 {
         if self.pair_start.load(Ordering::Acquire) == 0 {
             return 0;
         }
-        // Keep both endpoint guards through clearing the pending bits. Stop/close
-        // drain these guards before resetting or reopening a lifecycle, so this
+        // Keep both domain pins through clearing the pending bits. Stop/close
+        // drain these pins before resetting or reopening a lifecycle, so this
         // activation cannot clear a request belonging to a replacement session.
-        let p = self.pro_endpoint.load();
-        let c = self.directional_endpoint.load();
-        let generation = self.timeline.generation();
+        let p = unsafe { self.pro_endpoint.load_pinned(&self.pro_domain) };
+        let c = unsafe {
+            self.directional_endpoint
+                .load_pinned(&self.pro_capture_domain)
+        };
         let active = [
-            self.pro_active.load(Ordering::SeqCst),
-            self.directional_active.load(Ordering::SeqCst),
+            self.pro_endpoint.hot.active.load(Ordering::Acquire),
+            self.directional_endpoint.hot.active.load(Ordering::Acquire),
         ];
         let lifecycle_hardware = [
-            self.pro_hardware_generation.load(Ordering::Acquire),
-            self.directional_hardware_generation.load(Ordering::Acquire),
+            self.pro_endpoint
+                .hot
+                .lifecycle_hardware_generation
+                .load(Ordering::Acquire),
+            self.directional_endpoint
+                .hot
+                .lifecycle_hardware_generation
+                .load(Ordering::Acquire),
         ];
         let mask = self.pair_start.load(Ordering::Acquire);
-        let endpoints = [&*p, &*c];
+        let endpoints = [p, c];
         let eligible = std::array::from_fn::<_, 2, _>(|i| {
             mask & (1 << i) != 0
                 && active[i] != 0
                 && active[i] == endpoints[i].session_id
                 && lifecycle_hardware[i] == generation
         });
+        let pair_owners = [&self.pro_endpoint.owner, &self.directional_endpoint.owner];
         let mut activated = 0;
         for i in 0..2 {
             let bit = 1 << i;
@@ -1501,7 +1962,7 @@ impl DaemonCaptureBridge {
                 }
                 continue;
             }
-            let peer_owner = self.pair_owners[i ^ 1].load(Ordering::Acquire);
+            let peer_owner = pair_owners[i ^ 1].load(Ordering::Acquire);
             if !eligible[i ^ 1]
                 && active[i ^ 1] == 0
                 && peer_owner != 0
@@ -1542,34 +2003,42 @@ impl DaemonCaptureBridge {
         activated
     }
 
-    fn publish_pro_capture(&mut self, playback_sequence: u64, capture: &[i32]) {
-        let endpoint = self.pro_endpoint.load();
-        endpoint
-            .region
-            .set_hardware_generation(self.timeline.generation());
+    /// # Safety
+    /// Caller must hold an active pin on `self.pro_domain`.
+    unsafe fn publish_pro_capture_pinned(
+        &mut self,
+        playback_sequence: u64,
+        hardware_generation: u64,
+        capture: &[i32],
+    ) {
+        let endpoint = unsafe { self.pro_endpoint.load_pinned(&self.pro_domain) };
+        endpoint.region.set_hardware_generation(hardware_generation);
         endpoint.region.set_cycle_sequence(playback_sequence);
-        let session_id = self.pro_active.load(Ordering::SeqCst);
+        let session_id = self.pro_endpoint.hot.active.load(Ordering::Acquire);
+        if session_id == 0 || endpoint.session_id != session_id {
+            return;
+        }
         // Check after active: seeing a newly started session must also observe
         // the preceding pair-start barrier, even if this cycle entered earlier.
         if self.pair_start.load(Ordering::Acquire) & 1 != 0 {
             return;
         }
-        if endpoint.info().capture_channels == 0 {
-            if session_id != 0 && endpoint.session_id == session_id {
-                if self.pro_hardware_generation.load(Ordering::Acquire)
-                    == self.timeline.generation()
-                    && endpoint.region.client_state() != SHARED_CLIENT_IDLE
-                {
-                    endpoint.region.establish_activation(playback_sequence);
-                }
-                // Playback-only clients wake at capture-ready, before the hardware waits.
-                endpoint.events.notify_playback();
+        if !endpoint.has_capture {
+            if self
+                .pro_endpoint
+                .hot
+                .lifecycle_hardware_generation
+                .load(Ordering::Acquire)
+                == hardware_generation
+                && endpoint.region.client_state() != SHARED_CLIENT_IDLE
+            {
+                let _ = ensure_activation(&endpoint.region, playback_sequence);
             }
+            // Playback-only clients wake at capture-ready, before the hardware waits.
+            endpoint.events.notify_playback();
             return;
         }
-        if session_id != 0
-            && endpoint.session_id == session_id
-            && !endpoint.region.establish_activation(playback_sequence)
+        if !ensure_activation(&endpoint.region, playback_sequence)
             && endpoint.region.client_state() != SHARED_CLIENT_IDLE
         {
             if endpoint.region.try_publish_capture(
@@ -1586,31 +2055,60 @@ impl DaemonCaptureBridge {
     }
 
     fn publish_shared_capture(&mut self, hardware_sequence: u64, capture: &[i32]) {
-        for port in &mut self.shared {
-            port.process_capture(hardware_sequence, capture, &self.timeline);
-        }
-    }
-
-    fn publish_directional_capture(&mut self, sequence: u64, capture: &[i32]) {
-        let endpoint = self.directional_endpoint.load();
-        let hardware_generation = self.timeline.generation();
-        endpoint.region.set_hardware_generation(hardware_generation);
-        endpoint.region.set_cycle_sequence(sequence);
-        let session_id = self.directional_active.load(Ordering::SeqCst);
-        if self.pair_start.load(Ordering::Acquire) & 2 != 0 {
+        if self.shared.is_empty() {
             return;
         }
-        if session_id == 0
-            || endpoint.session_id != session_id
+        let pin = self.shared_capture_domain.enter(RT_SLOT_CAPTURE);
+        let hardware_generation = self.timeline.generation();
+        for port in &mut self.shared {
+            // SAFETY: `pin` holds `shared_capture_domain` slot `RT_SLOT_CAPTURE`.
+            unsafe {
+                port.process_capture_pinned(
+                    hardware_sequence,
+                    capture,
+                    hardware_generation,
+                    &self.timeline,
+                    &self.shared_capture_domain,
+                );
+            }
+        }
+        drop(pin);
+    }
+
+    /// # Safety
+    /// Caller must hold an active pin on `self.pro_capture_domain`.
+    unsafe fn publish_directional_capture_pinned(
+        &mut self,
+        sequence: u64,
+        hardware_generation: u64,
+        capture: &[i32],
+    ) {
+        let endpoint = unsafe {
+            self.directional_endpoint
+                .load_pinned(&self.pro_capture_domain)
+        };
+        endpoint.region.set_hardware_generation(hardware_generation);
+        endpoint.region.set_cycle_sequence(sequence);
+        let session_id = self.directional_endpoint.hot.active.load(Ordering::Acquire);
+        if session_id == 0 || endpoint.session_id != session_id {
+            return;
+        }
+        if self.pair_start.load(Ordering::Acquire) & 2 != 0
             || endpoint.region.client_state() == SHARED_CLIENT_IDLE
         {
             return;
         }
-        if self.directional_hardware_generation.load(Ordering::Acquire) != hardware_generation {
+        if self
+            .directional_endpoint
+            .hot
+            .lifecycle_hardware_generation
+            .load(Ordering::Acquire)
+            != hardware_generation
+        {
             endpoint.events.notify_capture();
             return;
         }
-        if endpoint.region.establish_activation(sequence) {
+        if ensure_activation(&endpoint.region, sequence) {
             endpoint.region.set_client_state(SHARED_CLIENT_RUNNING);
         } else if !endpoint.region.try_publish_capture(
             &mut self.directional_capture_index,
@@ -1626,12 +2124,31 @@ impl DaemonCaptureBridge {
 
 impl ProCaptureSink for DaemonCaptureBridge {
     fn process_capture(&mut self, sequence: u64, capture: &[i32]) {
-        let activated = self.activate_pair(sequence, sequence);
-        if activated & 1 == 0 {
-            self.publish_pro_capture(sequence, capture);
-        }
-        if activated & 2 == 0 {
-            self.publish_directional_capture(sequence, capture);
+        {
+            let guard = CapturePairGuard::enter(self);
+            let hardware_generation = guard.bridge.timeline.generation();
+            // SAFETY: `guard` holds both `pro_domain` and `pro_capture_domain`.
+            let activated = unsafe {
+                guard
+                    .bridge
+                    .activate_pair_pinned(sequence, sequence, hardware_generation)
+            };
+            if activated & 1 == 0 {
+                unsafe {
+                    guard
+                        .bridge
+                        .publish_pro_capture_pinned(sequence, hardware_generation, capture);
+                }
+            }
+            if activated & 2 == 0 {
+                unsafe {
+                    guard.bridge.publish_directional_capture_pinned(
+                        sequence,
+                        hardware_generation,
+                        capture,
+                    );
+                }
+            }
         }
         self.publish_shared_capture(sequence, capture);
     }
@@ -1642,12 +2159,33 @@ impl ProCaptureSink for DaemonCaptureBridge {
         playback_sequence: u64,
         capture: &[i32],
     ) {
-        let activated = self.activate_pair(hardware_sequence, playback_sequence);
+        let guard = CapturePairGuard::enter(self);
+        let hardware_generation = guard.bridge.timeline.generation();
+        // SAFETY: `guard` holds both `pro_domain` and `pro_capture_domain`.
+        let activated = unsafe {
+            guard.bridge.activate_pair_pinned(
+                hardware_sequence,
+                playback_sequence,
+                hardware_generation,
+            )
+        };
         if activated & 2 == 0 {
-            self.publish_directional_capture(hardware_sequence, capture);
+            unsafe {
+                guard.bridge.publish_directional_capture_pinned(
+                    hardware_sequence,
+                    hardware_generation,
+                    capture,
+                );
+            }
         }
         if activated & 1 == 0 {
-            self.publish_pro_capture(playback_sequence, capture);
+            unsafe {
+                guard.bridge.publish_pro_capture_pinned(
+                    playback_sequence,
+                    hardware_generation,
+                    capture,
+                );
+            }
         }
     }
 
@@ -1662,54 +2200,79 @@ impl ProPlaybackSource for DaemonPlaybackBridge {
     }
 
     fn prepare_playback(&mut self, sequence: u64) {
-        let endpoint = self.pro_endpoint.load();
-        if self.pro_active.load(Ordering::Acquire) != 0 {
-            endpoint.events.drain_playback_ready();
-        }
-        self.pro_gate
-            .synchronize(&endpoint, &self.pro_active, &self.timeline, sequence, true);
+        let _pin = (!self.commit_pinned).then(|| self.pro_domain.enter(RT_SLOT_PLAYBACK));
+        // SAFETY: `pro_domain` slot `RT_SLOT_PLAYBACK` is held by `_pin` or `commit_pinned`.
+        let endpoint = unsafe { self.pro_endpoint.load_pinned(&self.pro_domain) };
+        synchronize_pro_gate(&self.pro_endpoint, endpoint, &self.timeline, sequence, true);
     }
 
     fn prepare_playback_mix(&mut self, sequence: u64) {
         let defer = self.defer_playback_notifications;
+        let _pin =
+            (!self.commit_pinned).then(|| self.shared_playback_domain.enter(RT_SLOT_PLAYBACK));
+        let hardware_generation = self.timeline.generation();
+        let mut any_prepared = false;
+        let mut any_pending_notify = false;
         for port in &mut self.shared {
-            port.prepare_playback(sequence, &self.timeline, defer);
+            // SAFETY: `shared_playback_domain` slot `RT_SLOT_PLAYBACK` is held by `_pin` or `commit_pinned`.
+            unsafe {
+                port.prepare_playback_pinned(
+                    sequence,
+                    hardware_generation,
+                    &self.timeline,
+                    defer,
+                    &self.shared_playback_domain,
+                );
+            }
+            any_prepared |= port.prepared.is_some();
+            any_pending_notify |= port.pending_notify;
         }
+        self.any_prepared_shared = any_prepared;
+        self.any_pending_shared_notify |= any_pending_notify;
         self.prepared_shared_sequence = Some(sequence);
     }
 
     fn wait_for_playback_before(&mut self, sequence: u64, cutoff_nanos: u64) {
-        let wait_budget = self
-            .pro_diagnostics
-            .enabled
-            .load(Ordering::Relaxed)
-            .then(|| cutoff_nanos.saturating_sub(monotonic_nanos()));
-        let endpoint = self.pro_endpoint.load();
-        let session_id = self.pro_active.load(Ordering::SeqCst);
+        let diagnostics_enabled = self.pro_diagnostics.enabled.load(Ordering::Relaxed);
+        if !diagnostics_enabled && self.pro_endpoint.hot.active.load(Ordering::Acquire) == 0 {
+            self.pro_wait_timing = None;
+            return;
+        }
+        let entry_now = diagnostics_enabled.then(monotonic_nanos);
+        let _pin = (!self.commit_pinned).then(|| self.pro_domain.enter(RT_SLOT_PLAYBACK));
+        // SAFETY: `pro_domain` slot `RT_SLOT_PLAYBACK` is held by `_pin` or `commit_pinned`.
+        let endpoint = unsafe { self.pro_endpoint.load_pinned(&self.pro_domain) };
+        let session_id = self.pro_endpoint.hot.active.load(Ordering::Acquire);
         let hardware_generation = self.timeline.generation();
-        self.pro_wait_timing = wait_budget.map(|budget| {
+        self.pro_wait_timing = entry_now.map(|now| {
             (
                 ProPlaybackIdentity {
                     session_id,
                     lifecycle_generation: self
-                        .pro_gate
+                        .pro_endpoint
+                        .hot
                         .lifecycle_generation
                         .load(Ordering::Acquire),
                     hardware_generation,
                 },
                 sequence,
                 cutoff_nanos,
-                budget,
+                cutoff_nanos.saturating_sub(now),
             )
         });
         if session_id == 0
             || endpoint.session_id != session_id
             || !endpoint.region.activation_ready()
-            || endpoint.region.client_state() == SHARED_CLIENT_IDLE
-            || (endpoint.region.client_state() == SHARED_CLIENT_STARTING
+        {
+            return;
+        }
+        let client_state = endpoint.region.client_state();
+        if client_state == SHARED_CLIENT_IDLE
+            || (client_state == SHARED_CLIENT_STARTING
                 && endpoint.region.start_sequence() == sequence)
             || self
-                .pro_gate
+                .pro_endpoint
+                .hot
                 .lifecycle_hardware_generation
                 .load(Ordering::Acquire)
                 != hardware_generation
@@ -1718,43 +2281,28 @@ impl ProPlaybackSource for DaemonPlaybackBridge {
             return;
         }
 
-        let wait_started = Instant::now();
+        let wait_started_nanos = entry_now.unwrap_or_else(monotonic_nanos);
+        let mut now = wait_started_nanos;
         loop {
-            if self.pro_active.load(Ordering::SeqCst) != session_id
-                || endpoint.region.client_state() == SHARED_CLIENT_IDLE
-                || (endpoint.region.client_state() == SHARED_CLIENT_STARTING
-                    && endpoint.region.start_sequence() == sequence)
-                || self.timeline.generation() != hardware_generation
-                || self
-                    .pro_gate
-                    .lifecycle_hardware_generation
-                    .load(Ordering::Acquire)
-                    != hardware_generation
-                || endpoint.region.has_ready_playback(sequence)
-            {
+            if cutoff_nanos <= now {
                 break;
             }
             endpoint.events.drain_playback_ready();
-            if self.pro_active.load(Ordering::SeqCst) != session_id
-                || endpoint.region.client_state() == SHARED_CLIENT_IDLE
-                || (endpoint.region.client_state() == SHARED_CLIENT_STARTING
-                    && endpoint.region.start_sequence() == sequence)
-                || self.timeline.generation() != hardware_generation
-                || self
-                    .pro_gate
-                    .lifecycle_hardware_generation
-                    .load(Ordering::Acquire)
-                    != hardware_generation
-                || endpoint.region.has_ready_playback(sequence)
-            {
-                break;
-            }
-            let remaining = cutoff_nanos.saturating_sub(monotonic_nanos());
-            if remaining == 0 {
+            if self.pro_wait_should_stop(endpoint, session_id, hardware_generation, sequence) {
                 break;
             }
             match endpoint.events.wait_playback_ready_before(cutoff_nanos) {
-                PlaybackReadyWait::Ready | PlaybackReadyWait::Interrupted => {}
+                PlaybackReadyWait::Ready | PlaybackReadyWait::Interrupted => {
+                    if self.pro_wait_should_stop(
+                        endpoint,
+                        session_id,
+                        hardware_generation,
+                        sequence,
+                    ) {
+                        break;
+                    }
+                    now = monotonic_nanos();
+                }
                 PlaybackReadyWait::Timeout => break,
                 PlaybackReadyWait::Failed => {
                     self.core_miss_pro_sequence = Some(sequence);
@@ -1762,9 +2310,8 @@ impl ProPlaybackSource for DaemonPlaybackBridge {
                 }
             }
         }
-        self.timeline.record_pro_ready_wait(
-            u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-        );
+        self.timeline
+            .record_pro_ready_wait(monotonic_nanos().saturating_sub(wait_started_nanos));
     }
 
     fn mark_playback_budget_exhausted(&mut self, sequence: u64) {
@@ -1772,20 +2319,45 @@ impl ProPlaybackSource for DaemonPlaybackBridge {
     }
 
     fn begin_playback_commit(&mut self) {
-        self.playback_commits.begin();
+        self.playback_commits.begin_unflushed();
+        if !self.commit_pinned {
+            self.pro_domain.begin_unflushed(RT_SLOT_PLAYBACK);
+            self.shared_playback_domain
+                .begin_unflushed(RT_SLOT_PLAYBACK);
+            self.commit_pinned = true;
+        }
+        fence(Ordering::SeqCst);
         self.defer_playback_notifications = true;
     }
 
     fn end_playback_commit(&mut self) {
         // Flush deferred client wakeups after the ALSA playback write completes,
-        // while the commit barrier still pins the endpoints from teardown.
+        // while the commit barrier and RT pins still keep endpoints alive.
         self.defer_playback_notifications = false;
+        let pro_pin = (self.pending_pro_notify && !self.commit_pinned)
+            .then(|| self.pro_domain.enter(RT_SLOT_PLAYBACK));
         if self.pending_pro_notify {
             self.pending_pro_notify = false;
-            self.pro_endpoint.load().events.notify_playback();
+            // SAFETY: `pro_domain` slot `RT_SLOT_PLAYBACK` is held by `pro_pin` or `commit_pinned`.
+            unsafe { self.pro_endpoint.load_pinned(&self.pro_domain) }
+                .events
+                .notify_playback();
         }
-        for port in &mut self.shared {
-            port.flush_pending_notify();
+        drop(pro_pin);
+        let shared_pin = (self.any_pending_shared_notify && !self.commit_pinned)
+            .then(|| self.shared_playback_domain.enter(RT_SLOT_PLAYBACK));
+        if self.any_pending_shared_notify {
+            self.any_pending_shared_notify = false;
+            for port in &mut self.shared {
+                // SAFETY: `shared_playback_domain` slot `RT_SLOT_PLAYBACK` is held by `shared_pin` or `commit_pinned`.
+                unsafe { port.flush_pending_notify_pinned(&self.shared_playback_domain) };
+            }
+        }
+        drop(shared_pin);
+        if self.commit_pinned {
+            self.commit_pinned = false;
+            self.pro_domain.exit(RT_SLOT_PLAYBACK);
+            self.shared_playback_domain.exit(RT_SLOT_PLAYBACK);
         }
         self.playback_commits.end();
     }
@@ -1801,18 +2373,54 @@ impl ProPlaybackSource for DaemonPlaybackBridge {
     fn commit_playback(&mut self, sequence: u64, playback: &mut [i32]) {
         if self.prepared_shared_sequence == Some(sequence) {
             self.prepared_shared_sequence = None;
+            if !self.any_prepared_shared {
+                return;
+            }
+            self.any_prepared_shared = false;
+            let _pin =
+                (!self.commit_pinned).then(|| self.shared_playback_domain.enter(RT_SLOT_PLAYBACK));
+            let hardware_generation = self.timeline.generation();
             for port in &mut self.shared {
-                port.commit_prepared(sequence, playback, &self.timeline);
+                // SAFETY: `shared_playback_domain` slot `RT_SLOT_PLAYBACK` is held by `_pin` or `commit_pinned`.
+                unsafe {
+                    port.commit_prepared_pinned(
+                        sequence,
+                        playback,
+                        hardware_generation,
+                        &self.shared_playback_domain,
+                    );
+                }
             }
         } else {
-            let defer = self.defer_playback_notifications;
-            for port in &mut self.shared {
-                port.process_playback(sequence, playback, &self.timeline, defer);
+            self.any_prepared_shared = false;
+            if self.shared.is_empty() {
+                return;
             }
+            let defer = self.defer_playback_notifications;
+            let _pin =
+                (!self.commit_pinned).then(|| self.shared_playback_domain.enter(RT_SLOT_PLAYBACK));
+            let hardware_generation = self.timeline.generation();
+            let mut any_pending_notify = false;
+            for port in &mut self.shared {
+                // SAFETY: `shared_playback_domain` slot `RT_SLOT_PLAYBACK` is held by `_pin` or `commit_pinned`.
+                unsafe {
+                    port.process_playback_pinned(
+                        sequence,
+                        playback,
+                        hardware_generation,
+                        &self.timeline,
+                        defer,
+                        &self.shared_playback_domain,
+                    );
+                }
+                any_pending_notify |= port.pending_notify;
+            }
+            self.any_pending_shared_notify |= any_pending_notify;
         }
     }
 }
 
+#[inline]
 fn notify_or_defer(pending: &mut bool, endpoint: &SessionEndpoint, defer: bool) {
     if defer {
         *pending = true;
@@ -1821,7 +2429,55 @@ fn notify_or_defer(pending: &mut bool, endpoint: &SessionEndpoint, defer: bool) 
     }
 }
 
+#[inline]
+fn copy_and_check_nonzero(dst: &mut [i32], src: &[i32]) -> bool {
+    assert_eq!(dst.len(), src.len());
+    let mut acc = [0_i32; 8];
+    let (dst_chunks, dst_rem) = dst.as_chunks_mut::<8>();
+    let (src_chunks, src_rem) = src.as_chunks::<8>();
+    for (d, s) in dst_chunks.iter_mut().zip(src_chunks) {
+        *d = *s;
+        for i in 0..8 {
+            acc[i] |= s[i];
+        }
+    }
+    let mut tail = 0_i32;
+    for (d, &s) in dst_rem.iter_mut().zip(src_rem) {
+        *d = s;
+        tail |= s;
+    }
+    (acc[0] | acc[1] | acc[2] | acc[3] | acc[4] | acc[5] | acc[6] | acc[7] | tail) != 0
+}
+
 impl DaemonPlaybackBridge {
+    #[inline]
+    fn pro_wait_should_stop(
+        &self,
+        endpoint: &SessionEndpoint,
+        session_id: u64,
+        hardware_generation: u64,
+        sequence: u64,
+    ) -> bool {
+        if self.pro_endpoint.hot.active.load(Ordering::Acquire) != session_id {
+            return true;
+        }
+        let client_state = endpoint.region.client_state();
+        if client_state == SHARED_CLIENT_IDLE
+            || (client_state == SHARED_CLIENT_STARTING
+                && endpoint.region.start_sequence() == sequence)
+        {
+            return true;
+        }
+        self.timeline.generation() != hardware_generation
+            || self
+                .pro_endpoint
+                .hot
+                .lifecycle_hardware_generation
+                .load(Ordering::Acquire)
+                != hardware_generation
+            || endpoint.region.has_ready_playback(sequence)
+    }
+
     fn process_pro_playback(
         &mut self,
         sequence: u64,
@@ -1835,10 +2491,12 @@ impl DaemonPlaybackBridge {
             0
         };
         let wait_timing = self.pro_wait_timing.take();
-        let endpoint = self.pro_endpoint.load();
-        let gate = self.pro_gate.synchronize(
-            &endpoint,
-            &self.pro_active,
+        let _pin = (!self.commit_pinned).then(|| self.pro_domain.enter(RT_SLOT_PLAYBACK));
+        // SAFETY: `pro_domain` slot `RT_SLOT_PLAYBACK` is held by `_pin` or `commit_pinned`.
+        let endpoint = unsafe { self.pro_endpoint.load_pinned(&self.pro_domain) };
+        let gate = synchronize_pro_gate(
+            &self.pro_endpoint,
+            endpoint,
             &self.timeline,
             sequence,
             !self.defer_playback_notifications,
@@ -1847,24 +2505,30 @@ impl DaemonPlaybackBridge {
             self.pending_pro_notify = true;
         }
         let core_deadline_miss = self.core_miss_pro_sequence.take() == Some(sequence);
-        let session_id = self.pro_active.load(Ordering::SeqCst);
+        let session_id = gate.session_id;
+        if gate.blocked || session_id == 0 || endpoint.session_id != session_id {
+            playback.fill(0);
+            self.last_valid_pro_identity = None;
+            endpoint
+                .region
+                .set_playback_sequence(sequence.wrapping_add(1));
+            return;
+        }
         let identity = ProPlaybackIdentity {
             session_id,
-            lifecycle_generation: self.pro_gate.lifecycle_generation.load(Ordering::Acquire),
+            lifecycle_generation: self
+                .pro_endpoint
+                .hot
+                .lifecycle_generation
+                .load(Ordering::Acquire),
             hardware_generation: gate.hardware_generation,
         };
         if self.last_valid_pro_identity != Some(identity) {
             self.last_valid_pro_identity = None;
         }
-        if !gate.blocked
-            && session_id != 0
-            && endpoint.session_id == session_id
-            && endpoint.region.activation_ready()
-            && endpoint.region.client_state() != SHARED_CLIENT_IDLE
-        {
-            let (outcome, published_nanos) = if self.pro_active.load(Ordering::SeqCst) == session_id
-                && endpoint.region.client_state() == SHARED_CLIENT_RUNNING
-            {
+        let client_state = endpoint.region.client_state();
+        if endpoint.region.activation_ready() && client_state != SHARED_CLIENT_IDLE {
+            let (outcome, published_nanos) = if client_state == SHARED_CLIENT_RUNNING {
                 match cutoff_nanos {
                     Some(cutoff) => endpoint
                         .region
@@ -1889,8 +2553,13 @@ impl DaemonPlaybackBridge {
             } else {
                 None
             };
-            let identity_is_current = self.pro_active.load(Ordering::SeqCst) == session_id
-                && self.pro_gate.lifecycle_generation.load(Ordering::Acquire)
+            let identity_is_current = self.pro_endpoint.hot.active.load(Ordering::Acquire)
+                == session_id
+                && self
+                    .pro_endpoint
+                    .hot
+                    .lifecycle_generation
+                    .load(Ordering::Acquire)
                     == identity.lifecycle_generation
                 && self.timeline.generation() == gate.hardware_generation;
             if consumed && identity_is_current {
@@ -1901,15 +2570,17 @@ impl DaemonPlaybackBridge {
                 if let Some(elapsed) = capture_to_publish_nanos {
                     self.pro_diagnostics.record_accepted(elapsed);
                 }
-                self.timeline
-                    .record_pro_playback_block(playback.iter().any(|sample| *sample != 0));
-                self.last_valid_pro
-                    .copy_from_slice(&playback[..sample_count]);
+                let nonzero =
+                    copy_and_check_nonzero(&mut self.last_valid_pro, &playback[..sample_count]);
+                self.timeline.record_pro_playback_block(nonzero);
                 self.last_valid_pro_identity = Some(identity);
                 self.pro_repeated_periods = 0;
-                if self.pro_gate.armed.load(Ordering::Acquire) != session_id {
-                    self.pro_gate.warmup_blocks.store(1, Ordering::Release);
-                    let _ = self.pro_gate.armed.compare_exchange(
+                if self.pro_endpoint.hot.armed.load(Ordering::Acquire) != session_id {
+                    self.pro_endpoint
+                        .hot
+                        .warmup_blocks
+                        .store(1, Ordering::Release);
+                    let _ = self.pro_endpoint.hot.armed.compare_exchange(
                         0,
                         session_id,
                         Ordering::AcqRel,
@@ -1921,7 +2592,7 @@ impl DaemonPlaybackBridge {
                 self.last_valid_pro_identity = None;
             } else if identity_is_current
                 && endpoint.region.client_state() == SHARED_CLIENT_RUNNING
-                && self.pro_gate.armed.load(Ordering::Acquire) == session_id
+                && self.pro_endpoint.hot.armed.load(Ordering::Acquire) == session_id
             {
                 if core_deadline_miss {
                     self.timeline.record_pro_core_deadline_miss();
@@ -1962,8 +2633,13 @@ impl DaemonPlaybackBridge {
                 }
             } else {
                 playback.fill(0);
-                if endpoint.region.client_state() == SHARED_CLIENT_STARTING {
-                    self.pro_gate.warmup_blocks.store(0, Ordering::Release);
+                if client_state == SHARED_CLIENT_STARTING
+                    || endpoint.region.client_state() == SHARED_CLIENT_STARTING
+                {
+                    self.pro_endpoint
+                        .hot
+                        .warmup_blocks
+                        .store(0, Ordering::Release);
                     self.last_valid_pro_identity = None;
                 }
             }
@@ -1974,16 +2650,16 @@ impl DaemonPlaybackBridge {
                 .set_playback_sequence(sequence.wrapping_add(1));
             notify_or_defer(
                 &mut self.pending_pro_notify,
-                &endpoint,
+                endpoint,
                 self.defer_playback_notifications,
             );
         } else {
             playback.fill(0);
             self.last_valid_pro_identity = None;
+            endpoint
+                .region
+                .set_playback_sequence(sequence.wrapping_add(1));
         }
-        endpoint
-            .region
-            .set_playback_sequence(sequence.wrapping_add(1));
     }
 }
 
@@ -2105,7 +2781,7 @@ mod tests {
         io,
         mem::size_of,
         os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     const PROFILE: &str = r#"
@@ -2139,13 +2815,13 @@ mod tests {
     "#;
 
     fn activate_session(state: &DaemonState, session_id: u64, sequence: u64) {
-        let session = if state.pro.owner.load(Ordering::Acquire) == session_id {
+        let session = if state.pro.endpoint.owner.load(Ordering::Acquire) == session_id {
             &state.pro
         } else {
             &state
                 .shared
                 .iter()
-                .find(|port| port.session.owner.load(Ordering::Acquire) == session_id)
+                .find(|port| port.session.endpoint.owner.load(Ordering::Acquire) == session_id)
                 .expect("session should exist")
                 .session
         };
@@ -2286,6 +2962,8 @@ mod tests {
         assert!(state.start_pro_aligned(new_c));
         state
             .pro_capture
+            .endpoint
+            .hot
             .lifecycle_hardware_generation
             .store(u64::MAX, Ordering::Release);
         for sequence in [105, 106] {
@@ -2417,6 +3095,8 @@ mod tests {
         assert_eq!(state.pro_capture.current().region.ready_capture_slots(), 1);
         let c_generation = state
             .pro_capture
+            .endpoint
+            .hot
             .lifecycle_generation
             .load(Ordering::Acquire);
         assert!(state.close(p.0));
@@ -2428,6 +3108,8 @@ mod tests {
         assert_eq!(
             state
                 .pro_capture
+                .endpoint
+                .hot
                 .lifecycle_generation
                 .load(Ordering::Acquire),
             c_generation
@@ -2528,10 +3210,14 @@ mod tests {
         bridge.capture.process_capture(10, &[1; 8]);
         state
             .pro
+            .endpoint
+            .hot
             .lifecycle_hardware_generation
             .store(u64::MAX, Ordering::Release);
         state
             .pro_capture
+            .endpoint
+            .hot
             .lifecycle_hardware_generation
             .store(u64::MAX, Ordering::Release);
         let mut output = [99; 8];
@@ -2547,6 +3233,8 @@ mod tests {
         assert_eq!(
             state
                 .pro
+                .endpoint
+                .hot
                 .lifecycle_hardware_generation
                 .load(Ordering::Acquire),
             u64::MAX
@@ -2637,8 +3325,8 @@ mod tests {
 
     #[test]
     fn opening_session_seeds_current_hardware_generation() {
-        let session =
-            SessionState::new(4, 2, 2, 8, None, None).expect("session state should create");
+        let session = SessionState::new(4, 2, 2, 8, Arc::new(RtReadDomain::default()), None, None)
+            .expect("session state should create");
 
         session
             .try_open(7, 23)
@@ -3433,8 +4121,24 @@ mod tests {
         playback.process_playback(0, &mut output);
         playback.commit_playback(0, &mut output);
         assert_eq!(output, [0; 8]);
-        assert_eq!(state.shared[0].session.armed.load(Ordering::Acquire), 0);
-        assert_eq!(state.shared[0].session.outage.load(Ordering::Acquire), 0);
+        assert_eq!(
+            state.shared[0]
+                .session
+                .endpoint
+                .hot
+                .armed
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            state.shared[0]
+                .session
+                .endpoint
+                .hot
+                .outage
+                .load(Ordering::Acquire),
+            0
+        );
     }
 
     #[test]
@@ -3987,6 +4691,8 @@ mod tests {
         playback.shared[0].observed_hardware_generation = Some(u64::MAX);
         state.shared[0]
             .session
+            .endpoint
+            .hot
             .lifecycle_hardware_generation
             .store(u64::MAX, Ordering::Release);
         playback.process_playback(1, &mut output);
@@ -4018,6 +4724,8 @@ mod tests {
         // activation has a frozen pointer, so nothing else would ever restart it.
         state.shared[0]
             .session
+            .endpoint
+            .hot
             .lifecycle_hardware_generation
             .store(u64::MAX, Ordering::Release);
 
@@ -4058,6 +4766,8 @@ mod tests {
         playback.shared[0].observed_hardware_generation = Some(u64::MAX);
         state.shared[0]
             .session
+            .endpoint
+            .hot
             .lifecycle_hardware_generation
             .store(u64::MAX, Ordering::Release);
         assert!(state.stop(shared.session_id));
@@ -4106,12 +4816,14 @@ mod tests {
         ));
         state
             .pro
+            .endpoint
+            .hot
             .lifecycle_hardware_generation
             .store(u64::MAX, Ordering::Release);
         playback.process_playback(12, &mut output);
         assert_eq!(output, [0; 8]);
         assert_eq!(timeline.snapshot().pro_deadline_misses, 0);
-        assert_eq!(state.pro.armed.load(Ordering::Acquire), 0);
+        assert_eq!(state.pro.endpoint.hot.armed.load(Ordering::Acquire), 0);
 
         let mut stale = [0; 8];
         assert!(
@@ -4159,6 +4871,8 @@ mod tests {
         playback.process_playback(10, &mut output);
         state
             .pro
+            .endpoint
+            .hot
             .lifecycle_hardware_generation
             .store(u64::MAX, Ordering::Release);
 
@@ -4177,6 +4891,8 @@ mod tests {
         assert_eq!(
             state
                 .pro
+                .endpoint
+                .hot
                 .lifecycle_hardware_generation
                 .load(Ordering::Acquire),
             timeline.generation()
@@ -4557,5 +5273,430 @@ mod tests {
         assert_eq!(stats.pro_deadline_misses, 0);
         assert_eq!(stats.hw_playback_xruns, 0);
         assert_eq!(stats.generation, 0);
+    }
+
+    const E1X2_BENCH_PROFILE: &str = r#"
+        [device]
+        name = "Topping E1x2 OTG"
+        rate = 48000
+        period_size = 64
+        buffer_size = 256
+        shared_buffer_size = 512
+        duplex_link = true
+        pro_latency_periods = 0
+        pro_handoff_us = 1000
+        shared_latency_periods = 0
+        shared_playback_repeat_on_underrun = false
+
+        [device.playback]
+        device = "hw:OTG,0"
+        channels = 8
+        format = "S32_LE"
+
+        [device.capture]
+        device = "hw:OTG,0"
+        channels = 10
+        format = "S32_LE"
+
+        [[ports.playback]]
+        id = "line1"
+        name = "Line 1"
+        channels = [0, 1]
+
+        [[ports.playback]]
+        id = "line2"
+        name = "Line 2"
+        channels = [2, 3]
+
+        [[ports.playback]]
+        id = "line3"
+        name = "Line 3"
+        channels = [4, 5]
+
+        [[ports.playback]]
+        id = "line4"
+        name = "Line 4"
+        channels = [6, 7]
+
+        [[ports.capture]]
+        id = "mic1"
+        name = "Mic 1"
+        channels = [0]
+
+        [[ports.capture]]
+        id = "mic2"
+        name = "Mic 2"
+        channels = [1]
+
+        [[ports.capture]]
+        id = "input34"
+        name = "Input 3/4"
+        channels = [2, 3]
+
+        [[ports.capture]]
+        id = "input56"
+        name = "Input 5/6"
+        channels = [4, 5]
+
+        [[ports.capture]]
+        id = "input78"
+        name = "Input 7/8"
+        channels = [6, 7]
+
+        [[ports.capture]]
+        id = "input910"
+        name = "Input 9/10"
+        channels = [8, 9]
+    "#;
+
+    #[test]
+    #[ignore = "release-mode daemon RT bridge microbenchmark; no audio hardware"]
+    fn benchmark_daemon_rt_bridge_e1x2() {
+        let profile = Profile::from_toml(E1X2_BENCH_PROFILE).expect("profile should parse");
+        let capture = vec![0x1234_5600_i32; 64 * 10];
+        let mut playback = vec![0_i32; 64 * 8];
+
+        // 1. Idle E1x2 RT cycle (all 12 slots inactive, tracks sequence across all regions).
+        {
+            let timeline = Arc::new(HardwareTimeline::default());
+            let state = DaemonState::new(&profile, timeline).expect("state should create");
+            let (mut cap, mut play) = state.bridges();
+            let iters = 100_000_u64;
+            for seq in 0..1_000_u64 {
+                play.prepare_playback(seq);
+                cap.process_capture_for_playback(seq, seq, &capture);
+                play.wait_for_playback_before(seq, u64::MAX);
+                play.begin_playback_commit();
+                play.process_playback_before(seq, u64::MAX, &mut playback);
+                play.prepare_playback_mix(seq);
+                play.commit_playback(seq, &mut playback);
+                play.end_playback_commit();
+                cap.process_deferred_capture(seq, &capture);
+            }
+            let started = Instant::now();
+            for seq in 1_000..(1_000 + iters) {
+                play.prepare_playback(seq);
+                cap.process_capture_for_playback(seq, seq, &capture);
+                play.wait_for_playback_before(seq, u64::MAX);
+                play.begin_playback_commit();
+                play.process_playback_before(seq, u64::MAX, &mut playback);
+                play.prepare_playback_mix(seq);
+                play.commit_playback(seq, &mut playback);
+                play.end_playback_commit();
+                cap.process_deferred_capture(seq, &capture);
+            }
+            let elapsed = started.elapsed();
+            std::hint::black_box(&playback);
+            eprintln!(
+                "bench_idle_e1x2_cycle: {:.1} ns/period ({iters} iters in {:?})",
+                elapsed.as_nanos() as f64 / iters as f64,
+                elapsed
+            );
+        }
+
+        // 2. Active E1x2 RT cycle: PRO + 2 shared playback (line1, line2) + 2 shared capture (mic1, input34).
+        let mut run_active_bench = |label: &str, with_stats_contention: bool, silent_pro: bool| {
+            let timeline = Arc::new(HardwareTimeline::default());
+            let state =
+                Arc::new(DaemonState::new(&profile, timeline).expect("state should create"));
+            let pro = open_pro(&state).0;
+            let line1 = state.open_shared("line1").unwrap().unwrap().session_id;
+            let line2 = state.open_shared("line2").unwrap().unwrap().session_id;
+            let mic1 = state.open_shared("mic1").unwrap().unwrap().session_id;
+            let in34 = state.open_shared("input34").unwrap().unwrap().session_id;
+            assert!(state.start(pro));
+            assert!(state.start(line1));
+            assert!(state.start(line2));
+            assert!(state.start(mic1));
+            assert!(state.start(in34));
+            activate_session(&state, pro, 0);
+            activate_session(&state, line1, 0);
+            activate_session(&state, line2, 0);
+            activate_session(&state, mic1, 0);
+            activate_session(&state, in34, 0);
+
+            let (mut cap, mut play) = state.bridges();
+            let pro_samples = vec![if silent_pro { 0_i32 } else { 0x0010_0000_i32 }; 64 * 8];
+            let stereo_samples = vec![0x0002_0000_i32; 64 * 2];
+            let mut pro_cap_out = vec![0_i32; 64 * 10];
+            let mut mic1_out = vec![0_i32; 64];
+            let mut in34_out = vec![0_i32; 64 * 2];
+            let mut pro_idx = 0;
+            let mut l1_idx = 0;
+            let mut l2_idx = 0;
+            let mut pro_cap_idx = 0;
+            let mut mic1_cap_idx = 0;
+            let mut in34_cap_idx = 0;
+
+            let stop_stats = Arc::new(AtomicBool::new(false));
+            let stats_thread = with_stats_contention.then(|| {
+                let s = Arc::clone(&state);
+                let stop = Arc::clone(&stop_stats);
+                std::thread::spawn(move || {
+                    let mut count = 0_u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        std::hint::black_box(s.stats());
+                        count += 1;
+                    }
+                    count
+                })
+            });
+
+            let iters = 50_000_u64;
+            let mut total_bridge_nanos = 0_u128;
+            let pro_guard = state.pro.current();
+            let l1_guard = state.shared[0].session.current();
+            let l2_guard = state.shared[1].session.current();
+            let mic1_guard = state.shared[4].session.current();
+            let in34_guard = state.shared[6].session.current();
+            for seq in 1..=(1_000 + iters) {
+                assert!(pro_guard.region.try_client_publish_playback(
+                    &mut pro_idx,
+                    seq,
+                    &pro_samples
+                ));
+                assert!(l1_guard.region.try_client_publish_playback(
+                    &mut l1_idx,
+                    seq,
+                    &stereo_samples
+                ));
+                assert!(l2_guard.region.try_client_publish_playback(
+                    &mut l2_idx,
+                    seq,
+                    &stereo_samples
+                ));
+
+                let t0 = Instant::now();
+                play.prepare_playback(seq);
+                cap.process_capture_for_playback(seq, seq, &capture);
+                play.wait_for_playback_before(seq, u64::MAX);
+                play.begin_playback_commit();
+                play.process_playback_before(seq, u64::MAX, &mut playback);
+                play.prepare_playback_mix(seq);
+                play.commit_playback(seq, &mut playback);
+                play.end_playback_commit();
+                cap.process_deferred_capture(seq, &capture);
+                if seq > 1_000 {
+                    total_bridge_nanos += t0.elapsed().as_nanos();
+                }
+
+                // Drain client capture slots so capture rings stay steady-state.
+                let _ = pro_guard
+                    .region
+                    .try_client_read_capture(&mut pro_cap_idx, &mut pro_cap_out);
+                let _ = mic1_guard
+                    .region
+                    .try_client_read_capture(&mut mic1_cap_idx, &mut mic1_out);
+                let _ = in34_guard
+                    .region
+                    .try_client_read_capture(&mut in34_cap_idx, &mut in34_out);
+                if seq % 256 == 0 {
+                    pro_guard.events.drain();
+                    l1_guard.events.drain();
+                    l2_guard.events.drain();
+                    mic1_guard.events.drain();
+                    in34_guard.events.drain();
+                }
+            }
+            drop((pro_guard, l1_guard, l2_guard, mic1_guard, in34_guard));
+            stop_stats.store(true, Ordering::Relaxed);
+            let stats_polls = stats_thread.map(|h| h.join().unwrap()).unwrap_or(0);
+            std::hint::black_box(&playback);
+            eprintln!(
+                "{label}: {:.1} ns/period ({iters} iters, stats_polls={stats_polls})",
+                total_bridge_nanos as f64 / iters as f64,
+            );
+        };
+
+        run_active_bench("bench_active_e1x2_nonzero", false, false);
+        run_active_bench("bench_active_e1x2_silent", false, true);
+        run_active_bench("bench_active_e1x2_stats_contention", true, false);
+    }
+
+    #[test]
+    fn endpoint_slot_hot_line_is_isolated_from_control_fields() {
+        assert_eq!(size_of::<SessionHot>(), 64);
+        assert!(std::mem::offset_of!(EndpointSlot, reader_epoch) >= 64);
+        assert_eq!(std::mem::align_of::<PlaybackCommitBarrier>(), 64);
+    }
+
+    #[test]
+    fn rt_read_domain_waits_for_earlier_pin_and_ignores_later_pins() {
+        let domain = Arc::new(RtReadDomain::default());
+        let earlier = domain.enter(RT_SLOT_CAPTURE);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiting = Arc::clone(&domain);
+        let worker = std::thread::spawn(move || {
+            waiting.wait_for_idle();
+            done_tx.send(()).expect("completion should send");
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while domain.epoch.0.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline, "domain epoch should advance");
+            std::thread::yield_now();
+        }
+        let later = domain.enter(RT_SLOT_PLAYBACK);
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(earlier);
+        done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("later pin must not extend the drain");
+        drop(later);
+        worker.join().expect("drain worker should not panic");
+    }
+
+    #[test]
+    fn dropping_playback_bridge_during_commit_releases_rt_pins() {
+        let profile = Profile::from_toml(PROFILE).expect("profile should parse");
+        let state = Arc::new(
+            DaemonState::new(&profile, Arc::new(HardwareTimeline::default()))
+                .expect("state should create"),
+        );
+        let session = open_pro(&state).0;
+        assert!(state.start(session));
+        let (_, mut playback) = state.bridges();
+        playback.begin_playback_commit();
+        // End the commit barrier counter explicitly while simulating a drop that skipped
+        // clearing the domain pins, or drop before stop verifies pin release.
+        playback.playback_commits.end();
+        drop(playback);
+        assert!(state.stop(session));
+    }
+
+    #[test]
+    fn channel_map_all_variants_match_reference_mix_and_extract() {
+        let cases: &[(usize, &[usize])] = &[
+            (1, &[0]),
+            (2, &[0, 1]),
+            (8, &[0, 1, 2, 3, 4, 5, 6, 7]),
+            (8, &[0]),
+            (8, &[7]),
+            (8, &[0, 1]),
+            (8, &[6, 7]),
+            (8, &[2, 3, 4, 5]),
+            (8, &[7, 0, 3]),
+            (10, &[8, 9]),
+        ];
+        let period_frames = 17;
+        for &(physical_channels, channels) in cases {
+            let map = ChannelMap::from_channels(channels, physical_channels);
+            let mut physical: Vec<i32> = (0..period_frames * physical_channels)
+                .map(|i| match i % 5 {
+                    0 => i32::MAX - 10,
+                    1 => i32::MIN + 10,
+                    _ => (i as i32) * 13 - 500,
+                })
+                .collect();
+            let logical: Vec<i32> = (0..period_frames * channels.len())
+                .map(|i| match i % 4 {
+                    0 => 100,
+                    1 => -100,
+                    _ => (i as i32) * 7 - 200,
+                })
+                .collect();
+
+            // Reference mix.
+            let mut expected_mix = physical.clone();
+            for frame in 0..period_frames {
+                for (l, &p) in channels.iter().enumerate() {
+                    let idx = frame * physical_channels + p;
+                    expected_mix[idx] =
+                        expected_mix[idx].saturating_add(logical[frame * channels.len() + l]);
+                }
+            }
+            map.mix_into_physical(period_frames, physical_channels, &logical, &mut physical);
+            assert_eq!(
+                physical, expected_mix,
+                "mix mismatch for phys={physical_channels} ch={channels:?}"
+            );
+
+            // Reference extract.
+            let mut expected_extract = vec![0_i32; period_frames * channels.len()];
+            for frame in 0..period_frames {
+                for (l, &p) in channels.iter().enumerate() {
+                    expected_extract[frame * channels.len() + l] =
+                        physical[frame * physical_channels + p];
+                }
+            }
+            let mut scratch = vec![0_i32; period_frames * channels.len()];
+            let extracted = map.extract_from_physical(
+                period_frames,
+                physical_channels,
+                &physical,
+                &mut scratch,
+            );
+            assert_eq!(
+                extracted,
+                expected_extract.as_slice(),
+                "extract mismatch for phys={physical_channels} ch={channels:?}"
+            );
+            if matches!(map, ChannelMap::Identity) {
+                assert_eq!(
+                    extracted.as_ptr(),
+                    physical.as_ptr(),
+                    "Identity extract should avoid copying into scratch"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn copy_and_check_nonzero_handles_tails_and_boundaries() {
+        for len in [0, 1, 7, 8, 9, 15, 16, 17, 512] {
+            let zeros = vec![0_i32; len];
+            let mut dst = vec![42_i32; len];
+            assert!(!copy_and_check_nonzero(&mut dst, &zeros));
+            assert_eq!(dst, zeros);
+
+            for pos in [0, len / 2, len.saturating_sub(1)] {
+                if len == 0 {
+                    continue;
+                }
+                for val in [1_i32, -1, i32::MIN, i32::MAX] {
+                    let mut src = vec![0_i32; len];
+                    src[pos] = val;
+                    let mut dst = vec![0_i32; len];
+                    assert!(copy_and_check_nonzero(&mut dst, &src));
+                    assert_eq!(dst, src);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_pro_wait_ignores_stale_ready_notification_without_prepare_drain() {
+        let profile = Profile::from_toml(PROFILE).expect("profile should parse");
+        let state = DaemonState::new(&profile, Arc::new(HardwareTimeline::default()))
+            .expect("state should create");
+        let (session, _, fds) = open_pro(&state);
+        assert!(state.start(session));
+        activate_session(&state, session, 9);
+
+        // Simulate a stale playback_ready notification left over from a prior period.
+        notify_fd(fds[3]);
+
+        let (_, mut playback) = state.bridges();
+        playback.prepare_playback(10);
+        let (published_tx, published_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(10));
+                let mut producer_index = 0;
+                assert!(state.pro.current().region.try_client_publish_playback(
+                    &mut producer_index,
+                    10,
+                    &[77; 8],
+                ));
+                published_tx.send(()).expect("publish signal should send");
+                notify_fd(fds[3]);
+            });
+            playback.wait_for_playback_before(10, monotonic_nanos().saturating_add(1_000_000_000));
+            published_rx
+                .try_recv()
+                .expect("stale event must be drained before sleeping for real publication");
+        });
     }
 }

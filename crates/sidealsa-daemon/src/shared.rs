@@ -159,21 +159,27 @@ impl SharedEvents {
         } else {
             PlaybackReadyWait::Failed
         };
-        // Avoid a needless timer interrupt after the client has already responded.
-        let disarmed = libc::itimerspec {
-            it_interval: zero,
-            it_value: zero,
-        };
-        if unsafe {
-            libc::timerfd_settime(
-                self.playback_deadline.as_raw_fd(),
-                0,
-                &disarmed,
-                ptr::null_mut(),
-            )
-        } < 0
-        {
-            return PlaybackReadyWait::Failed;
+        // A one-shot timerfd that already fired is disarmed in the kernel; only disarm
+        // when the deadline may still be pending to avoid a needless interrupt and syscall.
+        let timer_expired = result > 0
+            && descriptors[1].revents & libc::POLLIN != 0
+            && descriptors[1].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) == 0;
+        if !timer_expired {
+            let disarmed = libc::itimerspec {
+                it_interval: zero,
+                it_value: zero,
+            };
+            if unsafe {
+                libc::timerfd_settime(
+                    self.playback_deadline.as_raw_fd(),
+                    0,
+                    &disarmed,
+                    ptr::null_mut(),
+                )
+            } < 0
+            {
+                return PlaybackReadyWait::Failed;
+            }
         }
         outcome
     }
@@ -315,5 +321,45 @@ mod tests {
             monotonic_nanos() >= cutoff,
             "stale expiration must not end a new wait"
         );
+    }
+
+    #[test]
+    fn playback_deadline_timeout_leaves_timer_disarmed() {
+        use std::os::fd::AsRawFd;
+
+        let events = SharedEvents::new().expect("events should create");
+        assert_eq!(
+            events.wait_playback_ready_before(0),
+            PlaybackReadyWait::Timeout
+        );
+        let mut timer = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: 1,
+                tv_nsec: 1,
+            },
+        };
+        assert_eq!(
+            unsafe { libc::timerfd_gettime(events.playback_deadline.as_raw_fd(), &mut timer) },
+            0
+        );
+        assert_eq!(timer.it_value.tv_sec, 0);
+        assert_eq!(timer.it_value.tv_nsec, 0);
+
+        let cutoff = monotonic_nanos() + 2_000_000;
+        assert_eq!(
+            events.wait_playback_ready_before(cutoff),
+            PlaybackReadyWait::Timeout
+        );
+        assert!(monotonic_nanos() >= cutoff);
+        assert_eq!(
+            unsafe { libc::timerfd_gettime(events.playback_deadline.as_raw_fd(), &mut timer) },
+            0
+        );
+        assert_eq!(timer.it_value.tv_sec, 0);
+        assert_eq!(timer.it_value.tv_nsec, 0);
     }
 }

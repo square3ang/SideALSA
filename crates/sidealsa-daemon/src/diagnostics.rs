@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProMiss {
@@ -22,6 +22,7 @@ pub struct ProDiagnosticsSnapshot {
     pub last_miss: Option<ProMiss>,
 }
 
+#[repr(align(64))]
 #[derive(Default)]
 pub(crate) struct ProDiagnostics {
     pub enabled: AtomicBool,
@@ -32,15 +33,22 @@ pub(crate) struct ProDiagnostics {
 }
 
 impl ProDiagnostics {
+    // Single writer: the daemon's sole playback bridge.
     pub fn record_accepted(&self, elapsed: u64) {
-        self.accepted_roundtrip_max_nanos
-            .fetch_max(elapsed, Ordering::Relaxed);
+        if elapsed > self.accepted_roundtrip_max_nanos.load(Ordering::Relaxed) {
+            self.accepted_roundtrip_max_nanos
+                .store(elapsed, Ordering::Relaxed);
+        }
+        let next = self
+            .accepted_roundtrip_samples
+            .load(Ordering::Relaxed)
+            .wrapping_add(1);
         self.accepted_roundtrip_samples
-            .fetch_add(1, Ordering::Relaxed);
+            .store(next, Ordering::Relaxed);
     }
 
-    // Single writer: the daemon's sole playback bridge. SeqCst atomics give
-    // bounded readers a coherent record without locks or non-atomic data races.
+    // Single writer: atomic seqlock with Release/Acquire fences gives bounded readers
+    // a coherent record without locks, non-atomic data races, or SeqCst barriers.
     pub fn record_miss(&self, miss: ProMiss) {
         let values = [
             miss.generation,
@@ -58,24 +66,29 @@ impl ProDiagnostics {
                 | (u64::from(miss.published_nanos.is_some()) << 3)
                 | (u64::from(miss.capture_to_publish_nanos.is_some()) << 4),
         ];
-        self.version.fetch_add(1, Ordering::SeqCst);
+        let version = self.version.load(Ordering::Relaxed);
+        self.version
+            .store(version.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
         for (field, value) in self.fields.iter().zip(values) {
-            field.store(value, Ordering::SeqCst);
+            field.store(value, Ordering::Relaxed);
         }
-        self.version.fetch_add(1, Ordering::SeqCst);
+        self.version
+            .store(version.wrapping_add(2), Ordering::Release);
     }
 
     pub fn snapshot(&self) -> Option<ProDiagnosticsSnapshot> {
         for _ in 0..3 {
-            let version = self.version.load(Ordering::SeqCst);
+            let version = self.version.load(Ordering::Acquire);
             if !version.is_multiple_of(2) {
                 continue;
             }
             let fields = self
                 .fields
                 .each_ref()
-                .map(|field| field.load(Ordering::SeqCst));
-            if self.version.load(Ordering::SeqCst) != version {
+                .map(|field| field.load(Ordering::Relaxed));
+            fence(Ordering::Acquire);
+            if self.version.load(Ordering::Relaxed) != version {
                 continue;
             }
             let optional =
